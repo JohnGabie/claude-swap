@@ -297,3 +297,13 @@ def test_import_error_is_reported(monkeypatch):
     api.pick_file = lambda kind: "C:/tmp/bad.cswap"
     out = api.import_()
     assert out["ok"] is False and "not valid JSON" in out["output"]
+
+
+def test_engine_events_reach_page_and_notifier():
+    seen = []
+    api = _api()
+    api.notifier = SimpleNamespace(handle=seen.append)
+    ev = _Ev("all-exhausted")
+    api._on_event(ev)
+    assert seen == [ev]
+    assert api.poll()["lines"][0]["alert"] is True

@@ -174,6 +174,7 @@ class DesktopApi:
         self._close_announced = False
         self.on_idle = None  # set by run(): finishes a close deferred by a running action
         self.pick_file = None  # set by run(): ("save"|"open") -> path or None
+        self.notifier = None  # set by run(): desktop_notify.Notifier
 
     # ---- reads ---------------------------------------------------------
     def snapshot(self) -> dict:
@@ -276,7 +277,7 @@ class DesktopApi:
             return {"on": False}
         if self._engine is None:
             try:
-                engine = self._engine_factory(self._switcher, self._events.put)
+                engine = self._engine_factory(self._switcher, self._on_event)
             except Exception as e:
                 return {"on": False, "output": f"auto-switch failed to start: {e}"}
             self._engine = engine
@@ -288,9 +289,16 @@ class DesktopApi:
         try:
             engine.run_loop()
         except Exception as e:
-            self._events.put(_EngineCrash(str(e)))
+            self._on_event(_EngineCrash(str(e)))
             if self._engine is engine:
                 self._engine = None
+
+    def _on_event(self, ev):
+        # Engine thread: queue for the page, and notify straight away (the page's
+        # timers are throttled while the window is in the background).
+        self._events.put(ev)
+        if self.notifier is not None:
+            self.notifier.handle(ev)
 
     def _stop_engine(self):
         if self._engine is not None:
@@ -301,6 +309,30 @@ class DesktopApi:
         self._stop_engine()
         if self._engine_thread is not None:
             self._engine_thread.join(timeout=5)  # may be mid-switch
+
+
+def _make_notifier(switcher):
+    from claude_swap import desktop_notify
+
+    if sys.platform == "win32":
+        import ctypes
+
+        def focused():
+            user32 = ctypes.windll.user32
+            return bool(user32.GetForegroundWindow()) and user32.GetForegroundWindow() == user32.FindWindowW(None, TITLE)
+        try:
+            # A stable copy of the icon: the onefile exe's own files vanish when it exits.
+            icon = Path(switcher.backup_dir) / "cswap.ico"
+            src = Path(__file__).with_name("cswap.ico")
+            if src.is_file() and not icon.is_file():
+                icon.write_bytes(src.read_bytes())
+            desktop_notify.register_app_id(str(icon) if icon.is_file() else None)
+        except Exception:
+            pass  # toasts still show, just without our name/icon
+    else:
+        def focused():
+            return False
+    return desktop_notify.Notifier(is_focused=focused)
 
 
 def _default_engine(switcher, on_event):
@@ -348,6 +380,7 @@ def run(switcher) -> int:
         return got if isinstance(got, str) else got[0]
 
     api.pick_file = pick_file
+    api.notifier = _make_notifier(switcher)
     window.events.closing += on_closing
     window.events.shown += lambda: tint_title_bar(TITLE)
     # The packaged exe has no data files; there pywebview falls back to the exe's own icon.

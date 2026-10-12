@@ -269,10 +269,12 @@ uv tool install 'claude-swap[desktop]'   # or: pipx install 'claude-swap[desktop
 cswap desktop
 ```
 
+With **Auto** on, the window sends a desktop notification when something needs your attention while it is in the background: an auto-switch, an account quarantined (or back in rotation), every account at its limit, or auto-switch stopping or ignoring a setting. Routine polls and retried errors stay quiet, and the same alert is not repeated within an hour. Windows shows these as "cswap" toasts (the first run registers that name under `HKCU\Software\Classes\AppUserModelId`); macOS uses `osascript`, Linux `notify-send`.
+
 For a standalone Windows exe with no console window, build it with PyInstaller (run via `uvx`, not a project dependency; `--with .` and `--copy-metadata` bundle the package version the app reads at import):
 
 ```bash
-uvx --with . --with pywebview pyinstaller --onefile --windowed --name cswap-desktop --icon "$PWD/src/claude_swap/cswap.ico" --copy-metadata claude-swap --paths "$PWD/src" --specpath build src/claude_swap/desktop.py
+uvx --with . --with pywebview pyinstaller --onefile --windowed --name cswap-desktop --icon "$PWD/src/claude_swap/cswap.ico" --add-data "$PWD/src/claude_swap/cswap.ico;claude_swap" --copy-metadata claude-swap --paths "$PWD/src" --specpath build src/claude_swap/desktop.py
 ```
 
 The result is `dist/cswap-desktop.exe`. It is a onefile build, so it unpacks itself on each launch and the window takes a few seconds to appear. It needs the Microsoft Edge WebView2 runtime, which ships with Windows 11.
