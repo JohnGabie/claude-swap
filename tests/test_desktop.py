@@ -249,3 +249,51 @@ def test_auto_runs_engine_until_stopped():
     assert api.poll()["auto"] is True
     api.shutdown()
     assert stopped.is_set() and api.poll()["auto"] is False
+
+
+def test_export_cancelled_does_nothing(monkeypatch):
+    called = []
+    monkeypatch.setattr("claude_swap.transfer.export_accounts", lambda *a, **k: called.append(a))
+    api = _api()
+    api.pick_file = lambda kind: None
+    assert api.export() == {"ok": True, "output": ""}
+    assert called == []
+
+
+def test_export_writes_to_picked_path(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        "claude_swap.transfer.export_accounts",
+        lambda sw, path, **k: (called.append(path), print(f"Exported 2 account(s) to {path}")),
+    )
+    api = _api()
+    api.pick_file = lambda kind: "C:/tmp/a.cswap" if kind == "save" else None
+    out = api.export()
+    assert called == ["C:/tmp/a.cswap"]
+    assert out == {"ok": True, "output": "Exported 2 account(s) to C:/tmp/a.cswap"}
+
+
+def test_import_passes_replace_as_force(monkeypatch):
+    called = []
+    monkeypatch.setattr(
+        "claude_swap.transfer.import_accounts",
+        lambda sw, path, force=False: called.append((path, force)),
+    )
+    api = _api()
+    api.pick_file = lambda kind: "C:/tmp/a.cswap" if kind == "open" else None
+    api.import_(True)
+    api.import_(False)
+    assert called == [("C:/tmp/a.cswap", True), ("C:/tmp/a.cswap", False)]
+
+
+def test_import_error_is_reported(monkeypatch):
+    from claude_swap.exceptions import TransferError
+
+    def boom(*a, **k):
+        raise TransferError("export file is not valid JSON")
+
+    monkeypatch.setattr("claude_swap.transfer.import_accounts", boom)
+    api = _api()
+    api.pick_file = lambda kind: "C:/tmp/bad.cswap"
+    out = api.import_()
+    assert out["ok"] is False and "not valid JSON" in out["output"]

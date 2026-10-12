@@ -173,6 +173,7 @@ class DesktopApi:
         self.closing = False
         self._close_announced = False
         self.on_idle = None  # set by run(): finishes a close deferred by a running action
+        self.pick_file = None  # set by run(): ("save"|"open") -> path or None
 
     # ---- reads ---------------------------------------------------------
     def snapshot(self) -> dict:
@@ -237,6 +238,32 @@ class DesktopApi:
 
     def set_disabled(self, num, disabled) -> dict:
         return self._act(lambda: self._switcher.set_account_disabled(str(num), bool(disabled)))
+
+    def export(self) -> dict:
+        """Save every account to a file the user picks (plain-text credentials)."""
+        path = self.pick_file("save") if self.pick_file else None
+        if not path:
+            return {"ok": True, "output": ""}  # cancelled
+
+        def do():
+            from claude_swap.transfer import export_accounts
+
+            export_accounts(self._switcher, path)
+
+        return self._act(do)
+
+    def import_(self, replace=False) -> dict:
+        """Import accounts from a file the user picks; ``replace`` overwrites matches."""
+        path = self.pick_file("open") if self.pick_file else None
+        if not path:
+            return {"ok": True, "output": ""}  # cancelled
+
+        def do():
+            from claude_swap.transfer import import_accounts
+
+            import_accounts(self._switcher, path, force=bool(replace))
+
+        return self._act(do)
 
     def remove(self, num) -> dict:
         # The page asks for confirmation before calling this.
@@ -309,6 +336,18 @@ def run(switcher) -> int:
         api.shutdown()
         return None
 
+    def pick_file(kind):
+        types = ("cswap export (*.cswap;*.json)", "All files (*.*)")
+        if kind == "save":
+            got = window.create_file_dialog(
+                webview.FileDialog.SAVE, save_filename="accounts.cswap", file_types=types)
+        else:
+            got = window.create_file_dialog(webview.FileDialog.OPEN, file_types=types)
+        if not got:
+            return None
+        return got if isinstance(got, str) else got[0]
+
+    api.pick_file = pick_file
     window.events.closing += on_closing
     window.events.shown += lambda: tint_title_bar(TITLE)
     # The packaged exe has no data files; there pywebview falls back to the exe's own icon.

@@ -63,16 +63,16 @@ PAGE = r"""<!doctype html>
 
   .card {
     background: var(--card); border-radius: 16px; padding: 16px 18px 18px; margin-bottom: 12px;
-    box-shadow: inset 0 0 0 1px var(--line), 0 10px 30px -18px rgba(0,0,0,.7);
+    box-shadow: inset 0 0 0 1px var(--line), 0 1px 3px rgba(0,0,0,.35);
     transition: background .18s, transform .18s var(--ease), box-shadow .18s;
-    animation: rise .35s var(--ease) both;
   }
+  .intro .card { animation: rise .35s var(--ease) both; }  /* first paint only, never on refresh */
   .card:hover { background: var(--card-hi); transform: translateY(-1px); }
-  .card.active { box-shadow: inset 0 0 0 1px rgba(247,111,83,.32), 0 10px 30px -16px rgba(247,111,83,.25); }
+  .card.active { box-shadow: inset 0 0 0 1px rgba(247,111,83,.35), 0 1px 3px rgba(0,0,0,.35); }
   .card.disabled .name { color: var(--muted); }
   .top { display: flex; align-items: center; gap: 12px; }
   .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--track); }
-  .active .dot { background: var(--accent); box-shadow: 0 0 0 4px rgba(247,111,83,.16); }
+  .active .dot { background: var(--accent); }
   .who { flex: 1; min-width: 0; }
   .name { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .tag { color: var(--muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -92,6 +92,11 @@ PAGE = r"""<!doctype html>
   .empty b { display: block; font: 400 20px Georgia, serif; color: var(--fg); margin-bottom: 6px; }
 
   footer { padding: 6px 22px 18px; }
+  .foot { display: flex; gap: 6px; }
+  .foot .grow { flex: 1; }
+  .dialog label { display: flex; align-items: center; gap: 8px; color: var(--muted); margin-bottom: 12px; cursor: pointer; }
+  .dialog input[type=checkbox] { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); box-shadow: none; }
+  .warn { color: var(--fg) !important; background: rgba(240,90,95,.12); border-radius: 10px; padding: 10px 12px; }
   .chev { transition: transform .25s var(--ease); }
   .open .chev { transform: rotate(180deg); }
   #panel { display: grid; grid-template-rows: 0fr; transition: grid-template-rows .3s var(--ease); }
@@ -157,9 +162,18 @@ PAGE = r"""<!doctype html>
 </header>
 <main id="cards"></main>
 <footer>
-  <button class="btn" id="out-toggle">Output
-    <svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10l4-4 4 4"/></svg>
-  </button>
+  <div class="foot">
+    <button class="btn" id="out-toggle">Output
+      <svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10l4-4 4 4"/></svg>
+    </button>
+    <span class="grow"></span>
+    <button class="btn" id="import" data-busy title="Import accounts from an export file">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 2.5v8M4.5 7 8 10.5 11.5 7M3 13.5h10"/></svg>Import
+    </button>
+    <button class="btn" id="export" data-busy title="Save all accounts to a file">
+      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 10.5v-8M4.5 6 8 2.5 11.5 6M3 13.5h10"/></svg>Export
+    </button>
+  </div>
   <div id="panel"><div><pre id="log"></pre></div></div>
 </footer>
 <script>
@@ -190,8 +204,14 @@ PAGE = r"""<!doctype html>
   window.cswapLog = log;
 
   // ---- cards ---------------------------------------------------------
+  let painted = "", firstPaint = true;
   function render() {
     const main = $("#cards");
+    const key = JSON.stringify(accounts);
+    if (key === painted) return;  // nothing changed: don't touch the DOM (no flicker)
+    painted = key;
+    main.classList.toggle("intro", firstPaint);
+    firstPaint = false;
     if (!accounts.length) {
       main.innerHTML = '<div class="empty"><b>No accounts yet</b>Log in with Claude Code, then use Add.</div>';
       return;
@@ -316,6 +336,16 @@ PAGE = r"""<!doctype html>
     ]);
   };
   $("#best").onclick = () => act("best");
+  $("#export").onclick = () => dialog(
+    `<h2>Export accounts</h2>
+     <p class="warn">The file holds your Claude login tokens in plain text. Anyone who has it can use these accounts — keep it private and delete it after importing.</p>
+     <div class="row-end"><button type="button" class="btn" data-cancel>Cancel</button><button type="submit" class="btn primary">Choose file…</button></div>`,
+    () => act("export"));
+  $("#import").onclick = () => dialog(
+    `<h2>Import accounts</h2><p>Pick a file made with Export (or <code>cswap export</code>).</p>
+     <label><input type="checkbox" name="replace"> Replace accounts that already exist</label>
+     <div class="row-end"><button type="button" class="btn" data-cancel>Cancel</button><button type="submit" class="btn primary">Choose file…</button></div>`,
+    (f) => act("import_", f.get("replace") === "on"));
   $("#refresh").onclick = () => refresh();
   $("#auto").onclick = async (e) => {
     e.preventDefault();
