@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from claude_swap.desktop import card_lines, colorref, event_line, strip_ansi
+from claude_swap.desktop import card_lines, colorref, event_line, rounded_points, strip_ansi
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import SENTINEL_NOTES
@@ -147,3 +147,16 @@ def test_main_run_error_shows_dialog(monkeypatch):
     monkeypatch.setattr(desktop, "_show_error", shown.append)
     assert desktop.main() == 1
     assert len(shown) == 1 and "RuntimeError" in shown[0] and "tcl" in shown[0]
+
+
+def test_rounded_points_stay_in_box_and_clamp_radius():
+    pts = rounded_points(0, 0, 100, 20, 50)  # radius larger than half the height
+    xs, ys = pts[0::2], pts[1::2]
+    assert len(pts) == 40
+    assert min(xs) == 0 and max(xs) == 100 and min(ys) == 0 and max(ys) == 20
+    assert pts[0] == 10  # radius clamped to h/2
+
+
+def test_rounded_points_zero_radius_is_plain_rect():
+    pts = rounded_points(0, 0, 10, 10, 0)
+    assert set(zip(pts[0::2], pts[1::2])) == {(0, 0), (10, 0), (10, 10), (0, 10)}
