@@ -301,10 +301,14 @@ def run(switcher) -> int:
             try:
                 while True:
                     on_done, res = self._q.get_nowait()
-                    on_done(res)
+                    try:
+                        on_done(res)
+                    except Exception as e:  # one bad callback must not stop the pump
+                        self.log(f"{type(e).__name__}: {e}", alert=True)
             except queue.Empty:
                 pass
-            self.root.after(100, self._pump)
+            finally:
+                self.root.after(100, self._pump)
 
         # ---- refresh -------------------------------------------------------
         def _tick(self):
@@ -316,9 +320,11 @@ def run(switcher) -> int:
                 self._bg(lambda: self.source.take(full=full), self._rendered)
 
         def _rendered(self, snap):
-            self._render(snap)
-            if self._gate.done():  # a refresh was asked for mid-flight
-                self.refresh()
+            try:
+                self._render(snap)
+            finally:
+                if self._gate.done():  # a refresh was asked for mid-flight
+                    self.refresh()
 
         def _render(self, snap):
             if isinstance(snap, Exception):
@@ -386,7 +392,7 @@ def run(switcher) -> int:
         def _acted(self, res):
             self._set_busy(False)
             if isinstance(res, Exception):
-                self.log(str(res), alert=True)
+                self.log(f"{type(res).__name__}: {res}", alert=True)
             else:
                 self.log(res.output, alert=not res.ok)
             if self._closing:
@@ -464,7 +470,7 @@ def run(switcher) -> int:
             if self._busy:  # don't kill a credential write mid-way
                 if not self._closing:
                     self._closing = True
-                    self.log("Waiting for the current action to finish…")
+                    self.log("Waiting for the current action to finish…", alert=True)
                 return
             self._stop_engine()
             if self._engine_thread is not None:
