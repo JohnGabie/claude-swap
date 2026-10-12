@@ -57,8 +57,9 @@ PAGE = r"""<!doctype html>
   .auto.on .switch::after { transform: translateX(16px); background: #fff; }
 
   main { flex: 1; overflow-y: auto; padding: 4px 22px 8px; }
-  main::-webkit-scrollbar, #log::-webkit-scrollbar { width: 8px; }
-  main::-webkit-scrollbar-thumb, #log::-webkit-scrollbar-thumb { background: var(--track); border-radius: 99px; border: 2px solid transparent; background-clip: padding-box; }
+  /* Scroll with wheel/touch/keys, but never show a scrollbar. */
+  main, #log { scrollbar-width: none; }
+  main::-webkit-scrollbar, #log::-webkit-scrollbar { display: none; }
 
   .card {
     background: var(--card); border-radius: 16px; padding: 16px 18px 18px; margin-bottom: 12px;
