@@ -120,3 +120,30 @@ def test_main_startup_error_shows_dialog(monkeypatch):
 def test_colorref_is_bgr():
     assert colorref("#16161a") == 0x1A1616
     assert colorref("#ff0000") == 0x0000FF
+
+
+def test_main_unexpected_constructor_error_shows_dialog(monkeypatch):
+    from claude_swap import desktop
+
+    def _boom(*a, **k):
+        raise OSError("disk")
+
+    shown = []
+    monkeypatch.setattr(desktop, "ClaudeAccountSwitcher", _boom)
+    monkeypatch.setattr(desktop, "_show_error", shown.append)
+    assert desktop.main() == 1
+    assert len(shown) == 1 and "OSError" in shown[0] and "disk" in shown[0]
+
+
+def test_main_run_error_shows_dialog(monkeypatch):
+    from claude_swap import desktop
+
+    def _boom(sw):
+        raise RuntimeError("tcl")
+
+    shown = []
+    monkeypatch.setattr(desktop, "ClaudeAccountSwitcher", lambda *a, **k: object())
+    monkeypatch.setattr(desktop, "run", _boom)
+    monkeypatch.setattr(desktop, "_show_error", shown.append)
+    assert desktop.main() == 1
+    assert len(shown) == 1 and "RuntimeError" in shown[0] and "tcl" in shown[0]

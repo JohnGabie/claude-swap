@@ -495,11 +495,12 @@ def main() -> int:
     if sys.stderr is None:
         sys.stderr = io.StringIO()
     try:
-        switcher = ClaudeAccountSwitcher()
+        return run(ClaudeAccountSwitcher())
     except ClaudeSwitchError as e:
         _show_error(str(e))
-        return 1
-    return run(switcher)
+    except Exception as e:  # windowed exe has no console: surface everything
+        _show_error(f"{type(e).__name__}: {e}")
+    return 1
 
 
 if __name__ == "__main__":
