@@ -105,6 +105,28 @@ BG, CARD, FG, MUTED = "#16161a", "#1f1f24", "#e6e6e6", "#8a8a93"
 ACCENT, TRACK, DANGER = "#d97757", "#2c2c33", "#e5484d"
 
 
+def colorref(hex_color: str) -> int:
+    """'#rrggbb' -> Win32 COLORREF (0x00bbggrr)."""
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return b << 16 | g << 8 | r
+
+
+def tint_title_bar(root) -> None:
+    """Paint the Windows title bar to match the body (no-op elsewhere)."""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    root.update_idletasks()  # the frame HWND exists only once Tk has mapped it
+    hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+    dwm = ctypes.windll.dwmapi.DwmSetWindowAttribute
+    on = ctypes.c_int(1)
+    dwm(hwnd, 20, ctypes.byref(on), ctypes.sizeof(on))  # DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 fallback)
+    for attr, color in ((35, BG), (36, FG)):  # DWMWA_CAPTION_COLOR / TEXT_COLOR, Win11 only
+        ref = ctypes.c_int(colorref(color))
+        dwm(hwnd, attr, ctypes.byref(ref), ctypes.sizeof(ref))
+
+
 class RefreshGate:
     """No-overlap rule for refreshes, remembering one skipped request."""
 
@@ -171,6 +193,10 @@ def run(switcher) -> int:
             r.geometry("520x640")
             r.minsize(420, 360)
             r.configure(bg=BG)
+            try:
+                tint_title_bar(r)
+            except Exception:  # cosmetic only; never block the window
+                pass
             r.protocol("WM_DELETE_WINDOW", self._close)
 
             head = tk.Frame(r, bg=BG)

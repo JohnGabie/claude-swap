@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from claude_swap.desktop import card_lines, event_line, strip_ansi
+from claude_swap.desktop import card_lines, colorref, event_line, strip_ansi
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import SENTINEL_NOTES
@@ -115,3 +115,8 @@ def test_main_startup_error_shows_dialog(monkeypatch):
     monkeypatch.setattr(desktop, "_show_error", shown.append)
     assert desktop.main() == 1
     assert len(shown) == 1 and "boom" in shown[0]
+
+
+def test_colorref_is_bgr():
+    assert colorref("#16161a") == 0x1A1616
+    assert colorref("#ff0000") == 0x0000FF
