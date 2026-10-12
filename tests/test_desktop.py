@@ -88,3 +88,30 @@ def test_refresh_gate_replays_skipped_request():
     assert g.done() is True  # but remembered
     assert g.request() is True
     assert g.done() is False
+
+
+def test_main_replaces_none_streams(monkeypatch):
+    import sys
+
+    from claude_swap import desktop
+
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setattr(desktop, "ClaudeAccountSwitcher", lambda *a, **k: object())
+    monkeypatch.setattr(desktop, "run", lambda sw: 0)
+    assert desktop.main() == 0
+    assert sys.stdout is not None and sys.stderr is not None
+
+
+def test_main_startup_error_shows_dialog(monkeypatch):
+    from claude_swap import desktop
+    from claude_swap.exceptions import ClaudeSwitchError
+
+    def _boom(*a, **k):
+        raise ClaudeSwitchError("boom")
+
+    shown = []
+    monkeypatch.setattr(desktop, "ClaudeAccountSwitcher", _boom)
+    monkeypatch.setattr(desktop, "_show_error", shown.append)
+    assert desktop.main() == 1
+    assert len(shown) == 1 and "boom" in shown[0]

@@ -12,13 +12,16 @@ formatting) are import-safe without tkinter so they can be unit-tested headless;
 
 from __future__ import annotations
 
+import io
 import queue
 import re
 import sys
 import threading
 from dataclasses import dataclass
 
+from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountSnapshot
+from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.data import (
     clock_stamp,
     format_age,
@@ -444,3 +447,34 @@ def run(switcher) -> int:
 
     DesktopApp().root.mainloop()
     return 0
+
+
+def _show_error(text: str) -> None:
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except ImportError:
+        print(text, file=sys.stderr)
+        return
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror("cswap desktop", text)
+    root.destroy()
+
+
+def main() -> int:
+    # --windowed exes have no console: sys.stdout/stderr are None.
+    if sys.stdout is None:
+        sys.stdout = io.StringIO()
+    if sys.stderr is None:
+        sys.stderr = io.StringIO()
+    try:
+        switcher = ClaudeAccountSwitcher()
+    except ClaudeSwitchError as e:
+        _show_error(str(e))
+        return 1
+    return run(switcher)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

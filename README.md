@@ -260,6 +260,22 @@ The agent lives at `~/Library/LaunchAgents/com.cswap.menubar.plist` and logs to 
 
 </details>
 
+## Desktop app
+
+A small Tkinter window with the same account cards, actions and optional auto-switch as the TUI. Works on Windows, macOS and Linux (needs your Python's `tkinter`).
+
+```bash
+cswap desktop
+```
+
+For a standalone Windows exe with no console window, build it with PyInstaller (run via `uvx`, not a project dependency; `--with .` and `--copy-metadata` bundle the package version the app reads at import):
+
+```bash
+uvx --with . pyinstaller --onefile --windowed --name cswap-desktop --copy-metadata claude-swap --paths "$PWD/src" --specpath build src/claude_swap/desktop.py
+```
+
+The result is `dist/cswap-desktop.exe`. It is a onefile build, so it unpacks itself on each launch and the window takes a few seconds to appear.
+
 ## Advanced
 
 ### Configuration
