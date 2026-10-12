@@ -77,3 +77,14 @@ def test_event_line_exhausted_alerts():
     text, alert = event_line(_Ev("all-exhausted"))
     assert alert is True
     assert text.endswith("something happened")
+
+
+def test_refresh_gate_replays_skipped_request():
+    from claude_swap.desktop import RefreshGate
+
+    g = RefreshGate()
+    assert g.request() is True
+    assert g.request() is False  # overlap refused
+    assert g.done() is True  # but remembered
+    assert g.request() is True
+    assert g.done() is False

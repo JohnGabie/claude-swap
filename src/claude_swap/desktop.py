@@ -102,6 +102,28 @@ BG, CARD, FG, MUTED = "#16161a", "#1f1f24", "#e6e6e6", "#8a8a93"
 ACCENT, TRACK, DANGER = "#d97757", "#2c2c33", "#e5484d"
 
 
+class RefreshGate:
+    """No-overlap rule for refreshes, remembering one skipped request."""
+
+    def __init__(self):
+        self._inflight = False
+        self._pending = False
+
+    def request(self) -> bool:
+        """True if the caller should start a refresh now."""
+        if self._inflight:
+            self._pending = True
+            return False
+        self._inflight = True
+        return True
+
+    def done(self) -> bool:
+        """Mark the refresh finished; True if one was requested meanwhile."""
+        self._inflight = False
+        pending, self._pending = self._pending, False
+        return pending
+
+
 class _EngineCrash:
     """Minimal event stand-in so a crashed engine thread shows up in the log."""
 
@@ -136,7 +158,9 @@ def run(switcher) -> int:
             self._events: queue.Queue = queue.Queue()
             self._engine = None
             self._busy = False
-            self._refreshing = False
+            self._gate = RefreshGate()
+            self._closing = False
+            self._engine_thread = None
             self._buttons: list = []
 
             r = self.root = tk.Tk()
@@ -259,13 +283,15 @@ def run(switcher) -> int:
             self.root.after(60_000, self._tick)
 
         def refresh(self, full=True):
-            if self._refreshing:
-                return
-            self._refreshing = True
-            self._bg(lambda: self.source.take(full=full), self._render)
+            if self._gate.request():
+                self._bg(lambda: self.source.take(full=full), self._rendered)
+
+        def _rendered(self, snap):
+            self._render(snap)
+            if self._gate.done():  # a refresh was asked for mid-flight
+                self.refresh()
 
         def _render(self, snap):
-            self._refreshing = False
             if isinstance(snap, Exception):
                 self.log(f"refresh failed: {snap}", alert=True)
                 return
@@ -334,6 +360,9 @@ def run(switcher) -> int:
                 self.log(str(res), alert=True)
             else:
                 self.log(res.output, alert=not res.ok)
+            if self._closing:
+                self._close()
+                return
             self.refresh()
 
         def _switch(self, num):
@@ -374,7 +403,10 @@ def run(switcher) -> int:
                 self.auto_var.set(False)
                 return
             self._engine = engine
-            threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
+            self._engine_thread = threading.Thread(
+                target=self._run_engine, args=(engine,), daemon=True
+            )
+            self._engine_thread.start()
 
         def _run_engine(self, engine):
             try:
@@ -400,7 +432,14 @@ def run(switcher) -> int:
             self.root.after(500, self._drain_events)
 
         def _close(self):
+            if self._busy:  # don't kill a credential write mid-way
+                if not self._closing:
+                    self._closing = True
+                    self.log("Waiting for the current action to finish…")
+                return
             self._stop_engine()
+            if self._engine_thread is not None:
+                self._engine_thread.join(timeout=5)  # may be mid-switch
             self.root.destroy()
 
     DesktopApp().root.mainloop()
