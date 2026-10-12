@@ -1,8 +1,11 @@
-"""Tests for the pure display helpers behind the desktop window."""
+"""Tests for the desktop window: display helpers and the page bridge (DesktopApi)."""
 
 from __future__ import annotations
 
-from claude_swap.desktop import card_lines, colorref, event_line, rounded_points, strip_ansi
+import threading
+from types import SimpleNamespace
+
+from claude_swap.desktop import DesktopApi, card_dict, card_lines, colorref, event_line, strip_ansi
 from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import SENTINEL_NOTES
@@ -79,17 +82,6 @@ def test_event_line_exhausted_alerts():
     assert text.endswith("something happened")
 
 
-def test_refresh_gate_replays_skipped_request():
-    from claude_swap.desktop import RefreshGate
-
-    g = RefreshGate()
-    assert g.request() is True
-    assert g.request() is False  # overlap refused
-    assert g.done() is True  # but remembered
-    assert g.request() is True
-    assert g.done() is False
-
-
 def test_main_replaces_none_streams(monkeypatch):
     import sys
 
@@ -149,14 +141,111 @@ def test_main_run_error_shows_dialog(monkeypatch):
     assert len(shown) == 1 and "RuntimeError" in shown[0] and "tcl" in shown[0]
 
 
-def test_rounded_points_stay_in_box_and_clamp_radius():
-    pts = rounded_points(0, 0, 100, 20, 50)  # radius larger than half the height
-    xs, ys = pts[0::2], pts[1::2]
-    assert len(pts) == 40
-    assert min(xs) == 0 and max(xs) == 100 and min(ys) == 0 and max(ys) == 20
-    assert pts[0] == 10  # radius clamped to h/2
+class _FakeSource:
+    def __init__(self, accounts):
+        self.accounts = accounts
+
+    def take(self, **_kw):
+        return SimpleNamespace(accounts=self.accounts, taken_at=0.0)
 
 
-def test_rounded_points_zero_radius_is_plain_rect():
-    pts = rounded_points(0, 0, 10, 10, 0)
-    assert set(zip(pts[0::2], pts[1::2])) == {(0, 0), (10, 0), (10, 10), (0, 10)}
+class _FakeSwitcher:
+    def __init__(self):
+        self.calls = []
+
+    def switch_to(self, num):
+        self.calls.append(("switch_to", num))
+        print("[32mSwitched to #2[0m")
+
+
+def _api(accounts=(), switcher=None, **kw):
+    return DesktopApi(switcher or _FakeSwitcher(), source=_FakeSource(list(accounts)), **kw)
+
+
+def test_card_dict_is_json_ready():
+    import json
+
+    usage = UsageEntry(last_good={"five_hour": {"pct": 62.0}, "seven_day": {"pct": 21.0}}, age_s=0)
+    d = card_dict(_acc(usage=usage), now=0.0)
+    assert d["num"] == "1"
+    assert d["rows"][0] == {"label": "5h", "pct": 62.0, "reset": None, "age": None}
+    json.dumps(d)  # must serialize for the page
+
+
+def test_snapshot_returns_cards():
+    out = _api([_acc()]).snapshot()
+    assert [c["num"] for c in out["accounts"]] == ["1"]
+
+
+def test_snapshot_failure_is_reported_not_raised():
+    class Broken:
+        def take(self, **_kw):
+            raise OSError("offline")
+
+    out = DesktopApi(_FakeSwitcher(), source=Broken()).snapshot()
+    assert out == {"error": "OSError: offline"}
+
+
+def test_action_output_is_captured_and_plain():
+    sw = _FakeSwitcher()
+    out = _api(switcher=sw).switch(2)
+    assert sw.calls == [("switch_to", "2")]
+    assert out == {"ok": True, "output": "Switched to #2"}
+
+
+def test_second_action_is_refused_while_one_runs():
+    api = _api()
+    api._action.acquire()  # an action is in flight
+    try:
+        out = api.switch(2)
+    finally:
+        api._action.release()
+    assert out["ok"] is False and "still running" in out["output"]
+
+
+def test_add_token_requires_both_fields():
+    out = _api().add_token("  ", "tok")
+    assert out["ok"] is False
+
+
+def test_deferred_close_runs_after_the_action():
+    api = _api()
+    closed = []
+    api.closing, api.on_idle = True, lambda: closed.append(True)
+    api.switch(1)
+    assert closed == [True]
+
+
+def test_poll_reports_events_and_requests_refresh_on_switch():
+    api = _api()
+    api._events.put(_Ev("switch"))
+    api._events.put(_Ev("all-exhausted"))
+    p = api.poll()
+    assert [line["alert"] for line in p["lines"]] == [False, True]
+    assert p["refresh"] is True
+    assert api.poll()["refresh"] is False
+
+
+def test_auto_start_failure_leaves_it_off():
+    def broken(*_a):
+        raise ValueError("bad settings")
+
+    out = _api(engine_factory=broken).auto(True)
+    assert out["on"] is False and "bad settings" in out["output"]
+
+
+def test_auto_runs_engine_until_stopped():
+    stopped = threading.Event()
+
+    class Engine:
+        def run_loop(self):
+            stopped.wait(5)
+
+        def stop(self):
+            stopped.set()
+
+    api = _api(engine_factory=lambda *_a: Engine())
+    assert api.auto(True) == {"on": True}
+    assert api.poll()["auto"] is True
+    api.shutdown()
+    assert stopped.is_set() and api.poll()["auto"] is False
