@@ -272,7 +272,7 @@ cswap desktop
 For a standalone Windows exe with no console window, build it with PyInstaller (run via `uvx`, not a project dependency; `--with .` and `--copy-metadata` bundle the package version the app reads at import):
 
 ```bash
-uvx --with . --with pywebview pyinstaller --onefile --windowed --name cswap-desktop --copy-metadata claude-swap --paths "$PWD/src" --specpath build src/claude_swap/desktop.py
+uvx --with . --with pywebview pyinstaller --onefile --windowed --name cswap-desktop --icon "$PWD/src/claude_swap/cswap.ico" --copy-metadata claude-swap --paths "$PWD/src" --specpath build src/claude_swap/desktop.py
 ```
 
 The result is `dist/cswap-desktop.exe`. It is a onefile build, so it unpacks itself on each launch and the window takes a few seconds to appear. It needs the Microsoft Edge WebView2 runtime, which ships with Windows 11.

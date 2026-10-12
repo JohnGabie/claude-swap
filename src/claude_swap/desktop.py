@@ -19,6 +19,7 @@ import re
 import sys
 import threading
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.models import AccountSnapshot
@@ -310,7 +311,9 @@ def run(switcher) -> int:
 
     window.events.closing += on_closing
     window.events.shown += lambda: tint_title_bar(TITLE)
-    webview.start()
+    # The packaged exe has no data files; there pywebview falls back to the exe's own icon.
+    icon = Path(__file__).with_name("cswap.ico")
+    webview.start(icon=str(icon) if icon.is_file() else None)
     return 0
 
 
