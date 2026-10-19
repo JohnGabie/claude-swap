@@ -147,7 +147,6 @@ def run(switcher) -> int:
         import pystray
         import webview
         from PIL import Image
-        from pystray._util import win32 as pwin32
     except ImportError:
         print("cswap tray needs pystray and pywebview: pip install 'claude-swap[tray]'", file=sys.stderr)
         return 1
@@ -207,13 +206,6 @@ def run(switcher) -> int:
     # ---- display state, refreshed in the background ----------------------
     cards: list[dict] = []
     wake = threading.Event()
-
-    class TrayIcon(pystray.Icon):
-        def _on_notify(self, wparam, lparam):
-            # Left click opens the same menu as right click.
-            if lparam == pwin32.WM_LBUTTONUP:
-                lparam = pwin32.WM_RBUTTONUP
-            super()._on_notify(wparam, lparam)
 
     def refresh_loop():
         while not quitting.is_set():
@@ -280,7 +272,7 @@ def run(switcher) -> int:
 
     ico = Path(__file__).with_name("cswap.ico")
     image = Image.open(ico) if ico.is_file() else Image.new("RGB", (64, 64), BG)
-    icon = TrayIcon("cswap", image, "cswap", pystray.Menu(build_menu))
+    icon = pystray.Icon("cswap", image, "cswap", pystray.Menu(build_menu))
 
     def on_ready():
         if settings.auto_switch:
