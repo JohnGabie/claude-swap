@@ -69,6 +69,7 @@ _SUBCOMMAND_FLAGS = {
     "watch": "--watch",
     "menubar": "--menubar",
     "desktop": "--desktop",
+    "tray": "--tray",
 }
 
 
@@ -1069,6 +1070,7 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s desktop                    desktop window (Tkinter)
+  %(prog)s tray                       Windows tray icon (opens the desktop window)
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -1294,6 +1296,21 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--tray",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--install-startup",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--uninstall-startup",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--upgrade",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1322,6 +1339,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.watch
         or args.menubar
         or args.desktop
+        or args.tray
         or args.upgrade
         or args.remove_account is not None
         or args.disable_account is not None
@@ -1379,6 +1397,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.hold is not None and not (math.isfinite(args.hold) and args.hold >= 0):
         parser.error("--hold must be a non-negative number of seconds")
+
+    if (args.install_startup or args.uninstall_startup) and not args.tray:
+        parser.error("--install-startup and --uninstall-startup can only be used with 'tray'")
 
     if (
         args.install_service or args.uninstall_service or args.service_status
@@ -1499,6 +1520,14 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.desktop import run as desktop_run
 
             sys.exit(desktop_run(switcher))
+        elif args.tray:
+            from claude_swap import tray
+
+            if args.install_startup or args.uninstall_startup:
+                tray.set_startup(args.install_startup)
+                print("cswap tray will %s with Windows." % ("start" if args.install_startup else "no longer start"))
+                sys.exit(0)
+            sys.exit(tray.run(switcher))
     except ClaudeSwitchError as e:
         # In JSON mode keep stdout pure JSON: emit the structured error envelope
         # there (exit 1) instead of a red stderr line.
