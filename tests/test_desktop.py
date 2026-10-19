@@ -307,3 +307,43 @@ def test_engine_events_reach_page_and_notifier():
     api._on_event(ev)
     assert seen == [ev]
     assert api.poll()["lines"][0]["alert"] is True
+
+
+# ---- settings bridge --------------------------------------------------------
+
+def _settings_api(tmp_path):
+    return DesktopApi(SimpleNamespace(backup_dir=tmp_path), source=object())
+
+
+def test_get_settings_lists_autoswitch_only_with_defaults(tmp_path):
+    got = _settings_api(tmp_path).get_settings()
+    keys = {r["key"]: r for r in got["core"]}
+    assert "ui.theme" not in keys
+    assert keys["autoswitch.threshold"]["value"] == 90.0
+    assert keys["autoswitch.threshold"]["set"] is False
+    assert got["app"] == []
+
+
+def test_save_settings_writes_and_resets(tmp_path):
+    api = _settings_api(tmp_path)
+    assert api.save_settings({"autoswitch.threshold": 80, "autoswitch.includeApiKeyAccounts": True}, {})["ok"]
+    rows = {r["key"]: r for r in api.get_settings()["core"]}
+    assert rows["autoswitch.threshold"]["value"] == 80.0 and rows["autoswitch.threshold"]["set"]
+    assert rows["autoswitch.includeApiKeyAccounts"]["value"] is True
+    assert api.save_settings({"autoswitch.threshold": None}, {})["ok"]
+    assert api.get_settings()["core"][0]["set"] is False
+
+
+def test_save_settings_rejects_bad_value_without_writing(tmp_path):
+    api = _settings_api(tmp_path)
+    res = api.save_settings({"autoswitch.cooldownSeconds": 60, "autoswitch.threshold": 5}, {})
+    assert res["ok"] is False and "between" in res["output"]
+    assert not (tmp_path / "settings.json").exists()
+
+
+def test_save_settings_passes_app_options_through(tmp_path):
+    seen = {}
+    api = _settings_api(tmp_path)
+    api.app_options = SimpleNamespace(get=lambda: [], set=lambda k, v: seen.update({k: v}))
+    assert api.save_settings({}, {"notifications": True})["ok"]
+    assert seen == {"notifications": True}

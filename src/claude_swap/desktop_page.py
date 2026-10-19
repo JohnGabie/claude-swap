@@ -137,6 +137,20 @@ PAGE = r"""<!doctype html>
     outline: none; transition: box-shadow .15s; user-select: text;
   }
   .dialog input:focus { box-shadow: inset 0 0 0 1px var(--accent), 0 0 0 3px rgba(247,111,83,.18); }
+  .dialog.settings { width: min(470px, 92vw); max-height: 88vh; overflow-y: auto; scrollbar-width: none; }
+  .dialog.settings::-webkit-scrollbar { display: none; }
+  .dialog h3 { margin: 18px 0 8px; font: 600 11px/1 "Segoe UI", sans-serif; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+  .dialog h3:first-of-type { margin-top: 4px; }
+  .dialog .field { display: flex; align-items: center; gap: 14px; margin: 0; padding: 8px 0; border-top: 1px solid var(--line); }
+  .dialog .field .what { flex: 1; min-width: 0; }
+  .dialog .field b { display: block; font-weight: 500; color: var(--fg); }
+  .dialog .field small { display: block; color: var(--muted); font-size: 11.5px; }
+  .dialog .field input:not([type=checkbox]), .dialog .field select { width: 120px; height: 32px; margin: 0; }
+  .dialog select {
+    padding: 0 10px; border: 0; border-radius: 10px; background: var(--bg); color: var(--fg); font: inherit;
+    box-shadow: inset 0 0 0 1px var(--line); outline: none;
+  }
+  .dialog .field input[type=checkbox] { flex: none; }
   .row-end { display: flex; justify-content: flex-end; gap: 8px; margin-top: 6px; }
   .btn.danger { background: var(--danger); color: #fff; }
   .btn.danger:hover { background: #ff6b70; }
@@ -156,6 +170,9 @@ PAGE = r"""<!doctype html>
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>Add
   </button>
   <button class="btn primary" id="best" data-busy title="Switch to the account with the most room">Best</button>
+  <button class="btn icon" id="settings" title="Settings">
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M2.5 4.5h6M11.5 4.5h2M2.5 11.5h2M7.5 11.5h6"/><circle cx="10" cy="4.5" r="1.5"/><circle cx="6" cy="11.5" r="1.5"/></svg>
+  </button>
   <button class="btn icon" id="refresh" title="Refresh usage">
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9"/><path d="M13.5 2.5v3h-3"/></svg>
   </button>
@@ -293,10 +310,10 @@ PAGE = r"""<!doctype html>
     setTimeout(() => document.addEventListener("click", closeMenus, {once: true}));
   }
 
-  function dialog(html, onSubmit) {
+  function dialog(html, onSubmit, cls = "") {
     const s = document.createElement("div");
     s.className = "scrim";
-    s.innerHTML = `<form class="dialog">${html}</form>`;
+    s.innerHTML = `<form class="dialog ${cls}">${html}</form>`;
     document.body.append(s);
     const close = () => s.remove();
     s.onclick = (e) => { if (e.target === s || e.target.dataset.cancel != null) close(); };
@@ -346,6 +363,56 @@ PAGE = r"""<!doctype html>
      <label><input type="checkbox" name="replace"> Replace accounts that already exist</label>
      <div class="row-end"><button type="button" class="btn" data-cancel>Cancel</button><button type="submit" class="btn primary">Choose file…</button></div>`,
     (f) => act("import_", f.get("replace") === "on"));
+  // ---- settings ------------------------------------------------------
+  const LABELS = {
+    "autoswitch.threshold": "Switch threshold (%)",
+    "autoswitch.intervalSeconds": "Check every (seconds)",
+    "autoswitch.cooldownSeconds": "Cooldown between switches (seconds)",
+    "autoswitch.hysteresisPct": "Required improvement (%)",
+    "autoswitch.strategy": "Strategy",
+    "autoswitch.includeApiKeyAccounts": "Include API-key accounts",
+    "autoswitch.unhealthyTicks": "Failed checks before unhealthy",
+    "autoswitch.model": "Model limits to watch",
+  };
+  const fmt = (v) => v === null || v === undefined ? "none" : (typeof v === "number" && Number.isInteger(v) ? String(v) : String(v));
+  function field(name, label, help, kind, value, extra = "") {
+    const what = `<div class="what"><b>${esc(label)}</b><small>${esc(help)}</small></div>`;
+    let input;
+    if (kind === "bool") input = `<input type="checkbox" name="${esc(name)}" ${value ? "checked" : ""}>`;
+    else if (kind === "choice") input = `<select name="${esc(name)}">${extra.choices.map((c) => `<option ${c === value ? "selected" : ""}>${esc(c)}</option>`).join("")}</select>`;
+    else if (kind === "string") input = `<input name="${esc(name)}" value="${esc(value ?? "")}" placeholder="none" autocomplete="off">`;
+    else input = `<input name="${esc(name)}" type="number" value="${esc(value)}" min="${extra.lo}" max="${extra.hi}" step="${kind === "int" ? 1 : "any"}">`;
+    return `<label class="field">${what}${input}</label>`;
+  }
+  $("#settings").onclick = async () => {
+    const cur = await api().get_settings();
+    let html = `<h2>Settings</h2><h3>Auto-switch</h3>` + cur.core.map((r) => field(
+      "core:" + r.key, LABELS[r.key] || r.key, `${r.help} (default ${fmt(r.default)})`, r.kind, r.value, r)).join("");
+    for (const group of [...new Set(cur.app.map((o) => o.group))]) {
+      html += `<h3>${esc(group)}</h3>` + cur.app.filter((o) => o.group === group).map((o) =>
+        field("app:" + o.key, o.label, o.help, "bool", o.value)).join("");
+    }
+    html += `<div class="row-end"><button type="button" class="btn" data-cancel>Cancel</button><button type="submit" class="btn primary">Save</button></div>`;
+    dialog(html, async (f) => {
+      const core = {}, app = {};
+      for (const r of cur.core) {
+        const raw = f.get("core:" + r.key);
+        let v;
+        if (r.kind === "bool") v = raw === "on";
+        else if (r.kind === "float" || r.kind === "int") v = Number(raw);
+        else v = raw === "" ? null : raw;
+        if (v !== (r.value ?? null)) core[r.key] = v;
+      }
+      for (const o of cur.app) {
+        const v = f.get("app:" + o.key) === "on";
+        if (v !== o.value) app[o.key] = v;
+      }
+      if (!Object.keys(core).length && !Object.keys(app).length) return;
+      const r = await api().save_settings(core, app);
+      log(r.output, !r.ok);
+      if (!r.ok) setPanel(true);
+    }, "settings");
+  };
   $("#refresh").onclick = () => refresh();
   $("#auto").onclick = async (e) => {
     e.preventDefault();

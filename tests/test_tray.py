@@ -22,7 +22,7 @@ def test_settings_default_notifications_off(tmp_path):
 def test_settings_roundtrip_and_bad_values(tmp_path):
     path = tmp_path / "tray.json"
     tray.TraySettings(auto_switch=True, notifications=True, startup_initialized=True).save(path)
-    assert tray.TraySettings.load(path) == tray.TraySettings(True, True, True)
+    assert tray.TraySettings.load(path) == tray.TraySettings(auto_switch=True, notifications=True, startup_initialized=True)
     path.write_text(json.dumps({"auto_switch": "yes", "notifications": True}), encoding="utf-8")
     loaded = tray.TraySettings.load(path)
     assert loaded.auto_switch is False and loaded.notifications is True
@@ -56,3 +56,9 @@ def test_startup_command_prefers_windowless_python(tmp_path):
     cmd = tray.startup_command(str(tmp_path / "python.exe"))
     assert cmd == f'"{tmp_path / "pythonw.exe"}" -m claude_swap.tray'
     assert tray.startup_command(str(tmp_path / "nope" / "python.exe")).endswith('python.exe" -m claude_swap.tray')
+
+
+def test_muted_kinds_follow_event_toggles():
+    assert tray.muted_kinds(tray.TraySettings()) == set()
+    s = tray.TraySettings(notify_quarantine=False, notify_errors=False)
+    assert tray.muted_kinds(s) == {"account-quarantined", "account-unquarantined", "error"}

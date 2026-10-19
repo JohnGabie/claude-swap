@@ -104,3 +104,13 @@ def test_send_failure_is_swallowed():
 def test_toast_xml_escapes_text():
     xml = toast_xml("A & B", "<b>x</b>")
     assert "A &amp; B" in xml and "&lt;b&gt;x&lt;/b&gt;" in xml
+
+
+def test_muted_kind_does_not_notify():
+    from types import SimpleNamespace
+
+    sent = []
+    n = Notifier(send=lambda t, b: sent.append((t, b)))
+    n.muted = {"all-exhausted"}
+    ev = SimpleNamespace(kind="all-exhausted", earliest_reset_at=None)
+    assert n.handle(ev) is False and sent == []

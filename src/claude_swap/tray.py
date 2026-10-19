@@ -40,6 +40,12 @@ class TraySettings:
 
     auto_switch: bool = False
     notifications: bool = False
+    # Which events notify once notifications are on.
+    notify_switch: bool = True
+    notify_quarantine: bool = True
+    notify_exhausted: bool = True
+    notify_config: bool = True
+    notify_errors: bool = True
     startup_initialized: bool = False  # start-with-Windows is registered once, then left alone
 
     @classmethod
@@ -61,6 +67,22 @@ class TraySettings:
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
+
+
+# (settings field, event kinds it covers, label, help) for the per-event toggles.
+NOTIFY_EVENTS = (
+    ("notify_switch", ("switch",), "Account switched", "When auto-switch moves to another account"),
+    ("notify_quarantine", ("account-quarantined", "account-unquarantined"),
+     "Account needs re-login", "When an account is taken out of rotation, or comes back"),
+    ("notify_exhausted", ("all-exhausted",), "All accounts at limit", "When there is no account left to switch to"),
+    ("notify_config", ("config-warning",), "Setting ignored", "When an auto-switch setting is not applied"),
+    ("notify_errors", ("error",), "Auto-switch stopped", "When the auto-switch engine fails"),
+)
+
+
+def muted_kinds(settings: TraySettings) -> set[str]:
+    """Event kinds the user turned off."""
+    return {k for field, kinds, *_ in NOTIFY_EVENTS if not getattr(settings, field) for k in kinds}
 
 
 # ---- labels (operate on ``desktop.card_dict`` output) ----------------------
@@ -169,6 +191,7 @@ def run(switcher) -> int:
 
     api = DesktopApi(switcher)
     notifier = _make_notifier(switcher)
+    notifier.muted = muted_kinds(settings)
     api.notifier = notifier if settings.notifications else None
 
     window = webview.create_window(
@@ -238,10 +261,42 @@ def run(switcher) -> int:
         settings.save(settings_path)
         api.auto(settings.auto_switch)
 
-    def toggle_notifications():
-        settings.notifications = not settings.notifications
+    def set_notifications(on):
+        settings.notifications = on
         settings.save(settings_path)
-        api.notifier = notifier if settings.notifications else None
+        api.notifier = notifier if on else None
+
+    def toggle_notifications():
+        set_notifications(not settings.notifications)
+
+    class AppOptions:
+        """The tray's own options, shown in the window's Settings dialog."""
+
+        def get(self):
+            rows = [
+                {"key": "notifications", "label": "Notifications", "group": "Notifications",
+                 "help": "Windows toasts for the events below", "value": settings.notifications},
+            ]
+            rows += [
+                {"key": field, "label": label, "group": "Notifications", "help": help_, "value": getattr(settings, field)}
+                for field, _kinds, label, help_ in NOTIFY_EVENTS
+            ]
+            rows.append({"key": "startup", "label": "Start with Windows", "group": "App",
+                         "help": "Launch the tray when you sign in", "value": is_startup_enabled()})
+            return rows
+
+        def set(self, key, value):
+            if key == "notifications":
+                set_notifications(value)
+            elif key == "startup":
+                set_startup(value)
+            elif key in {f for f, *_ in NOTIFY_EVENTS}:
+                setattr(settings, key, value)
+                settings.save(settings_path)
+                notifier.muted = muted_kinds(settings)
+            icon.update_menu()
+
+    api.app_options = AppOptions()
 
     def quit_app():
         quitting.set()

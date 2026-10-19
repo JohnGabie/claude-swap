@@ -85,11 +85,14 @@ class Notifier:
         self._send = send or send_notification
         self.is_focused = is_focused
         self._clock = clock
+        self.muted: set[str] = set()  # event kinds the user turned off
         self._last: dict[str, float] = {}
         self._lock = threading.Lock()
 
     def handle(self, ev) -> bool:
         """Notify for ``ev`` if appropriate; True when a notification was sent."""
+        if getattr(ev, "kind", "") in self.muted:
+            return False
         note = notification_for(ev)
         if note is None:
             return False

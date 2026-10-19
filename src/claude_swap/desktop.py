@@ -175,6 +175,7 @@ class DesktopApi:
         self.on_idle = None  # set by run(): finishes a close deferred by a running action
         self.pick_file = None  # set by run(): ("save"|"open") -> path or None
         self.notifier = None  # set by run(): desktop_notify.Notifier
+        self.app_options = None  # set by the tray: object with .get() -> [option dicts] and .set(key, bool)
 
     # ---- reads ---------------------------------------------------------
     def snapshot(self) -> dict:
@@ -269,6 +270,56 @@ class DesktopApi:
     def remove(self, num) -> dict:
         # The page asks for confirmation before calling this.
         return self._act(lambda: self._switcher.remove_account(str(num), assume_yes=True))
+
+    # ---- settings ------------------------------------------------------
+    def get_settings(self) -> dict:
+        """Auto-switch policy (from settings.json) and, in the tray, the app's own options."""
+        from claude_swap.settings import effective_settings
+
+        core = [
+            {
+                "key": spec.dotted, "kind": spec.kind, "lo": spec.lo, "hi": spec.hi,
+                "choices": list(spec.choices), "help": spec.help,
+                "value": value, "default": spec.default, "set": is_set,
+            }
+            for spec, value, is_set in effective_settings(self._switcher.backup_dir)
+            if spec.section == "autoswitch"  # ui.theme styles the TUI, not this window
+        ]
+        return {"core": core, "app": self.app_options.get() if self.app_options else []}
+
+    def save_settings(self, core, app) -> dict:
+        """Apply ``{dotted key: value or None to reset}`` and ``{option key: bool}``.
+
+        Everything is validated before anything is written, so a bad value never
+        leaves the file half-changed.
+        """
+        from claude_swap.exceptions import ConfigError
+        from claude_swap.settings import parse_setting_value, set_setting, setting_spec, unset_setting
+
+        try:
+            writes = []
+            for key, value in (core or {}).items():
+                spec = setting_spec(key)
+                if value is None:
+                    writes.append((key, None))
+                    continue
+                raw = str(value).lower() if isinstance(value, bool) else str(value)
+                parse_setting_value(spec, raw)
+                writes.append((key, raw))
+            for key, raw in writes:
+                if raw is None:
+                    unset_setting(self._switcher.backup_dir, key)
+                else:
+                    set_setting(self._switcher.backup_dir, key, raw)
+            if self.app_options is not None:
+                for key, value in (app or {}).items():
+                    self.app_options.set(key, bool(value))
+        except ConfigError as e:
+            return {"ok": False, "output": str(e)}
+        if writes and self._engine is not None:  # the engine reads settings once, at start
+            self._stop_engine()
+            self.auto(True)
+        return {"ok": True, "output": "settings saved"}
 
     # ---- auto-switch engine (mirrors menubar.py) -----------------------
     def auto(self, on) -> dict:
