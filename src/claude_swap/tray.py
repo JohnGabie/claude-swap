@@ -1,4 +1,4 @@
-"""Windows system-tray app for claude-swap (``cswap tray``).
+"""System-tray app (Windows and Linux) for claude-swap (``cswap tray``).
 
 The tray icon is the app; the desktop window (``claude_swap.desktop``) is opened
 from it and hides back to the tray when closed. Like the window and the macOS
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import threading
 from dataclasses import asdict, dataclass, fields
@@ -27,6 +28,10 @@ TOOLTIP_MAX = 127  # Windows truncates NOTIFYICONDATA.szTip at 127 chars
 STARTUP_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE = "cswap-tray"
 MUTEX_NAME = "Local\\cswap-tray"
+AUTOSTART_FILE = "cswap-tray.desktop"  # Linux: ~/.config/autostart
+LOCK_FILE = "cswap-tray.lock"  # Linux single-instance lock, in the runtime dir
+SUPPORTED = sys.platform in ("win32", "linux")
+STARTUP_LABEL = "Start with Windows" if sys.platform == "win32" else "Start on login"
 
 
 @dataclass
@@ -47,6 +52,11 @@ class TraySettings:
     notify_config: bool = True
     notify_errors: bool = True
     startup_initialized: bool = False  # start-with-Windows is registered once, then left alone
+    # The screen-edge pill (Linux only, see claude_swap.pill).
+    pill_enabled: bool = sys.platform == "linux"
+    pill_fold: bool = True  # "Show on hover": the pill rests as a small sliver and opens when the pointer reaches the edge
+    pill_edge: str = "right"
+    pill_theme: str = "black"
 
     @classmethod
     def load(cls, path: Path) -> "TraySettings":
@@ -60,9 +70,14 @@ class TraySettings:
         kwargs = {
             f.name: raw[f.name]
             for f in fields(cls)
-            if f.name in raw and isinstance(raw[f.name], bool)
+            if f.name in raw and isinstance(raw[f.name], type(getattr(defaults, f.name)))
         }
-        return cls(**kwargs)
+        settings = cls(**kwargs)
+        from claude_swap.pill import normalize_edge, normalize_theme
+
+        settings.pill_edge = normalize_edge(settings.pill_edge)
+        settings.pill_theme = normalize_theme(settings.pill_theme)
+        return settings
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,7 +134,23 @@ def startup_command(python: str | None = None) -> str:
     return f'"{windowless if windowless.is_file() else exe}" -m claude_swap.tray'
 
 
+def _autostart_path() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "autostart" / AUTOSTART_FILE
+
+
+def autostart_entry(python: str | None = None) -> str:
+    """Linux autostart .desktop file launching this module."""
+    return (
+        "[Desktop Entry]\nType=Application\nName=cswap tray\n"
+        f"Exec=\"{python or sys.executable}\" -m claude_swap.tray\n"
+        "X-GNOME-Autostart-enabled=true\n"
+    )
+
+
 def is_startup_enabled() -> bool:
+    if sys.platform == "linux":
+        return _autostart_path().is_file()
     if sys.platform != "win32":
         return False
     import winreg
@@ -133,7 +164,15 @@ def is_startup_enabled() -> bool:
 
 
 def set_startup(enabled: bool) -> None:
-    """Add or remove this app's own Run-key value (never touches other entries)."""
+    """Add or remove this app's own startup entry (never touches other entries)."""
+    if sys.platform == "linux":
+        path = _autostart_path()
+        if enabled:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(autostart_entry(), encoding="utf-8")
+        else:
+            path.unlink(missing_ok=True)
+        return
     if sys.platform != "win32":
         return
     import winreg
@@ -149,7 +188,19 @@ def set_startup(enabled: bool) -> None:
 
 
 def _acquire_single_instance():
-    """Return a mutex handle if this is the only tray, else None (keep it referenced)."""
+    """Return a handle if this is the only tray, else None (keep it referenced)."""
+    if sys.platform == "linux":
+        import fcntl
+
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+        lock = open(runtime / LOCK_FILE, "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock.close()
+            return None
+        return lock  # the flock lives as long as this file object
+
     import ctypes
 
     handle = ctypes.windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
@@ -162,9 +213,12 @@ def _acquire_single_instance():
 
 def run(switcher) -> int:
     """Run the tray app until Quit; returns 0, or 1 if a dependency is missing."""
-    if sys.platform != "win32":
-        print("cswap tray is only available on Windows.", file=sys.stderr)
+    if not SUPPORTED:
+        print("cswap tray is only available on Windows and Linux.", file=sys.stderr)
         return 1
+    if sys.platform == "linux":
+        # Wayland can't pin windows to an edge; XWayland can (the pill needs that).
+        os.environ.setdefault("GDK_BACKEND", "x11")
     try:
         import pystray
         import webview
@@ -235,6 +289,8 @@ def run(switcher) -> int:
             snap = api.snapshot()
             if "accounts" in snap:
                 cards[:] = snap["accounts"]
+                if pill is not None:
+                    pill.update(cards)
                 icon.title = tooltip(cards)
                 icon.update_menu()
             wake.wait(REFRESH_INTERVAL_S)
@@ -275,13 +331,13 @@ def run(switcher) -> int:
         def get(self):
             rows = [
                 {"key": "notifications", "label": "Notifications", "group": "Notifications",
-                 "help": "Windows toasts for the events below", "value": settings.notifications},
+                 "help": "Desktop notifications for the events below", "value": settings.notifications},
             ]
             rows += [
                 {"key": field, "label": label, "group": "Notifications", "help": help_, "value": getattr(settings, field)}
                 for field, _kinds, label, help_ in NOTIFY_EVENTS
             ]
-            rows.append({"key": "startup", "label": "Start with Windows", "group": "App",
+            rows.append({"key": "startup", "label": STARTUP_LABEL, "group": "App",
                          "help": "Launch the tray when you sign in", "value": is_startup_enabled()})
             return rows
 
@@ -298,11 +354,40 @@ def run(switcher) -> int:
 
     api.app_options = AppOptions()
 
+    pill = None
+    if sys.platform == "linux":
+        from claude_swap.desktop_notify import send_notification
+        from claude_swap.pill import EDGES, THEMES, PillController
+
+        def say(title, body):
+            threading.Thread(target=send_notification, args=(title, body), daemon=True).start()
+
+        pill = PillController(webview, api, settings, wake.set, say)
+        pill.create()
+
+    def set_pill_option(field, value):
+        setattr(settings, field, value)
+        settings.save(settings_path)
+        if field == "pill_enabled":
+            pill.set_visible(value)
+        elif settings.pill_enabled:
+            pill.relayout()
+        icon.update_menu()
+
+    def pill_option(field, value):
+        """A zero-argument menu action (pystray decides how to call it by argument count)."""
+        return lambda: set_pill_option(field, value)
+
+    def add_account():
+        threading.Thread(target=pill.add_account if pill else api.add_login, daemon=True).start()
+
     def quit_app():
         quitting.set()
         wake.set()
         api.shutdown()
         icon.stop()
+        if pill is not None:
+            pill.destroy()
         window.destroy()
 
     def build_menu():
@@ -313,14 +398,32 @@ def run(switcher) -> int:
             )
             for card in cards
         ] or [pystray.MenuItem("No managed accounts", None, enabled=False)]
+        pill_items = ()
+        if pill is not None:
+            pill_items = (
+                pystray.MenuItem("Pill", pystray.Menu(
+                    pystray.MenuItem("Show pill", lambda: set_pill_option("pill_enabled", not settings.pill_enabled),
+                                     checked=lambda _i: settings.pill_enabled),
+                    pystray.MenuItem("Show on hover", lambda: set_pill_option("pill_fold", not settings.pill_fold),
+                                     checked=lambda _i: settings.pill_fold),
+                    pystray.Menu.SEPARATOR,
+                    *(pystray.MenuItem(e.capitalize(), pill_option("pill_edge", e),
+                                       checked=lambda _i, e=e: settings.pill_edge == e, radio=True) for e in EDGES),
+                    pystray.Menu.SEPARATOR,
+                    *(pystray.MenuItem(t.capitalize(), pill_option("pill_theme", t),
+                                       checked=lambda _i, t=t: settings.pill_theme == t, radio=True) for t in THEMES),
+                )),
+            )
         return (
             pystray.MenuItem("Open cswap", open_window, default=True),
             pystray.Menu.SEPARATOR,
             *accounts,
+            pystray.MenuItem("Add account (browser login)", add_account),
             pystray.MenuItem("Switch to best", switch_best),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Auto-switch", toggle_auto, checked=lambda _i: settings.auto_switch),
             pystray.MenuItem("Notifications", toggle_notifications, checked=lambda _i: settings.notifications),
+            *pill_items,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_app),
         )
@@ -334,8 +437,19 @@ def run(switcher) -> int:
             api.auto(True)
         icon.run_detached()
         threading.Thread(target=refresh_loop, daemon=True).start()
+        if pill is not None:
+            threading.Thread(target=pill.start, daemon=True).start()
 
-    webview.start(on_ready, icon=str(ico) if ico.is_file() else None)
+    window_icon = ico if ico.is_file() else None
+    if window_icon and sys.platform == "linux":
+        # GTK can't load .ico files: hand the window a PNG copy.
+        png = Path(switcher.backup_dir) / "cswap.png"
+        try:
+            image.save(png)
+            window_icon = png
+        except (OSError, ValueError):
+            window_icon = None
+    webview.start(on_ready, icon=str(window_icon) if window_icon else None)
     return 0
 
 
@@ -351,11 +465,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if "--install-startup" in argv:
             set_startup(True)
-            print("cswap tray will start with Windows.")
+            print(f"cswap tray will start on {'Windows startup' if sys.platform == 'win32' else 'login'}.")
             return 0
         if "--uninstall-startup" in argv:
             set_startup(False)
-            print("cswap tray will no longer start with Windows.")
+            print("cswap tray will no longer start automatically.")
             return 0
         return run(ClaudeAccountSwitcher())
     except ClaudeSwitchError as e:

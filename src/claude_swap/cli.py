@@ -1045,6 +1045,7 @@ Commands:
   %(prog)s switch                     rotate to the next account
   %(prog)s switch <num|email>         switch to a specific account
   %(prog)s add                        add the current account
+  %(prog)s add --login                log in to a new account without switching to it
   %(prog)s add-token [TOKEN|-]        register a setup-token or API key
   %(prog)s remove <num|email>         remove an account
   %(prog)s disable <num|email>        hold an account out of auto-rotation
@@ -1070,7 +1071,7 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s desktop                    desktop window (Tkinter)
-  %(prog)s tray                       Windows tray icon (opens the desktop window)
+  %(prog)s tray                       System tray icon (Windows/Linux; opens the desktop window)
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
 
@@ -1135,6 +1136,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "weekly limits when comparing accounts (comma-separated display "
             "names, or 'all'). Defaults to the autoswitch.model setting"
         ),
+    )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="With 'add': log in to a new account in a temporary profile, leaving the active login untouched",
     )
     parser.add_argument(
         "--slot",
@@ -1374,6 +1380,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "'switch --strategy next-available'"
         )
 
+    if args.login and not args.add_account:
+        parser.error("--login can only be used with 'add'")
+    if args.login and args.slot is not None:
+        parser.error("--login cannot be combined with --slot")
     if args.slot is not None and not (args.add_account or args.add_token is not None):
         parser.error("--slot can only be used with 'add' or 'add-token'")
 
@@ -1436,7 +1446,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
-        if args.add_account:
+        if args.add_account and args.login:
+            from claude_swap.addlogin import add_via_login
+
+            print(add_via_login(interactive=True))
+        elif args.add_account:
             switcher.add_account(slot=args.slot, alias=args.alias)
         elif args.add_token is not None:
             switcher.add_account_from_token(
@@ -1525,7 +1539,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
             if args.install_startup or args.uninstall_startup:
                 tray.set_startup(args.install_startup)
-                print("cswap tray will %s with Windows." % ("start" if args.install_startup else "no longer start"))
+                print("cswap tray will %s on login." % ("start" if args.install_startup else "no longer start"))
                 sys.exit(0)
             sys.exit(tray.run(switcher))
     except ClaudeSwitchError as e:

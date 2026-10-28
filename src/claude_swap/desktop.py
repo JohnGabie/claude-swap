@@ -232,6 +232,22 @@ class DesktopApi:
     def add_current(self) -> dict:
         return self._act(lambda: self._switcher.add_account(assume_yes=True))
 
+    def add_login(self) -> dict:
+        """Log in to a new account in a temporary profile; the active login is untouched.
+
+        Runs outside the action lock: signing in can take minutes and must not block
+        switching. cswap's own file locks guard the roster write.
+        """
+        from claude_swap.addlogin import add_via_login
+        from claude_swap.exceptions import ClaudeSwitchError
+
+        try:
+            out = add_via_login()
+        except ClaudeSwitchError as e:
+            return {"ok": False, "output": str(e)}
+        self._refresh_due = True
+        return {"ok": True, "output": out}
+
     def add_token(self, email, token) -> dict:
         email, token = str(email or "").strip(), str(token or "").strip()
         if not email or not token:
