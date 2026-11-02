@@ -84,6 +84,59 @@ def test_pill_is_against_the_screen_side_of_its_window():
     assert lay["pill"][1] + pill.THICKNESS == lay["win"][3]
 
 
+@pytest.mark.parametrize("env,expected", [
+    ({"I3SOCK": "/run/user/1000/i3/ipc-socket.1"}, True),
+    ({"XDG_CURRENT_DESKTOP": "i3"}, True),
+    ({"XDG_CURRENT_DESKTOP": "ubuntu:GNOME"}, False),
+    ({}, False),
+])
+def test_is_i3(env, expected):
+    assert pill.is_i3(env) is expected
+
+
+def _i3_output(name, x, y, w, h, bar):
+    return {
+        "type": "output", "name": name, "rect": {"x": x, "y": y, "width": w, "height": h},
+        "nodes": [
+            {"type": "dockarea", "name": "topdock", "rect": {"x": x, "y": y, "width": w, "height": bar}},
+            {"type": "con", "name": "content", "rect": {"x": x, "y": y + bar, "width": w, "height": h - bar}},
+        ],
+    }
+
+
+def test_i3_content_rect_is_the_monitor_under_the_point_minus_its_bar():
+    tree = {"nodes": [
+        # i3's scratchpad output really does overlap the first monitor, with an empty content
+        {"type": "output", "name": "__i3", "rect": {"x": 0, "y": 0, "width": 1920, "height": 1080}, "nodes": [
+            {"type": "con", "name": "content", "rect": {"x": 0, "y": 0, "width": 0, "height": 0}},
+        ]},
+        _i3_output("DP-0", 0, 0, 1920, 1080, 30),
+        _i3_output("DP-4", 1920, 0, 1920, 1080, 0),
+    ]}
+    assert pill.i3_content_rect(tree, 0, 0) == (0, 30, 1920, 1050)
+    assert pill.i3_content_rect(tree, 1920, 0) == (1920, 0, 1920, 1080)
+    assert pill.i3_content_rect(tree, 9999, 0) is None
+    assert pill.i3_content_rect({}, 0, 0) is None
+
+
+@pytest.mark.parametrize("edge", ["left", "right"])
+def test_offset_moves_a_side_pill_along_its_edge(edge):
+    area = (0, 30, 1920, 1050)
+    base = pill.window_layout(edge, 3, area)["win"]
+    assert pill.window_layout(edge, 3, area, 80)["win"][1] == base[1] + 80
+    assert pill.window_layout(edge, 3, area, -80)["win"][1] == base[1] - 80
+
+
+@pytest.mark.parametrize("offset", [5000, -5000])
+def test_offset_keeps_the_pill_on_the_monitor_and_ignores_top_and_bottom(offset):
+    area = (0, 30, 1920, 1050)
+    assert pill.window_layout("top", 3, area, offset) == pill.window_layout("top", 3, area)
+    lay = pill.window_layout("left", 3, area, offset)
+    x, y, w, h = lay["win"]
+    assert y >= 30 and y + h <= 30 + 1050
+    assert contains((0, 0, w, h), lay["pill"])
+
+
 def test_pill_payload_carries_each_accounts_card_data():
     lay = pill.window_layout("right", 2, AREA)
     payload = pill.pill_payload([card(1, 73, 15, active=True), card(2, None, None)], "right", "white", lay)

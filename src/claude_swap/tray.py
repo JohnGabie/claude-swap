@@ -56,6 +56,7 @@ class TraySettings:
     pill_enabled: bool = sys.platform == "linux"
     pill_fold: bool = True  # "Show on hover": the pill rests as a small sliver and opens when the pointer reaches the edge
     pill_edge: str = "right"
+    pill_offset: int = 0  # px below centre on the left/right edges (negative: above)
     pill_theme: str = "black"
 
     @classmethod

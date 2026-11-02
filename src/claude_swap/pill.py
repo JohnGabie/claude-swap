@@ -14,6 +14,8 @@ bottom is the only part that touches pywebview, imported lazily.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import threading
 
 EDGES = ("right", "left", "top", "bottom")
@@ -125,13 +127,14 @@ def card_height(n_rows: int) -> int:
 CARD_MAX_H = card_height(2) + 8  # the tallest card (5-hour + weekly rows), plus slack for its border/rounding
 
 
-def window_layout(edge: str, n_accounts: int, area: tuple[int, int, int, int]) -> dict:
+def window_layout(edge: str, n_accounts: int, area: tuple[int, int, int, int], offset: int = 0) -> dict:
     """Geometry of the one window that holds both the pill and its hover card.
 
     Like Codenotch, the card lives inside the pill's own transparent window and the
     window's input region is cut down to the pill and card (see ``set_hot``), so the
     empty remainder never intercepts clicks. Returns the window's screen rectangle and
-    the pill's rectangle inside it; the page places the card itself.
+    the pill's rectangle inside it; the page places the card itself. ``offset`` moves a
+    left/right pill that many px below centre (negative: above), stopping at the monitor's ends.
     """
     pw, ph = pill_size(edge, n_accounts)
     ax, ay, aw, ah = area
@@ -139,7 +142,7 @@ def window_layout(edge: str, n_accounts: int, area: tuple[int, int, int, int]) -
     if is_vertical(edge):
         w, h = pw + room + CARD_W, max(ph, CARD_MAX_H)
         x = ax + aw - w if edge == "right" else ax
-        centre = ay + ah / 2
+        centre = max(ay + ph / 2, min(ay + ah / 2 + offset, ay + ah - ph / 2))
         y = int(max(ay, min(centre - h / 2, ay + ah - h)))
         px = w - pw if edge == "right" else 0
         py = int(round(centre - y - ph / 2))
@@ -489,6 +492,40 @@ function render(p){
 
 # ---- the window --------------------------------------------------------------
 
+def is_i3(env=None) -> bool:
+    """Running under i3, which needs the pill handled differently (see ``_tune_x11``)."""
+    env = os.environ if env is None else env
+    return bool(env.get("I3SOCK")) or "i3" in env.get("XDG_CURRENT_DESKTOP", "").lower().split(":")
+
+
+def i3_content_rect(tree: dict, x: int, y: int) -> tuple[int, int, int, int] | None:
+    """The monitor at (x, y) minus its bars, from an i3 layout tree.
+
+    i3 publishes no ``_NET_WORKAREA``, so GDK reports the whole monitor. A workspace's own
+    rect is no substitute: it is inset by i3's gaps, which would lift the pill off the edge.
+    """
+    for output in tree.get("nodes") or ():
+        r = output.get("rect") or {}
+        # __i3 is i3's internal scratchpad output: it has a real rect but no real content
+        if output.get("type") != "output" or output.get("name") == "__i3" or not r.get("width") or not r.get("height"):
+            continue
+        if not (r["x"] <= x < r["x"] + r["width"] and r["y"] <= y < r["y"] + r["height"]):
+            continue
+        for con in output.get("nodes") or ():
+            if con.get("name") == "content":
+                c = con["rect"]
+                return c["x"], c["y"], c["width"], c["height"]
+    return None
+
+
+def _i3_work_area(x: int, y: int) -> tuple[int, int, int, int] | None:
+    try:
+        out = subprocess.run(["i3-msg", "-t", "get_tree"], capture_output=True, timeout=2, check=True).stdout
+        return i3_content_rect(json.loads(out), x, y)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+
+
 def work_area() -> tuple[int, int, int, int] | None:
     """(x, y, w, h) of the primary monitor minus panels/docks, or None if unknown."""
     try:
@@ -500,7 +537,7 @@ def work_area() -> tuple[int, int, int, int] | None:
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
         r = monitor.get_workarea()
-        return r.x, r.y, r.width, r.height
+        return (is_i3() and _i3_work_area(r.x, r.y)) or (r.x, r.y, r.width, r.height)
     except Exception:
         return None
 
@@ -540,6 +577,7 @@ class PillController:
         self._hot: list[list[float]] = []
         self._loaded = threading.Event()
         self._visible = False
+        self._placed: dict | None = None
 
     # ---- setup -----------------------------------------------------------
     def create(self) -> None:
@@ -571,17 +609,20 @@ class PillController:
         self.cards = list(cards)
         if not self._visible:
             return
-        self.relayout() if resized else self._push()
+        # Also when the layout moved under us: a bar came up, or a monitor changed.
+        self.relayout() if resized or self._layout() != self._placed else self._push()
 
     def relayout(self) -> None:
         lay = self._layout()
+        self._placed = lay
         self._hot = []  # until the page reports again, only the pill takes input
         self._push()
         _place(self.window, lay["win"], lambda: self._hot or [lay["pill"]])
 
     def _layout(self) -> dict:
         edge = normalize_edge(self.settings.pill_edge)
-        return window_layout(edge, len(self.cards), work_area() or self._screen_area())
+        area = work_area() or self._screen_area()
+        return window_layout(edge, len(self.cards), area, getattr(self.settings, "pill_offset", 0))
 
     def _screen_area(self):
         s = self._wv.screens[0]
@@ -706,12 +747,15 @@ def _place(window, win_rect, hot) -> None:
         gw.resize(w, h)
         gw.show_all()
         gw.move(x, y)
+        if is_i3():  # override-redirect (see _tune_x11): no window manager acts on GTK's request
+            gw.get_window().move(x, y)
         _apply_input_region(gw, hot() or [[0, 0, w, h]])
 
     _gtk_call(window, apply)
 
 
 LEAVE_GRACE_MS = 250  # Codenotch's LEAVE_GRACE (linux_pointer.rs)
+RAISE_INTERVAL_S = 2  # i3 restacks its own windows without regard for an unmanaged one
 
 
 def _tune_x11(window) -> None:
@@ -720,6 +764,11 @@ def _tune_x11(window) -> None:
     GTK enter/leave on the window are relayed to the page as ``codenotchPointer(bool)``, with a
     250 ms grace before a leave (``linux_pointer.rs``). They are what a compositor reliably sends;
     DOM mouseleave is not.
+
+    i3 takes any dock window as a bar: it ignores the requested position and reserves the window's
+    full height on the monitor. So under i3 the window is override-redirect, which keeps it out of
+    the window manager altogether: placed exactly, on every workspace, never focused. It keeps the
+    dock hint, which i3 then never reads, for the sake of compositor rules that match on it.
     """
     import time
 
@@ -779,5 +828,17 @@ def _tune_x11(window) -> None:
         w.connect("enter-notify-event", on_enter)
         w.connect("leave-notify-event", on_leave)
         w.connect("destroy", lambda _w: cancel())
+        if is_i3():
+            w.realize()
+            w.get_window().set_override_redirect(True)
+            GLib.timeout_add_seconds(RAISE_INTERVAL_S, keep_on_top, w)
+
+    def keep_on_top(w) -> bool:
+        gdk_window = w.get_window()
+        if gdk_window is None:
+            return False
+        if w.get_visible():
+            gdk_window.raise_()
+        return True
 
     _gtk_call(window, apply)
