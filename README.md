@@ -360,6 +360,57 @@ Weekly windows (`sevenDay` and per-model `scoped` entries — never `fiveHour`) 
 
 `cswap auto --json` emits an event *stream* instead — one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}` with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`). The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
 
+### Usage feed for pacing (`cswap pace`)
+
+`cswap pace --json` prints the plan and the stored usage of each account. Tools that pace their work read it. The command is JSON-only, so `cswap pace` prints the same JSON.
+
+```bash
+cswap pace --json
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "accounts": [
+    { "id": 1, "alias": "work", "plan": "max", "status": "ok",
+      "fetchedAt": "2026-11-10T11:58:12Z",
+      "fiveHour": { "pct": 41.0, "resetsAt": "2026-11-10T14:00:00Z" },
+      "sevenDay": { "pct": 12.5, "resetsAt": "2026-11-14T09:00:00Z" } }
+  ]
+}
+```
+
+The fields of each account:
+
+- `id`: the account number.
+- `alias`: the alias that you set with `cswap alias`. The field is absent when the account has no alias.
+- `plan`: `pro`, `max` or `unknown`.
+- `status`: `ok`, `stale`, `api_key`, `token_expired`, `relogin_needed`, `no_credentials` or `unavailable`.
+- `error`: the same word as `status`. It is present only when `status` is not `ok` or `stale`. Such an account has no usage windows.
+- `fetchedAt`: the time of the stored measurement.
+- `fiveHour` and `sevenDay`: the usage windows. `pct` is a number from 0 to 100. `resetsAt` is the reset time.
+
+All times are ISO 8601 in UTC, with whole seconds, for example `2026-11-10T14:00:00Z`. A window or a `resetsAt` value is absent when the stored value is missing or not valid. Read a missing key as "unknown". The command never guesses a value. If the stored measurement time is not valid, the account is `unavailable`, with no `fetchedAt` and no windows. If the stored measurement time is a whole number too large to read, the command answers `unavailable` and exits with `4`.
+
+The exit codes:
+
+- `0`: no account failed. Each account is `ok`, `stale` or `api_key`. An `api_key` account counts as read. Zero accounts also give `0`.
+- `3`: partial data. At least one account failed, and at least one account was read (`ok`, `stale` or `api_key`).
+- `4`: usage unavailable. Every account failed, or an error occurred. On an error, stdout is only `{"schemaVersion":1,"error":"unavailable"}`. If stdout closes before the JSON is written, for example `cswap pace | head -c 0`, the command prints nothing and exits with `4`.
+- `2`: a usage error, for example a flag that `pace` does not accept, or a flag before `pace` (`cswap --json pace`).
+- `130`: interrupted with Ctrl-C. The command prints nothing.
+
+Privacy and safety:
+
+- The output has no email, no organization, no account name and no token.
+- The output shows `alias`. An alias can hold a personal name. Do not put a name in an alias if other tools or logs must not see it.
+- The command reads only the usage that cswap already stored. It makes no network call. It renews no token and switches no account.
+- The command writes no credential, no config and no usage data.
+- The command does not accept `--debug`, because debug logging writes to stderr.
+- On an error, the command prints no error text and no traceback. cswap can still write the error to its log file, `claude-swap.log`, in the cswap data folder.
+- An account added before cswap supported organizations has no `organizationUuid` in its record. `pace` does not migrate that record. The account shows as `unavailable` until another cswap command, for example `cswap list`, migrates it.
+- If cswap must first move its data folder or run a data migration, `pace` does not do it. It prints the error payload and exits with `4`. Run another cswap command, for example `cswap list`, then run `pace` again.
+
 ### Add an account from a raw token or API key
 
 If you only have a long-lived setup-token (e.g., produced by `claude setup-token`)

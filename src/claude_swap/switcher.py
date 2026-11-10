@@ -1766,7 +1766,9 @@ class ClaudeAccountSwitcher:
             accounts_info, fetch=fetch, scheduled=scheduled
         )
 
-    def accounts_snapshot(self, fetch: set[str] | None = None) -> AccountsSnapshot:
+    def accounts_snapshot(
+        self, fetch: set[str] | None = None, *, read_only: bool = False
+    ) -> AccountsSnapshot:
         """One-pass structured snapshot of every managed account, for the TUI.
 
         Metadata, active-slot detection, and usage entries all come from a
@@ -1776,9 +1778,15 @@ class ClaudeAccountSwitcher:
         has ``_collect_usage_entries`` semantics: ``None`` makes every stale
         account eligible; a set restricts which accounts *may* be fetched
         this pass.
+
+        ``read_only=True`` (``cswap pace``) writes nothing: the sequence file
+        is read without the org-field migration, a healed dead-token strike
+        is left in place, and no fetch is reserved or run.
         """
-        accounts_info = self._build_accounts_info()
-        entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        accounts_info = self._build_accounts_info(read_only=read_only)
+        entries = self._collect_usage_entries(
+            accounts_info, fetch=fetch, read_only=read_only
+        )
         seq_data = self._get_sequence_data() or {}
         active_number: str | None = None
         accounts: list[AccountSnapshot] = []
@@ -4237,15 +4245,24 @@ class ClaudeAccountSwitcher:
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
 
-    def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
+    def _build_accounts_info(
+        self, *, read_only: bool = False
+    ) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
 
         Shared by list_accounts and the usage-aware switch helpers so the active
         slot is detected and credentials are read in exactly one place. The
         active account's credentials come from Claude Code's live store; every
         other slot reads its backup copy.
+
+        ``read_only=True`` reads the sequence file without the org-field
+        migration (which rewrites it), so a record that predates org support
+        yields an empty org uuid.
         """
-        data = self._get_sequence_data_migrated() or {}
+        if read_only:
+            data = self._get_sequence_data() or {}
+        else:
+            data = self._get_sequence_data_migrated() or {}
         current_identity = self._get_current_account()
 
         # Find active account number by (email, organizationUuid) composite key
@@ -5178,8 +5195,12 @@ class ClaudeAccountSwitcher:
         fetch: set[str] | None = None,
         *,
         scheduled: bool = False,
+        read_only: bool = False,
     ) -> dict[str, UsageEntry]:
         """Store-backed usage collection: one :class:`UsageEntry` per account.
+
+        ``read_only=True`` writes nothing to the usage store: a healed
+        dead-token strike is not cleared, and no slot is reserved or fetched.
 
         ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
         strategies, dashboards) makes every account a candidate but respects
@@ -5221,7 +5242,7 @@ class ClaudeAccountSwitcher:
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
-            elif entry.auth_dead_strikes and entry.token_dead():
+            elif entry.auth_dead_strikes and entry.token_dead() and not read_only:
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
                 # Clear the stale strike ROW too: display and fetch
@@ -5236,7 +5257,10 @@ class ClaudeAccountSwitcher:
             for num in info_by_num
             if num not in sentinels and (fetch is None or num in fetch)
         ]
-        if fetch is None:
+        if read_only:
+            # No lease, no fetch: reserve() stamps the row it wins.
+            claims: dict[str, str] = {}
+        elif fetch is None:
             # Repair reset-parked plans written by releases that stopped
             # polling exhausted accounts until their advertised reset. The
             # store recognizes that impossible deadline shape under the same
