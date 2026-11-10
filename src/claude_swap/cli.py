@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
+import logging
 import math
 import os
 import sys
+import warnings
+from types import SimpleNamespace
 
-from claude_swap import __version__, paths, printer
+from claude_swap import __version__, pace_feed, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
-from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
+from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN, Platform
 from claude_swap.printer import (
     accent,
     bolded,
@@ -874,6 +879,171 @@ Defaults live in settings.json in the backup root; flags override them.
         sys.exit(130)
 
 
+#: Exit code of an interrupted ``pace`` run (the CLI's usual Ctrl-C code).
+_PACE_EXIT_INTERRUPTED = 130
+
+#: The one registered migration that can act on each platform. Each
+#: migration returns False (skip, nothing recorded, nothing written) on any
+#: other platform, so only this ID is ever recorded there. Linux and WSL have
+#: none. ``tests/test_pace_cli.py`` checks this map against a real
+#: ``run_migrations`` on each platform.
+_PACE_PLATFORM_MIGRATION = {
+    Platform.MACOS: "macos_keyring_to_security",
+    Platform.WINDOWS: "windows_keyring_to_files",
+}
+
+
+def _pace_construction_writes() -> bool:
+    """Whether building a switcher now would move or write cswap data.
+
+    ``ClaudeAccountSwitcher.__init__`` runs two one-time steps that write:
+    the legacy ``~/.claude-swap-backup`` move (which also prints its path),
+    and, on macOS/Windows, the pending credential migration of that
+    platform. ``pace`` is read-only (P2), so it refuses to build a switcher
+    while either step is pending. This check only reads; it mirrors the
+    conditions under which those steps act (``paths.migrate_legacy_backup_dir``
+    and ``migrations.run_migrations``). A corrupt ``sequence.json`` counts as
+    pending: the migration then writes nothing, and pace gives exit 4 anyway.
+    """
+    backup = paths.get_backup_root()
+    legacy = paths.get_legacy_backup_root()
+    try:
+        same_path = legacy.resolve() == backup.resolve()
+    except OSError:
+        same_path = legacy == backup
+    if not same_path and (
+        legacy.exists() or paths.migration_flag_for(backup).exists()
+    ):
+        return True
+
+    migration_id = _PACE_PLATFORM_MIGRATION.get(Platform.detect())
+    # The platform migration skips (and writes nothing) until a sequence
+    # file exists; once it does, a pending one may write.
+    if migration_id is not None and (backup / "sequence.json").exists():
+        from claude_swap.migrations import _load_applied
+
+        applied = _load_applied(SimpleNamespace(backup_dir=backup))
+        if migration_id not in applied:
+            return True
+    return False
+
+
+def _pace_discard_stdout() -> None:
+    """Send the rest of stdout to the null device, after a failed write.
+
+    Python flushes stdout at shutdown; the JSON still in its buffer would
+    fail again there and print an error to stderr. Pointing the stdout file
+    descriptor at the null device makes that flush succeed and print nothing.
+    A stdout with no descriptor (or None) is replaced by a null-device stream
+    instead. The old stream is closed first: its finalizer would otherwise
+    flush it again and print "Exception ignored" to stderr. With no null
+    device, the replacement is an in-memory buffer; this never raises.
+    """
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        # close() flushes; on the Ctrl-C path that flush can raise
+        # KeyboardInterrupt again, which must not escape either.
+        with contextlib.suppress(Exception, KeyboardInterrupt):
+            sys.stdout.close()
+        try:
+            sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+        except OSError:
+            sys.stdout = io.StringIO()
+
+
+def _pace_payload() -> tuple[dict, int]:
+    """Build the ``pace`` payload and exit code; never raises an Exception.
+
+    Its own handler, not the shared ``ClaudeSwitchError`` one: that one prints
+    ``error_envelope(e)``, which copies ``str(exc)``. Any Exception here —
+    also from building the switcher — gives the bare unavailable payload and
+    exit 4, with no exception text, type or traceback (Security req. 4, 5).
+
+    Nothing the run writes to ``sys.stdout``/``sys.stderr`` gets out: both are
+    sent to a discarded buffer, warnings are ignored, and a NullHandler on the
+    root logger keeps Python's last-resort handler (which writes to stderr)
+    from firing for a logger without handlers. Log records still reach the
+    cswap log file through the switcher's file handler.
+    """
+    sink = io.StringIO()
+    root_guard = logging.NullHandler()
+    root_logger = logging.getLogger()
+    root_logger.addHandler(root_guard)
+    try:
+        with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                if _pace_construction_writes():
+                    return pace_feed.unavailable_payload(), pace_feed.EXIT_UNAVAILABLE
+                # debug=False: no console log handler. `pace` rejects --debug.
+                switcher = ClaudeAccountSwitcher(debug=False)
+                return pace_feed.build_pace(switcher)
+    except Exception:
+        return pace_feed.unavailable_payload(), pace_feed.EXIT_UNAVAILABLE
+    finally:
+        root_logger.removeHandler(root_guard)
+
+
+def _pace_command(argv: list[str]) -> None:
+    """Handle ``cswap pace [--json]``: the read-only usage feed for guilda.
+
+    Pre-dispatched before the theme probe and the main parser: ``pace`` takes
+    no other flag, so any other flag is an argparse error (exit 2). It prints
+    one JSON document (the command is JSON-only, so ``--json`` is optional)
+    and exits with the code of :func:`pace_feed.build_pace` (0, 3 or 4).
+    It runs no root check, no update check and no network call.
+    """
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} pace",
+        description=(
+            "Print each account's plan and stored usage windows as one JSON "
+            "document. Reads only stored usage: no network call, no switch, "
+            "no write. Exit 0: no account failed; 3: some accounts failed; "
+            "4: usage unavailable."
+        ),
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON (the default and only output of pace)",
+    )
+    # Declared only to reject it with a clear message: debug logging adds a
+    # console handler that sends credential-reader errors to stderr.
+    parser.add_argument("--debug", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.debug:
+        parser.error(
+            "--debug cannot be used with 'pace' (debug logging writes to stderr)"
+        )
+
+    try:
+        payload, code = _pace_payload()
+    except KeyboardInterrupt:
+        sys.exit(_PACE_EXIT_INTERRUPTED)
+    # The write is under the pace handler too: a closed reader (`| head`)
+    # or another output error prints nothing and exits 4, and Ctrl-C exits
+    # 130, with no traceback and nothing on stderr.
+    try:
+        sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except KeyboardInterrupt:
+        _pace_discard_stdout()
+        sys.exit(_PACE_EXIT_INTERRUPTED)
+    except OSError:
+        _pace_discard_stdout()
+        sys.exit(pace_feed.EXIT_UNAVAILABLE)
+    except Exception:
+        # sys.stdout is None (`>&-`: AttributeError) or closed (ValueError).
+        _pace_discard_stdout()
+        sys.exit(pace_feed.EXIT_UNAVAILABLE)
+    sys.exit(code)
+
+
 def _config_command(argv: list[str]) -> None:
     """Handle `cswap config [list|get KEY|set KEY VALUE|unset KEY|path]`.
 
@@ -1106,8 +1276,14 @@ def _menubar_service(args) -> int:
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
-    _use_native_tls()
     argv = sys.argv[1:]
+    # `pace` runs before the theme probe (an OSC query on the terminal, and a
+    # settings read that can log) and before TLS setup: it prints only JSON
+    # and makes no network call.
+    if argv and argv[0] == "pace":
+        _pace_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
+    _use_native_tls()
     try:
         from claude_swap.appearance import cli_should_probe, cli_theme
         # `run` execs a child that takes over the terminal, and `--json`
@@ -1192,6 +1368,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
+  %(prog)s pace [--json]              print plan and stored usage as JSON (read-only)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
