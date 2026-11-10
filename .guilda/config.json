@@ -1,0 +1,48 @@
+{
+  "guildaVersion": "0.1.0",
+  "languages": {
+    "replies": "pt-BR",
+    "docs": "en"
+  },
+  "tiers": {
+    "master": "opus",
+    "journeyman": "sonnet",
+    "apprentice": "haiku"
+  },
+  "writing": {
+    "free": [
+      "docs/superpowers/**"
+    ],
+    "exceptions": [
+      {
+        "docType": "LICENSE",
+        "level": "skip",
+        "reason": "Fixed legal text"
+      },
+      {
+        "docType": "THIRD_PARTY_NOTICES.md",
+        "level": "skip",
+        "reason": "Third-party legal notices"
+      }
+    ]
+  },
+  "security": {
+    "enabled": true,
+    "riskAreas": [
+      "credentials-and-tokens",
+      "personal-data",
+      "account-transfer"
+    ]
+  },
+  "checks": [
+    {
+      "name": "test",
+      "command": "uv run pytest"
+    }
+  ],
+  "scan": {
+    "ignore": [
+      "tests/fixtures/**"
+    ]
+  }
+}
