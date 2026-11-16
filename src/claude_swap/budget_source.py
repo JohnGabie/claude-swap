@@ -45,7 +45,7 @@ def token_rates(root: Path, pace: dict, now: float) -> dict:
     return budget_calibrate.rates(store, _plans(pace))
 
 
-def current_budget(now: float | None = None) -> dict:
+def current_budget(now: float | None = None, horizon_hours: tuple | None = None) -> dict:
     """The budget of the fleet now. Never raises: a failure gives advice ``unknown``."""
     now = time.time() if now is None else now
     try:
@@ -61,6 +61,7 @@ def current_budget(now: float | None = None) -> dict:
             weekly_threshold=settings.weekly_threshold,
             token_rates=token_rates(root, pace, now),
             token_meta=token_model.meta(),
+            horizon_hours=horizon_hours,
         )
     except Exception:  # noqa: BLE001 - a planner must get an answer, not a traceback
         return budget.build_budget({}, now)
@@ -92,3 +93,57 @@ def hook_line(session: str, now: float | None = None) -> str | None:
         return budget.advice_line(current)
     except Exception:  # noqa: BLE001 - a hook must never break a prompt
         return None
+
+
+def measure_account(account=None, now: float | None = None) -> dict:
+    """Token rate of one account (or of all): rates, own sums and confidence. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        from claude_swap import budget_calibrate
+        from claude_swap.cli import _pace_payload
+
+        root = paths.get_backup_root()
+        pace, _code = _pace_payload()
+        plans = _plans(pace)
+        rates = token_rates(root, pace, now)
+        store = budget_calibrate.load_store(root)
+        wanted = None if account is None else str(account)
+        rows = []
+        for number in sorted(plans, key=lambda n: (len(n), n)):
+            if wanted is not None and number != wanted:
+                continue
+            own = store["accounts"].get(number) or {}
+            rate = rates[number]
+            rows.append({
+                "id": int(number) if number.isdigit() else number,
+                "plan": plans[number],
+                "confidence": rate["confidence"],
+                "weekly": {
+                    "weightedTokensPerPoint": round(rate["weekPerPct"]),
+                    "prior": round(token_model.prior_rate(plans[number], "week")),
+                    "ownPoints": rate["ownWeekPoints"],
+                    "ownTokens": round((own.get("week") or {}).get("tokens") or 0),
+                },
+                "fiveHour": {
+                    "weightedTokensPerPoint": round(rate["fivePerPct"]),
+                    "prior": round(token_model.prior_rate(plans[number], "five")),
+                    "ownPoints": rate["ownFivePoints"],
+                    "ownTokens": round((own.get("five") or {}).get("tokens") or 0),
+                },
+                "externalPoints": own.get("externalPoints", 0.0),
+            })
+        last = store.get("lastPoll")
+        return {
+            "generatedAt": budget._iso(now),
+            "accounts": rows,
+            "lastPointAt": budget._iso(last[0]) if isinstance(last, list) and last else None,
+            "drift": None,
+            **token_model.meta(),
+            "assumptions": [
+                "the rate is the account's own data pulled toward the community prior",
+                "drift is not computed yet: the store keeps totals, not a recent window",
+                "externalPoints are weekly points that rose with no token in the local logs",
+            ],
+        }
+    except Exception:  # noqa: BLE001
+        return {"generatedAt": budget._iso(now), "accounts": [], "error": "unavailable"}

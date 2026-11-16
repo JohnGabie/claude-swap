@@ -212,6 +212,7 @@ def build_budget(
     weekly_threshold: float | None = None,
     token_rates: dict | None = None,
     token_meta: dict | None = None,
+    horizon_hours: tuple | None = None,
 ) -> dict:
     """The budget of the fleet at ``now``, from one ``cswap pace`` payload.
 
@@ -269,7 +270,7 @@ def build_budget(
         _add_tokens(a, rates.get(str(a["id"])))
     has_tokens = bool(measured_accounts) and all(a["_week_rate"] is not None for a in measured_accounts)
     horizons = []
-    for hours in HORIZON_HOURS:
+    for hours in (horizon_hours or HORIZON_HOURS):
         end = now + hours * 3600.0
         inside = [a for a in accounts if a["measured"] and a["_reset7"] is not None and a["_reset7"] <= end]
         expiring = sum(a["sevenDay"]["remainingUnits"] for a in inside)

@@ -28,12 +28,11 @@ What the method cannot see:
 from __future__ import annotations
 
 import json
-import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from claude_swap import decision_log, token_model
+from claude_swap import decision_log, token_model, usage_log
 
 STORE_VERSION = 2
 # Two polls farther apart than this are not one interval (the engine was off).
@@ -86,45 +85,12 @@ def read_polls(backup_root: Path) -> list[tuple[float, str, float | None, float 
 
 
 def claude_projects_dir(env=None) -> Path:
-    env = os.environ if env is None else env
-    base = env.get("CLAUDE_CONFIG_DIR")
-    return (Path(base) if base else Path.home() / ".claude") / "projects"
+    return usage_log.claude_projects_dir(env)
 
 
 def read_token_events(projects_dir: Path, since: float) -> list[tuple[float, float]]:
-    """``(time, weighted tokens)`` of each assistant message after ``since``.
-
-    A message repeats on several lines of a log; one (message id, request id)
-    counts once. Files not changed since ``since`` are skipped.
-    """
-    events: dict[tuple, tuple[float, float]] = {}
-    try:
-        files = [p for p in projects_dir.rglob("*.jsonl") if p.stat().st_mtime >= since]
-    except OSError:
-        return []
-    for path in files:
-        try:
-            handle = path.open(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        with handle:
-            for line in handle:
-                if '"usage"' not in line:
-                    continue
-                try:
-                    row = json.loads(line)
-                except ValueError:
-                    continue
-                message = row.get("message") if isinstance(row, dict) else None
-                usage = message.get("usage") if isinstance(message, dict) else None
-                ts = _ts(row.get("timestamp")) if isinstance(row, dict) else None
-                if not isinstance(usage, dict) or ts is None or ts <= since:
-                    continue
-                key = (message.get("id"), row.get("requestId"))
-                if key == (None, None):
-                    key = (str(path), ts)
-                events[key] = (ts, token_model.weighted_tokens(message.get("model"), usage))
-    return sorted(events.values())
+    """``(time, weighted tokens)`` of each assistant message after ``since``."""
+    return [(m["ts"], m["weighted"]) for m in usage_log.read_messages(projects_dir, since)]
 
 
 def empty_store() -> dict:
