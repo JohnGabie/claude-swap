@@ -7,7 +7,9 @@ rule P1: the state file never holds an email or an account name.
 Manual call sites (all call ``autoswitch.record_manual_switch``):
 ``cli.py`` (``--switch``, ``--switch-to``), ``tui/app.py`` (``do_switch``,
 ``action_switch_best``) and ``menubar.py`` (``run_manual_switch``, used by the
-two menu callbacks). ``AutoSwitchEngine._perform`` never calls it.
+two menu callbacks) and ``desktop.py`` (``DesktopApi.switch`` and
+``DesktopApi.best``, which the tray menu and the pill also call).
+``AutoSwitchEngine._perform`` never calls it.
 """
 
 from __future__ import annotations
@@ -563,13 +565,245 @@ class TestMenubarCallSite:
 
 
 # ---------------------------------------------------------------------------
+# Call sites: desktop window API (the tray menu and the pill call the same API)
+# ---------------------------------------------------------------------------
+
+
+class _DesktopSwitcher:
+    """Stand-in for ``ClaudeAccountSwitcher`` behind ``DesktopApi``."""
+
+    def __init__(self, backup_dir: Path, *, result="switched"):
+        self.backup_dir = backup_dir
+        self.active = 1
+        self.result = result  # "switched" | "noop" | "refused" | "error"
+        self.calls: list[str] = []
+
+    def _get_sequence_data(self):
+        return {"activeAccountNumber": self.active, "accounts": {}}
+
+    def _do(self, name, json_output, target):
+        self.calls.append(name)
+        if self.result == "refused":
+            raise ClaudeSwitchError("refused")
+        if self.result == "error":
+            raise RuntimeError("broken")
+        moved = self.result == "switched"
+        old = self.active
+        if moved:
+            self.active = target
+            print(f"Switched to #{target}")
+        else:
+            print("Already active")
+        if not json_output:
+            return None
+        return {
+            "switched": moved,
+            "from": {"number": old, "email": ""},
+            "to": {"number": self.active, "email": ""},
+            "reason": "switched" if moved else "already-active",
+        }
+
+    def switch(self, strategy=None, json_output=False, models=(), model_source=None):
+        return self._do("switch", json_output, 2)
+
+    def switch_to(self, identifier, json_output=False, force=False):
+        return self._do("switch_to", json_output, int(identifier))
+
+
+class _NoSource:
+    def take(self, **_kw):
+        raise AssertionError("no snapshot is needed here")
+
+
+def _desktop_api(tmp_path: Path, **kw):
+    from claude_swap.desktop import DesktopApi
+
+    sw = _DesktopSwitcher(tmp_path, **kw)
+    return DesktopApi(sw, source=_NoSource()), sw
+
+
+_DESKTOP_ACTIONS = [
+    pytest.param(lambda api: api.switch(2), "switch_to", id="switch_to"),
+    pytest.param(lambda api: api.best(), "switch", id="switch"),
+]
+
+
+class TestDesktopCallSite:
+    @pytest.mark.parametrize("action, name", _DESKTOP_ACTIONS)
+    def test_records_after_a_successful_switch(self, tmp_path, action, name):
+        api, sw = _desktop_api(tmp_path)
+        out = action(api)
+        assert out["ok"] is True and sw.calls == [name]
+        assert isinstance(_state(tmp_path)["lastManualSwitchAt"], float)
+
+    @pytest.mark.parametrize("action, name", _DESKTOP_ACTIONS)
+    def test_records_once_after_the_switch_with_the_switcher_root(
+        self, tmp_path, action, name
+    ):
+        api, sw = _desktop_api(tmp_path)
+        seen = []
+        with patch(
+            "claude_swap.autoswitch.record_manual_switch",
+            side_effect=lambda root, **kw: seen.append((root, sw.active, kw)),
+        ):
+            action(api)
+        # One record, with the switcher's root, when account 2 is already active.
+        assert seen == [(tmp_path, 2, {})]
+
+    @pytest.mark.parametrize("action, name", _DESKTOP_ACTIONS)
+    def test_keeps_the_printed_output_of_the_switch(self, tmp_path, action, name):
+        api, _sw = _desktop_api(tmp_path)
+        assert action(api) == {"ok": True, "output": "Switched to #2"}
+
+    @pytest.mark.parametrize("action, name", _DESKTOP_ACTIONS)
+    def test_does_not_record_a_no_op(self, tmp_path, action, name):
+        api, sw = _desktop_api(tmp_path, result="noop")
+        assert action(api)["ok"] is True and sw.calls == [name]
+        assert not _recorded(tmp_path)
+
+    @pytest.mark.parametrize("action, name", _DESKTOP_ACTIONS)
+    def test_does_not_record_a_refused_switch(self, tmp_path, action, name):
+        api, sw = _desktop_api(tmp_path, result="refused")
+        assert action(api)["ok"] is False and sw.calls == [name]
+        assert not _recorded(tmp_path)
+
+    @pytest.mark.parametrize("action, name", _DESKTOP_ACTIONS)
+    def test_does_not_record_an_error(self, tmp_path, action, name):
+        api, sw = _desktop_api(tmp_path, result="error")
+        out = action(api)
+        assert out["ok"] is False and "RuntimeError" in out["output"]
+        assert sw.calls == [name]
+        assert not _recorded(tmp_path)
+
+    @pytest.mark.parametrize("action, name", _DESKTOP_ACTIONS)
+    def test_does_not_record_when_another_action_runs(self, tmp_path, action, name):
+        api, sw = _desktop_api(tmp_path)
+        api._action.acquire()
+        try:
+            out = action(api)
+        finally:
+            api._action.release()
+        assert out["ok"] is False and sw.calls == []
+        assert not _recorded(tmp_path)
+
+    @pytest.mark.parametrize("action, name", _DESKTOP_ACTIONS)
+    def test_a_failing_record_does_not_fail_the_switch(self, tmp_path, action, name):
+        api, sw = _desktop_api(tmp_path)
+        with patch("claude_swap.autoswitch.record_manual_switch",
+                   side_effect=RuntimeError("boom")):
+            out = action(api)
+        assert out == {"ok": True, "output": "Switched to #2"}
+        assert sw.active == 2
+
+    def test_other_actions_do_not_record(self, tmp_path):
+        api, sw = _desktop_api(tmp_path)
+        sw.set_account_disabled = lambda num, disabled: None
+        sw.remove_account = lambda num, assume_yes=False: None
+        assert api.set_disabled(2, True)["ok"] is True
+        assert api.remove(2)["ok"] is True
+        assert not _recorded(tmp_path)
+
+
+class TestTrayAndPillCallSites:
+    """The tray menu and the pill switch through ``DesktopApi`` only, so the
+    record of ``DesktopApi`` is the one record of each switch."""
+
+    def _count(self, tmp_path, drive):
+        api, sw = _desktop_api(tmp_path)
+        seen = []
+        with patch("claude_swap.autoswitch.record_manual_switch",
+                   side_effect=lambda root, **kw: seen.append(root)):
+            drive(api)
+        assert sw.active == 2
+        return seen
+
+    def test_pill_switch_records_exactly_once(self, tmp_path):
+        from claude_swap import pill
+
+        def drive(api):
+            ctl = pill.PillController(
+                None, api, None, on_change=lambda: None, notify=lambda *a: None
+            )
+            assert pill.PillBridge(ctl).switch(2) == {"ok": True}
+
+        assert self._count(tmp_path, drive) == [tmp_path]
+
+    def test_pill_does_not_record_a_refused_switch(self, tmp_path):
+        from claude_swap import pill
+
+        api, _sw = _desktop_api(tmp_path, result="refused")
+        ctl = pill.PillController(
+            None, api, None, on_change=lambda: None, notify=lambda *a: None
+        )
+        assert pill.PillBridge(ctl).switch(2) == {"ok": False}
+        assert not _recorded(tmp_path)
+
+    def test_tray_calls_record_exactly_once(self, tmp_path):
+        """The tray menu callbacks are closures of ``tray.run`` (needs
+        pystray): drive the two API calls the callbacks make."""
+        assert self._count(tmp_path, lambda api: api.switch(2)) == [tmp_path]
+        assert self._count(tmp_path, lambda api: api.best()) == [tmp_path]
+
+    def test_tray_and_pill_have_no_second_record_layer(self):
+        """Pin the wiring in the source: one layer records, the API."""
+        from claude_swap import pill, tray
+
+        tray_src = inspect.getsource(tray)
+        pill_src = inspect.getsource(pill)
+        for src in (tray_src, pill_src):
+            assert "record_manual_switch" not in src
+            assert "_record_if_switched" not in src
+            assert not re.search(r"switcher\.(switch_to|switch)\b(?!_)", src)
+        run_src = inspect.getsource(tray.run)
+        assert len(re.findall(r"\bapi\.switch\(num\)", run_src)) == 1
+        assert len(re.findall(r"\bapi\.best\(\)", run_src)) == 1
+        assert len(re.findall(r"self\._api\.switch\(num\)", pill_src)) == 1
+
+
+class TestDesktopEngineIsNotManual:
+    def _factory_engine(self, h):
+        """The engine that ``DesktopApi`` creates, on the harness clock."""
+        from claude_swap.desktop import DesktopApi
+
+        api = DesktopApi(h.switcher, source=_NoSource())
+        with patch("claude_swap.settings.load_settings", return_value=h.settings):
+            engine = api._engine_factory(h.switcher, h.events.append)
+        assert isinstance(engine, autoswitch.AutoSwitchEngine)
+        assert engine.dry_run is False
+        engine.clock = h.clock
+        h.engine = engine
+        return api
+
+    def test_engine_of_the_desktop_factory_does_not_record(self, temp_home):
+        h = _balanced(temp_home)
+        self._factory_engine(h)
+        with patch("claude_swap.autoswitch.record_manual_switch") as rec:
+            assert h.tick_with_usage(PRO_BETTER) is TickOutcome.SWITCHED
+        rec.assert_not_called()
+        assert h.active_number() == 2
+
+    def test_engine_of_the_desktop_factory_leaves_the_key_out(self, temp_home):
+        h = _balanced(temp_home)
+        self._factory_engine(h)
+        assert h.tick_with_usage(PRO_BETTER) is TickOutcome.SWITCHED
+        assert "lastManualSwitchAt" not in h.state()
+
+    def test_engine_gets_the_switcher_and_not_the_api(self, temp_home):
+        """The engine switches on the switcher, so no API record is on its path."""
+        h = _balanced(temp_home)
+        self._factory_engine(h)
+        assert h.engine.switcher is h.switcher
+
+
+# ---------------------------------------------------------------------------
 # Rejected call sites
 # ---------------------------------------------------------------------------
 
 
 def test_no_other_source_calls_a_switch_for_a_user_action():
     """Evidence for the rejected sites: the only callers of the switcher's
-    ``switch`` or ``switch_to`` are cli, tui/app, menubar and the engine."""
+    ``switch`` or ``switch_to`` are cli, tui/app, menubar, desktop and the
+    engine. The tray and the pill switch through ``DesktopApi``."""
     root = Path(autoswitch.__file__).parent
     pattern = re.compile(r"\.(switch_to|switch)\b(?!_)")
     found = set()
@@ -580,4 +814,6 @@ def test_no_other_source_calls_a_switch_for_a_user_action():
         if re.search(r"(switcher|self\.switcher)\.(switch_to|switch)\(|"
                      r"switcher\.(switch_to|switch),", text):
             found.add(path.relative_to(root).as_posix())
-    assert found == {"autoswitch.py", "cli.py", "menubar.py", "tui/app.py"}
+    assert found == {
+        "autoswitch.py", "cli.py", "desktop.py", "menubar.py", "tui/app.py",
+    }
