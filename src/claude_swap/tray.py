@@ -139,6 +139,22 @@ SWITCH_MODES = (
 THRESHOLD_MIN, THRESHOLD_MAX = 50, 99
 
 
+# The state of a row is written in its text. Themed check and radio marks
+# can be invisible (seen with a GTK theme that draws them as a thin line).
+def toggle_label(name: str, on: bool) -> str:
+    return f"{name}: {'On' if on else 'Off'}"
+
+
+def choice_label(label: str, selected: bool) -> str:
+    return f"{'\u25cf' if selected else '\u25cb'}  {label}"
+
+
+def mode_label(strategy: str) -> str:
+    """Short name of a strategy for the 'Switch mode' row."""
+    full = dict(SWITCH_MODES).get(strategy, strategy)
+    return full.split(":")[0]
+
+
 def threshold_label(value: float) -> str:
     return f"{value:g}%"
 
@@ -160,7 +176,7 @@ body{background:#1b1b1f;color:#f2f0e3;font:14px system-ui,sans-serif;padding:20p
 h1{font-size:15px;font-weight:600;margin:0 0 4px}
 p{margin:0;color:#a9a79c;font-size:12.5px;line-height:1.4}
 #val{font-size:44px;font-weight:700;font-variant-numeric:tabular-nums;text-align:center;margin:14px 0 6px}
-input[type=range]{width:100%;accent-color:#e0a800}
+input[type=range]{width:100%;accent-color:#e0a800;outline:none}
 .ends{display:flex;justify-content:space-between;color:#8d8b82;font-size:11px;margin-top:2px}
 .row{display:flex;gap:10px;justify-content:flex-end;margin-top:auto}
 button{font:inherit;padding:7px 16px;border-radius:8px;border:1px solid #3a3a41;background:#26262b;color:inherit;cursor:pointer}
@@ -284,6 +300,10 @@ def run(switcher) -> int:
     if sys.platform == "linux":
         # Wayland can't pin windows to an edge; XWayland can (the pill needs that).
         os.environ.setdefault("GDK_BACKEND", "x11")
+        # WebKit's DMABUF renderer draws nothing on some GPU drivers (NVIDIA:
+        # "Failed to create GBM buffer", blank windows, invisible pill).
+        # Shared-memory buffers work everywhere.
+        os.environ.setdefault("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1")
     try:
         import pystray
         import webview
@@ -390,6 +410,7 @@ def run(switcher) -> int:
 
     def toggle_notifications():
         set_notifications(not settings.notifications)
+        icon.update_menu()
 
     class AppOptions:
         """The tray's own options, shown in the window's Settings dialog."""
@@ -474,6 +495,24 @@ def run(switcher) -> int:
     def set_mode(strategy):
         return lambda: save_core("autoswitch.strategy", strategy)
 
+    # The threshold window is driven through GTK directly, as the pill is:
+    # pywebview's show/hide wrappers wait on events that a window created
+    # hidden never fires, so a second open could hang.
+    def threshold_gtk(fn):
+        from gi.repository import GLib
+        from webview.platforms import gtk as wgtk
+
+        def run():
+            view = wgtk.BrowserView.instances.get(threshold_window.uid)
+            if view is not None:
+                fn(view)
+            return False
+
+        GLib.idle_add(run)
+
+    def hide_threshold():
+        threshold_gtk(lambda view: view.window.hide())
+
     class ThresholdDialog:
         """What the threshold window calls through ``pywebview.api``."""
 
@@ -482,12 +521,12 @@ def run(switcher) -> int:
 
         def confirm(self, value):
             number = clamp_threshold(value)
-            threshold_window.hide()
+            hide_threshold()
             if number is not None:
                 save_core("autoswitch.threshold", number)
 
         def cancel(self):
-            threshold_window.hide()
+            hide_threshold()
 
     threshold_window = webview.create_window(
         "cswap threshold", html=THRESHOLD_PAGE, js_api=ThresholdDialog(), width=380, height=290,
@@ -497,35 +536,35 @@ def run(switcher) -> int:
     def on_threshold_closing():
         if quitting.is_set():
             return None
-        threshold_window.hide()
+        hide_threshold()
         return False
 
     threshold_window.events.closing += on_threshold_closing
 
     def open_threshold():
-        def action():
-            threshold_window.show()
-            threshold_window.restore()
-            threshold_window.evaluate_js("window.setValue&&window.setValue(%d)" % clamp_threshold(core_settings().threshold))
-        threading.Thread(target=action, daemon=True).start()
+        value = clamp_threshold(core_settings().threshold)
+
+        def show(view):
+            view.webview.run_javascript("window.setValue&&window.setValue(%d)" % value, None, None, None)
+            view.window.show_all()
+            view.window.deiconify()
+            view.window.present()
+
+        threshold_gtk(show)
 
     def build_menu():
         accounts = ()
         if show_account_rows(pill_available=pill is not None, pill_enabled=settings.pill_enabled):
             accounts = [
-                pystray.MenuItem(
-                    account_label(card), switch_to(card["num"]),
-                    checked=lambda _item, c=card: c["active"], radio=True,
-                )
+                pystray.MenuItem(choice_label(account_label(card), bool(card["active"])), switch_to(card["num"]))
                 for card in cards
             ] or [pystray.MenuItem("No managed accounts", None, enabled=False)]
         core = core_settings()
         auto_on = lambda _i: settings.auto_switch  # noqa: E731 - mode and threshold belong to auto-switch
         mode_menu = pystray.MenuItem(
-            "Switch mode",
+            f"Switch mode: {mode_label(core.strategy)}",
             pystray.Menu(*(
-                pystray.MenuItem(label, set_mode(name),
-                                 checked=lambda _i, n=name: core.strategy == n, radio=True)
+                pystray.MenuItem(choice_label(label, core.strategy == name), set_mode(name))
                 for name, label in SWITCH_MODES
             )),
             enabled=auto_on,
@@ -536,16 +575,16 @@ def run(switcher) -> int:
         if pill is not None:
             pill_items = (
                 pystray.MenuItem("Pill", pystray.Menu(
-                    pystray.MenuItem("Show pill", lambda: set_pill_option("pill_enabled", not settings.pill_enabled),
-                                     checked=lambda _i: settings.pill_enabled),
-                    pystray.MenuItem("Show on hover", lambda: set_pill_option("pill_fold", not settings.pill_fold),
-                                     checked=lambda _i: settings.pill_fold),
+                    pystray.MenuItem(toggle_label("Show pill", settings.pill_enabled),
+                                     lambda: set_pill_option("pill_enabled", not settings.pill_enabled)),
+                    pystray.MenuItem(toggle_label("Show only on hover", settings.pill_fold),
+                                     lambda: set_pill_option("pill_fold", not settings.pill_fold)),
                     pystray.Menu.SEPARATOR,
-                    *(pystray.MenuItem(e.capitalize(), pill_option("pill_edge", e),
-                                       checked=lambda _i, e=e: settings.pill_edge == e, radio=True) for e in EDGES),
+                    *(pystray.MenuItem(choice_label(f"{e.capitalize()} edge", settings.pill_edge == e),
+                                       pill_option("pill_edge", e)) for e in EDGES),
                     pystray.Menu.SEPARATOR,
-                    *(pystray.MenuItem(t.capitalize(), pill_option("pill_theme", t),
-                                       checked=lambda _i, t=t: settings.pill_theme == t, radio=True) for t in THEMES),
+                    *(pystray.MenuItem(choice_label(f"{t.capitalize()} theme", settings.pill_theme == t),
+                                       pill_option("pill_theme", t)) for t in THEMES),
                 )),
             )
         return (
@@ -555,11 +594,11 @@ def run(switcher) -> int:
             pystray.MenuItem("Add account (browser login)", add_account),
             pystray.MenuItem("Switch to best", switch_best),
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Auto-switch", toggle_auto, checked=lambda _i: settings.auto_switch),
+            pystray.MenuItem(toggle_label("Auto-switch", settings.auto_switch), toggle_auto),
             mode_menu,
             threshold_item,
             pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Notifications", toggle_notifications, checked=lambda _i: settings.notifications),
+            pystray.MenuItem(toggle_label("Notifications", settings.notifications), toggle_notifications),
             *pill_items,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_app),

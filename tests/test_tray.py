@@ -100,3 +100,13 @@ def test_account_rows_only_without_a_visible_pill():
     assert tray.show_account_rows(pill_available=False, pill_enabled=False) is True
     assert tray.show_account_rows(pill_available=True, pill_enabled=False) is True
     assert tray.show_account_rows(pill_available=True, pill_enabled=True) is False
+
+
+def test_row_state_is_written_in_the_text():
+    assert tray.toggle_label("Auto-switch", True) == "Auto-switch: On"
+    assert tray.toggle_label("Auto-switch", False) == "Auto-switch: Off"
+    assert tray.choice_label("Left edge", True).startswith("\u25cf")
+    assert tray.choice_label("Left edge", False).startswith("\u25cb")
+    assert tray.mode_label("balanced") == "Balanced"
+    assert tray.mode_label("best") == "Simple"
+    assert tray.mode_label("other") == "other"
