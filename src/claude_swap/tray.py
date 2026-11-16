@@ -336,6 +336,7 @@ def run(switcher) -> int:
         settings.auto_switch = not settings.auto_switch
         settings.save(settings_path)
         api.auto(settings.auto_switch)
+        icon.update_menu()  # greys or restores 'Switch balanced'
 
     def set_notifications(on):
         settings.notifications = on
@@ -419,6 +420,18 @@ def run(switcher) -> int:
             icon.update_menu()
         return lambda: threading.Thread(target=action, daemon=True).start()
 
+    def toggle_balanced():
+        def action():
+            from claude_swap.settings import load_settings
+
+            on = load_settings(Path(switcher.backup_dir)).strategy == "balanced"
+            # Off returns to the default strategy; the active account stays.
+            res = api.save_settings({"autoswitch.strategy": None if on else "balanced"}, {})
+            if not res["ok"] and res["output"]:
+                icon.notify(res["output"], "cswap")
+            icon.update_menu()
+        threading.Thread(target=action, daemon=True).start()
+
     def build_menu():
         from claude_swap.settings import load_settings
 
@@ -431,7 +444,9 @@ def run(switcher) -> int:
                 )
                 for card in cards
             ] or [pystray.MenuItem("No managed accounts", None, enabled=False)]
-        threshold = load_settings(Path(switcher.backup_dir)).threshold
+        core = load_settings(Path(switcher.backup_dir))
+        threshold = core.threshold
+        balanced = core.strategy == "balanced"
         threshold_menu = pystray.MenuItem(
             f"Switch at {threshold_label(threshold)}",
             pystray.Menu(*(
@@ -464,6 +479,9 @@ def run(switcher) -> int:
             pystray.MenuItem("Switch to best", switch_best),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Auto-switch", toggle_auto, checked=lambda _i: settings.auto_switch),
+            # Greyed, and still checked, while auto-switch is off.
+            pystray.MenuItem("Switch balanced", toggle_balanced, checked=lambda _i: balanced,
+                             enabled=lambda _i: settings.auto_switch),
             threshold_menu,
             pystray.MenuItem("Notifications", toggle_notifications, checked=lambda _i: settings.notifications),
             *pill_items,
