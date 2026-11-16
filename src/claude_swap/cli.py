@@ -1640,6 +1640,44 @@ def _record_if_switched(switcher, payload, active_before) -> None:
         pass
 
 
+def _budget_command(argv: list[str]) -> None:
+    """``cswap budget``: the fleet budget for planning, as JSON.
+
+    ``--hook`` is for a Claude Code ``UserPromptSubmit`` hook: it reads the
+    hook JSON on stdin and prints one advice line only when the advice
+    changed for that session. It always exits 0 and prints nothing on error.
+    """
+    from claude_swap import budget_source
+
+    parser = argparse.ArgumentParser(
+        prog="cswap budget",
+        description=(
+            "Print the quota budget of the account fleet as JSON: advice, fleet "
+            "sums, each account and the weekly resets. No email, no token, no network."
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="Emit JSON (the default output)")
+    parser.add_argument(
+        "--hook", action="store_true",
+        help="Prompt-hook mode: one advice line, only when it changed for the session",
+    )
+    args = parser.parse_args(argv)
+    if args.hook:
+        session = "default"
+        try:
+            raw = json.loads(sys.stdin.read() or "{}")
+            if isinstance(raw, dict) and isinstance(raw.get("session_id"), str) and raw["session_id"]:
+                session = raw["session_id"][:128]
+        except (OSError, ValueError):
+            pass
+        line = budget_source.hook_line(session)
+        if line:
+            print(line)
+        sys.exit(0)
+    print(json.dumps(budget_source.current_budget(), indent=2))
+    sys.exit(0)
+
+
 def _debug_report_command(argv: list[str]) -> None:
     """``cswap debug-report``: text for a bug report, with no email, no
     organization or account name and no token. Read-only, no network."""
@@ -1681,6 +1719,15 @@ def main() -> None:
     if argv and argv[0] == "pace":
         _pace_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
+    # `budget` and `mcp` print only their own output (JSON, one hook line, or
+    # the MCP stdio stream), so they also run before the theme probe.
+    if argv and argv[0] == "budget":
+        _budget_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
+    if argv and argv[0] == "mcp":
+        from claude_swap import mcp_server
+
+        sys.exit(mcp_server.run())
     # `debug-report` reads local files only and prints plain text.
     if argv and argv[0] == "debug-report":
         _debug_report_command(argv[1:])
@@ -1778,6 +1825,8 @@ Commands:
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s pace [--json]              print plan and stored usage as JSON (read-only)
   %(prog)s debug-report [-o FILE]     settings, state and last decisions for a bug report (no emails)
+  %(prog)s budget [--hook]            quota budget of the fleet as JSON, for planning (read-only)
+  %(prog)s mcp                        MCP server (stdio) with get_budget and get_advice
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
