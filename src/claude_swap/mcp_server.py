@@ -124,8 +124,13 @@ def run() -> int:
                     session_id: str | None = None, outcome: str = "done") -> dict:
         """Record one finished task of an orchestrator. cswap sums its tokens from the local
         logs by agent_id (preferred) or session_id; the caller counts nothing. Times are
-        ISO 8601 with a zone. project_hash must be a hash, never a path. outcome: done,
-        failed or stalled. This history feeds estimate_task and fits."""
+        ISO 8601 with a zone; with an agent_id they may be approximate (the answer gives
+        firstTokenAt and lastTokenAt), with a session_id only they bound what counts. project_hash must be a hash, never a path. outcome is one of
+        done / finished (stored as done), failed / error (stored as failed), stalled /
+        limit / timeout (stored as stalled); another word is refused. Only tasks stored as
+        done feed estimate_task and fits. Recording the same agent_id (or task_id and
+        attempt) again replaces the earlier record, so a task with matchedInLogs false
+        can be recorded again later."""
         return measure.record_task(root(), usage_log.claude_projects_dir(), {
             "role": role, "started_at": started_at, "ended_at": ended_at, "tier": tier,
             "model": model, "tool": tool, "task_id": task_id, "address": address,

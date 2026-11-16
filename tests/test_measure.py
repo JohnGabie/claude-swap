@@ -143,11 +143,11 @@ def task(i, role="executor", tier="master", model="claude-opus-5-5", agent=None,
 
 def test_record_task_sums_the_tokens_of_its_agent(env):
     root, projects, logs, _ = env
-    logs(msg(NOW + 100, "m1", agent="a0", out=2000), msg(NOW + 200, "m2", agent="other", out=9999),
-         msg(NOW + 900, "m3", agent="a0", out=9999))  # after the task ended
+    logs(msg(NOW + 100, "m1", agent="a0", out=2000), msg(NOW + 200, "m2", agent="other", out=9999))
     out = measure.record_task(root, projects, task(0, task_id="T3", address="T3-exe-7f2a",
                                                   project_hash="ab12", attempt=1), NOW + 600)
     assert out["ok"] and out["matchedInLogs"] and out["weightedTokens"] == 10_000
+    assert out["timeWindow"] == "15-minute-margin" and out["firstTokenAt"] == iso(NOW + 100)
     row = json.loads((root / "tasks.jsonl").read_text())
     assert row["role"] == "executor" and row["address"] == "T3-exe-7f2a" and row["projectHash"] == "ab12"
     assert row["usage"]["weightedTokens"] == 10_000 and row["durationSeconds"] == 500
@@ -223,3 +223,51 @@ def test_fits_yes_tight_no_and_unknown(env):
     mixed = measure.fits(root, wave + [{"role": "qa"}], _budget(10**9), 24)
     assert mixed["fits"] == "unknown" and mixed["unknownTasks"] == 1
     assert measure.fits(root, [], _budget(10**9), 24)["fits"] == "unknown"
+
+
+def test_outcome_words_map_and_an_unknown_word_is_refused(env):
+    root, projects, _logs, _ = env
+    for given, stored in (("done", "done"), ("finished", "done"), ("error", "failed"),
+                          ("failed", "failed"), ("limit", "stalled"), ("timeout", "stalled"),
+                          ("Stalled", "stalled")):
+        assert measure.record_task(root, projects, task(0, outcome=given), NOW)["ok"]
+        row = json.loads((root / "tasks.jsonl").read_text().splitlines()[-1])
+        assert row["outcome"] == stored and row["outcomeGiven"] == given.lower()
+    bad = measure.record_task(root, projects, task(0, outcome="maybe"), NOW)
+    assert bad["error"] == "bad-outcome" and "finished" in bad["allowed"]
+
+
+def test_an_agent_id_tolerates_approximate_times(env):
+    root, projects, logs, _ = env
+    # The agent ran 2 minutes before the window the caller gave (minute precision).
+    logs(msg(NOW - 125, "m1", agent="a0", out=1000), msg(NOW - 102, "m2", agent="a0", out=1000))
+    out = measure.record_task(root, projects, task(0), NOW + 600)
+    assert out["matchedInLogs"] and out["weightedTokens"] == 10_000
+    assert out["firstTokenAt"] == iso(NOW - 125) and out["lastTokenAt"] == iso(NOW - 102)
+
+
+def test_an_agent_far_from_the_given_times_uses_the_wide_window(env):
+    root, projects, logs, _ = env
+    logs(msg(NOW - 3 * 3600, "m1", agent="a0", out=1000))
+    out = measure.record_task(root, projects, task(0), NOW + 600)
+    assert out["matchedInLogs"] and out["timeWindow"] == "6-hour-margin"
+
+
+def test_a_session_id_keeps_the_window_as_given(env):
+    root, projects, logs, _ = env
+    logs(msg(NOW - 120, "m1", session="sx", out=1000), msg(NOW + 100, "m2", session="sx", out=1000))
+    fields = task(0, agent="unused")
+    fields.pop("agent_id")
+    out = measure.record_task(root, projects, {**fields, "session_id": "sx"}, NOW + 600)
+    assert out["weightedTokens"] == 5000 and out["timeWindow"] == "as-given"
+
+
+def test_recording_a_task_again_replaces_the_earlier_record(env):
+    root, projects, logs, _ = env
+    measure.record_task(root, projects, task(0), NOW)          # before the log was written
+    logs(msg(NOW + 100, "m1", agent="a0", inp=700))
+    measure.record_task(root, projects, task(0), NOW + 600)    # the same task, now with tokens
+    measure.record_task(root, projects, task(0), NOW + 700)    # and once more
+    rows = measure._read(root / "tasks.jsonl")
+    assert len(rows) == 3 and len(measure.latest_tasks(rows)) == 1
+    assert measure.estimate_task(root, "executor")["weightedTokens"]["n"] == 1

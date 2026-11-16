@@ -1640,6 +1640,18 @@ def _record_if_switched(switcher, payload, active_before) -> None:
         pass
 
 
+# `cswap budget` exit codes (a contract for scripts; see `cswap budget --help`).
+BUDGET_EXIT_OK = 0
+BUDGET_EXIT_NO_ACCOUNTS = 2
+BUDGET_EXIT_UNREADABLE = 3
+BUDGET_EXIT_USAGE = 4
+BUDGET_EXIT_BY_STATUS = {
+    "ok": BUDGET_EXIT_OK,
+    "no-accounts": BUDGET_EXIT_NO_ACCOUNTS,
+    "unavailable": BUDGET_EXIT_UNREADABLE,
+}
+
+
 def _budget_command(argv: list[str]) -> None:
     """``cswap budget``: the fleet budget for planning, as JSON.
 
@@ -1649,14 +1661,27 @@ def _budget_command(argv: list[str]) -> None:
     """
     from claude_swap import budget_source
 
-    parser = argparse.ArgumentParser(
+    class _Parser(argparse.ArgumentParser):
+        def error(self, message):  # a usage error is exit 4: 2 means "no accounts" here
+            self.print_usage(sys.stderr)
+            self.exit(BUDGET_EXIT_USAGE, f"{self.prog}: error: {message}\n")
+
+    parser = _Parser(
         prog="cswap budget",
         description=(
             "Print the quota budget of the account fleet as JSON: advice, fleet "
             "sums, each account and the weekly resets. No email, no token, no network."
         ),
+        epilog=(
+            "Exit codes: 0 ok, 2 no accounts set up, 3 the usage source cannot be read, "
+            "4 usage error. --json prints the same object as the MCP tool get_budget, "
+            "on one line, and writes nothing."
+        ),
     )
-    parser.add_argument("--json", action="store_true", help="Emit JSON (the default output)")
+    parser.add_argument(
+        "--json", action="store_true",
+        help="One-line JSON for scripts; read-only (the token rates are not refreshed)",
+    )
     parser.add_argument(
         "--hook", action="store_true",
         help="Prompt-hook mode: one advice line, only when it changed for the session",
@@ -1691,8 +1716,13 @@ def _budget_command(argv: list[str]) -> None:
         if line:
             print(line)
         sys.exit(0)
-    print(json.dumps(budget_source.current_budget(), indent=2))
-    sys.exit(0)
+    if args.json:
+        result = budget_source.current_budget(refresh_calibration=False)
+        print(json.dumps(result, separators=(",", ":")))
+    else:
+        result = budget_source.current_budget()
+        print(json.dumps(result, indent=2))
+    sys.exit(BUDGET_EXIT_BY_STATUS.get(result.get("status"), BUDGET_EXIT_UNREADABLE))
 
 
 def _debug_report_command(argv: list[str]) -> None:

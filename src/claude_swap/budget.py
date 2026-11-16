@@ -35,6 +35,10 @@ DATA_STATUSES = frozenset({"ok", "stale"})
 HORIZON_HOURS = (24, 72, 168)
 
 NOTES = (
+    "status: ok, no-accounts (nothing is set up) or unavailable (the usage source cannot be read).",
+    "fetchedAt is the oldest provider read among the measured accounts; each account has its own.",
+    "Per account: fiveHour and sevenDay carry usedPercent (0-100, the same number as pct) and "
+    "resetsAt (ISO 8601). An account with no open 5-hour window has usedPercent 0 and no resetsAt.",
     "1 capacity unit = the weekly quota of one Pro account (pro 1, max 5, ultra 10).",
     "Plan sizes are not published: capacity units and token figures are estimates.",
     "expectedLossUnits is the quota that expires unused if the current pace continues.",
@@ -117,6 +121,7 @@ def _account(raw: dict, now: float, threshold: float, weekly_threshold: float) -
         "usableAt": _iso(usable_at),
         "sevenDay": {
             "pct": _round(pct7),
+            "usedPercent": _round(pct7),
             "resetsAt": _iso(reset7),
             "elapsedPct": _round(elapsed * 100.0) if counted else None,
             "remainingPct": _round(remaining_pct),
@@ -130,6 +135,7 @@ def _account(raw: dict, now: float, threshold: float, weekly_threshold: float) -
     if not no_five and pct5 is not None:
         out["fiveHour"] = {
             "pct": _round(pct5),
+            "usedPercent": _round(pct5),
             "resetsAt": _iso(reset5),
             "headroomPct": _round(max(0.0, threshold - pct5)),
         }
@@ -322,9 +328,20 @@ def build_budget(
             a.pop(key, None)
 
     measured = [a for a in accounts if a["measured"]]
+    if not isinstance(pace, dict) or pace.get("error") or not isinstance(raw_accounts, list):
+        status = "unavailable"
+    elif not accounts:
+        status = "no-accounts"
+    else:
+        status = "ok"
+    reads = sorted(t for t in (_ts(a.get("fetchedAt")) for a in measured) if t is not None)
     return {
         "schemaVersion": SCHEMA_VERSION,
+        "status": status,
         "generatedAt": _iso(now),
+        # The OLDEST provider read among the measured accounts: data is as old as this.
+        "fetchedAt": _iso(reads[0]) if reads else None,
+        "newestFetchedAt": _iso(reads[-1]) if reads else None,
         "advice": advice,
         "reason": reason,
         "fleet": {

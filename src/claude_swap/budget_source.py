@@ -45,10 +45,16 @@ def token_rates(root: Path, pace: dict, now: float) -> dict:
     return budget_calibrate.rates(store, _plans(pace))
 
 
-def current_budget(now: float | None = None, horizon_hours: tuple | None = None) -> dict:
-    """The budget of the fleet now. Never raises: a failure gives advice ``unknown``."""
+def current_budget(now: float | None = None, horizon_hours: tuple | None = None,
+                   refresh_calibration: bool = True) -> dict:
+    """The budget of the fleet now. Never raises: a failure gives advice ``unknown``.
+
+    With ``refresh_calibration=False`` nothing is written: the token rates
+    come from the calibration store as it is.
+    """
     now = time.time() if now is None else now
     try:
+        from claude_swap import budget_calibrate
         from claude_swap.cli import _pace_payload
         from claude_swap.settings import load_settings
 
@@ -59,7 +65,10 @@ def current_budget(now: float | None = None, horizon_hours: tuple | None = None)
             pace, now,
             threshold=settings.threshold,
             weekly_threshold=settings.weekly_threshold,
-            token_rates=token_rates(root, pace, now),
+            token_rates=(
+                token_rates(root, pace, now) if refresh_calibration
+                else budget_calibrate.rates(budget_calibrate.load_store(root), _plans(pace))
+            ),
             token_meta=token_model.meta(),
             horizon_hours=horizon_hours,
         )

@@ -31,7 +31,16 @@ TASKS_FILENAME = "tasks.jsonl"
 MEASURES_FILENAME = "measures.jsonl"
 MIN_N_FOR_ESTIMATE = 5
 MAX_MEASURE_S = 48 * 3600.0
-OUTCOMES = ("done", "failed", "stalled")
+# Margins around the given times when the key is an agent id: first a
+# small one, then a wide one for times that are only approximate.
+AGENT_WINDOWS = (("15-minute-margin", 15 * 60.0), ("6-hour-margin", 6 * 3600.0))
+# Outcome words a caller may send, and the word stored. The guilda end
+# reasons (finished, error, limit, timeout) are accepted as they are.
+OUTCOME_WORDS = {
+    "done": "done", "finished": "done",
+    "failed": "failed", "error": "failed",
+    "stalled": "stalled", "limit": "stalled", "timeout": "stalled",
+}
 
 _SAFE = re.compile(r"[^A-Za-z0-9 _.:#+-]")
 _HASH = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -244,7 +253,9 @@ def record_task(backup_root: Path, projects_dir: Path, fields: dict, now: float)
     """Store one finished task of an orchestrator, with its tokens from the logs.
 
     ``agent_id`` (preferred) or ``session_id`` is the key into the logs.
-    ``started_at`` and ``ended_at`` are ISO 8601 times with a zone.
+    ``started_at`` and ``ended_at`` are ISO 8601 times with a zone. With an
+    agent id the times may be approximate; with a session id only, they bound
+    the tokens that count.
     """
     fields = fields if isinstance(fields, dict) else {}
     began, ended = usage_log.parse_ts(fields.get("started_at")), usage_log.parse_ts(fields.get("ended_at"))
@@ -256,14 +267,30 @@ def record_task(backup_root: Path, projects_dir: Path, fields: dict, now: float)
     project = fields.get("project_hash")
     if project is not None and not (isinstance(project, str) and _HASH.match(project)):
         return {"ok": False, "error": "project-hash-must-be-a-hash"}
-    outcome = fields.get("outcome") if fields.get("outcome") in OUTCOMES else "done"
+    given = fields.get("outcome", "done")
+    given = given.strip().lower() if isinstance(given, str) else given
+    if given not in OUTCOME_WORDS:
+        return {"ok": False, "error": "bad-outcome", "allowed": sorted(OUTCOME_WORDS)}
+    outcome = OUTCOME_WORDS[given]
     agents, sessions = _ids(fields.get("agent_id")), _ids(fields.get("session_id"))
     attempt = fields.get("attempt")
 
-    usage = None
-    if agents or sessions:
+    # An agent id names one run, so its times may be approximate: the window
+    # gets a margin, and a wider one when nothing is found. A session id holds
+    # many tasks, so its window stays as given.
+    usage, window_used, chosen = None, "as-given", []
+    if agents:
+        for name, margin in AGENT_WINDOWS:
+            messages = usage_log.read_messages(projects_dir, began - margin, ended + margin)
+            chosen = usage_log.select(messages, sessions, agents)
+            window_used = name
+            if chosen:
+                break
+        usage = usage_log.summarize(chosen)
+    elif sessions:
         messages = usage_log.read_messages(projects_dir, began - 1.0, ended + 1.0)
-        usage = usage_log.summarize(usage_log.select(messages, sessions, agents))
+        chosen = usage_log.select(messages, sessions, agents)
+        usage = usage_log.summarize(chosen)
     models = sorted(usage["models"]) if usage else []
     row = {
         "schemaVersion": SCHEMA_VERSION,
@@ -284,8 +311,12 @@ def record_task(backup_root: Path, projects_dir: Path, fields: dict, now: float)
         "endedAt": _iso(ended),
         "durationSeconds": round(ended - began),
         "outcome": outcome,
+        "outcomeGiven": given,
         "usage": usage,
         "modelsSeen": models,
+        "timeWindow": window_used,
+        "firstTokenAt": _iso(chosen[0]["ts"]) if chosen else None,
+        "lastTokenAt": _iso(chosen[-1]["ts"]) if chosen else None,
     }
     _append(Path(backup_root) / TASKS_FILENAME, row)
     matched = bool(usage and usage["messages"])
@@ -295,8 +326,30 @@ def record_task(backup_root: Path, projects_dir: Path, fields: dict, now: float)
         "matchedInLogs": matched,
         "weightedTokens": usage["weightedTokens"] if matched else None,
         "modelsSeen": models,
+        "timeWindow": window_used,
+        "firstTokenAt": row["firstTokenAt"],
+        "lastTokenAt": row["lastTokenAt"],
         "note": None if matched else "no token found for these ids in the local logs: the task is stored without usage",
     }
+
+
+def latest_tasks(rows: list[dict]) -> list[dict]:
+    """One row per task: a task recorded again replaces its earlier record.
+
+    The file is append-only, so a correction is a new line. Two lines are the
+    same task when they share the agent ids, or the task id and attempt.
+    """
+    kept: dict[tuple, dict] = {}
+    for index, row in enumerate(rows):
+        agents = tuple(row.get("agentIds") or ())
+        if agents:
+            key = ("agents", agents)
+        elif row.get("taskId"):
+            key = ("task", row.get("taskId"), row.get("attempt"), tuple(row.get("sessionIds") or ()))
+        else:
+            key = ("line", index)
+        kept[key] = row
+    return list(kept.values())
 
 
 def _norm(value) -> str | None:
@@ -314,7 +367,7 @@ def estimate_task(backup_root: Path, role, tier=None, model=None, project_hash=N
     """
     role, tier, model = _norm(role), _norm(tier), _norm(model)
     rows = [
-        r for r in _read(Path(backup_root) / TASKS_FILENAME)
+        r for r in latest_tasks(_read(Path(backup_root) / TASKS_FILENAME))
         if r.get("outcome") == "done" and isinstance(r.get("usage"), dict) and r["usage"].get("weightedTokens")
     ]
 

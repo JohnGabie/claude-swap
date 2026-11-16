@@ -3,6 +3,8 @@
 import json
 from datetime import datetime, timezone
 
+import pytest
+
 from claude_swap import budget
 
 NOW = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc).timestamp()
@@ -473,3 +475,44 @@ def test_current_budget_uses_the_calibration_store(monkeypatch, tmp_path):
     assert b["accounts"][0]["tokenConfidence"] == "low"
     assert b["tokens"]["remainingTokens"] == 14_000_000
     assert "weighted" in b["tokens"]["unit"]
+
+
+# ---- contract for scripts ----------------------------------------------------
+
+def test_status_and_fetched_at_at_the_top():
+    one, two = acc(1, week=50.0), acc(2, week=50.0)
+    one["fetchedAt"], two["fetchedAt"] = iso(NOW - 900), iso(NOW - 60)
+    b = build(one, two)
+    assert b["schemaVersion"] == 1 and b["status"] == "ok"
+    assert b["fetchedAt"] == iso(NOW - 900) and b["newestFetchedAt"] == iso(NOW - 60)
+    assert build()["status"] == "no-accounts" and build()["fetchedAt"] is None
+    for pace in ({"schemaVersion": 1, "error": "unavailable"}, None, {"accounts": "x"}):
+        assert budget.build_budget(pace, NOW)["status"] == "unavailable"
+
+
+def test_windows_carry_used_percent_and_resets_at():
+    a = build(acc(1, five=12.0, five_reset_h=2.0, week=34.0, week_reset_h=50.0))["accounts"][0]
+    assert a["fiveHour"]["usedPercent"] == 12.0 and a["fiveHour"]["resetsAt"] == iso(NOW + 2 * H)
+    assert a["sevenDay"]["usedPercent"] == 34.0 and a["sevenDay"]["resetsAt"] == iso(NOW + 50 * H)
+
+
+def _run_budget(monkeypatch, tmp_path, capsys, pace, argv):
+    from claude_swap import cli
+
+    _fake_source(monkeypatch, tmp_path, pace)
+    with pytest.raises(SystemExit) as e:
+        cli._budget_command(argv)
+    return e.value.code, capsys.readouterr()
+
+
+def test_cli_json_is_one_line_read_only_with_exit_codes(monkeypatch, tmp_path, capsys):
+    code, out = _run_budget(monkeypatch, tmp_path, capsys, {"accounts": [acc(1, week=50.0)]}, ["--json"])
+    assert code == 0 and out.out.count("\n") == 1
+    assert json.loads(out.out)["status"] == "ok"
+    assert list(tmp_path.iterdir()) == []  # nothing written
+    code, out = _run_budget(monkeypatch, tmp_path, capsys, {"accounts": []}, ["--json"])
+    assert code == 2 and json.loads(out.out)["status"] == "no-accounts"
+    code, out = _run_budget(monkeypatch, tmp_path, capsys, {"error": "unavailable"}, ["--json"])
+    assert code == 3 and json.loads(out.out)["status"] == "unavailable"
+    code, out = _run_budget(monkeypatch, tmp_path, capsys, {"accounts": []}, ["--nope"])
+    assert code == 4 and out.out == ""
