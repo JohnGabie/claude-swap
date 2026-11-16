@@ -31,11 +31,17 @@ SPEED_UP_RATIO = 0.75
 # Below this elapsed share a projection divides by almost nothing.
 MIN_ELAPSED_FOR_PROJECTION = 0.05
 DATA_STATUSES = frozenset({"ok", "stale"})
+# Planning horizons: one day, three days, one week.
+HORIZON_HOURS = (24, 72, 168)
 
 NOTES = (
     "1 capacity unit = the weekly quota of one Pro account (pro 1, max 5, ultra 10).",
     "Plan sizes are not published: capacity units and token figures are estimates.",
     "expectedLossUnits is the quota that expires unused if the current pace continues.",
+    "horizons: the fuel for a plan. inTankUnits is what is left now; expiringUnits is the part of "
+    "it that is lost at a weekly reset inside the horizon unless it is used first; refillUnits "
+    "comes back at those resets; availableUnits = inTankUnits + refillUnits. It is an upper "
+    "bound: the 5-hour windows limit how fast one account can be used.",
 )
 
 
@@ -196,6 +202,7 @@ def build_budget(
                 "at": _iso(a["_reset7"]),
                 "accountId": a["id"],
                 "expiringUnits": a["sevenDay"]["remainingUnits"],
+                "refillUnits": a["capacityUnits"],
                 "hoursFromNow": _round((a["_reset7"] - now) / 3600.0, 1),
             }
             for a in accounts
@@ -203,6 +210,28 @@ def build_budget(
         ),
         key=lambda r: r["at"],
     )
+    per_unit_tokens = (
+        100.0 * tokens_per_percent_pro if tokens_per_percent_pro and tokens_per_percent_pro > 0 else None
+    )
+    horizons = []
+    for hours in HORIZON_HOURS:
+        end = now + hours * 3600.0
+        inside = [a for a in accounts if a["measured"] and a["_reset7"] is not None and a["_reset7"] <= end]
+        expiring = sum(a["sevenDay"]["remainingUnits"] for a in inside)
+        refill = sum(a["capacityUnits"] for a in inside)
+        total = remaining + refill
+        row = {
+            "hours": hours,
+            "until": _iso(end),
+            "inTankUnits": _round(remaining, 3),
+            "expiringUnits": _round(expiring, 3),
+            "refillUnits": _round(refill, 3),
+            "availableUnits": _round(total, 3),
+        }
+        if per_unit_tokens is not None:
+            row["availableTokens"] = round(total * per_unit_tokens)
+        horizons.append(row)
+
     for a in accounts:
         for key in ("_u", "_e", "_counted", "_reset7"):
             a.pop(key, None)
@@ -247,6 +276,7 @@ def build_budget(
         },
         "accounts": accounts,
         "resets": resets,
+        "horizons": horizons,
         "tokens": tokens,
         "notes": list(NOTES),
     }

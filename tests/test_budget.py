@@ -96,7 +96,8 @@ def test_resets_are_sorted_with_what_expires():
     b = build(acc(1, week=20.0, week_reset_h=100.0), acc(2, "max", week=60.0, week_reset_h=10.0))
     assert [r["accountId"] for r in b["resets"]] == [2, 1]
     assert b["resets"][0] == {
-        "at": iso(NOW + 10 * H), "accountId": 2, "expiringUnits": 2.0, "hoursFromNow": 10.0,
+        "at": iso(NOW + 10 * H), "accountId": 2, "expiringUnits": 2.0, "refillUnits": 5.0,
+        "hoursFromNow": 10.0,
     }
 
 
@@ -356,3 +357,29 @@ def test_calibrate_with_no_data_writes_nothing(tmp_path):
     out = cal.calibrate(tmp_path, {}, projects_dir=tmp_path / "none")
     assert out["written"] is False and out["enough"] is False
     assert not (tmp_path / "budget_calibration.json").exists()
+
+
+# ---- horizons: the fuel for a plan ------------------------------------------
+
+def test_horizons_add_the_refills_inside_each_window():
+    # Pro, 40% left, resets in 10 h. Max, 50% left (2.5 units), resets in 100 h.
+    b = build(acc(1, week=60.0, week_reset_h=10.0), acc(2, "max", week=50.0, week_reset_h=100.0))
+    day, three, week = b["horizons"]
+    assert [h["hours"] for h in b["horizons"]] == [24, 72, 168]
+    assert day == {"hours": 24, "until": iso(NOW + 24 * H), "inTankUnits": 2.9,
+                   "expiringUnits": 0.4, "refillUnits": 1.0, "availableUnits": 3.9}
+    assert three["availableUnits"] == 3.9
+    assert week["expiringUnits"] == 2.9 and week["refillUnits"] == 6.0 and week["availableUnits"] == 8.9
+
+
+def test_an_exhausted_account_gives_fuel_only_after_its_reset():
+    b = build(acc(1, week=100.0, week_reset_h=30.0))
+    day, three, _week = b["horizons"]
+    assert day["availableUnits"] == 0.0
+    assert three["refillUnits"] == 1.0 and three["availableUnits"] == 1.0
+
+
+def test_horizons_carry_tokens_when_measured():
+    b = build(acc(1, week=50.0, week_reset_h=10.0), tokens_per_percent_pro=1000.0)
+    assert b["horizons"][0]["availableTokens"] == 150_000  # 0.5 left + 1.0 refill
+    assert "availableTokens" not in build(acc(1, week=50.0))["horizons"][0]
