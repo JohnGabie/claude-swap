@@ -62,3 +62,24 @@ def test_muted_kinds_follow_event_toggles():
     assert tray.muted_kinds(tray.TraySettings()) == set()
     s = tray.TraySettings(notify_quarantine=False, notify_errors=False)
     assert tray.muted_kinds(s) == {"account-quarantined", "account-unquarantined", "error"}
+
+
+# ---- threshold submenu and account rows ------------------------------------
+
+def test_threshold_choices_are_the_presets():
+    assert tray.threshold_choices(90.0) == [80.0, 85.0, 90.0, 95.0, 98.0]
+
+
+def test_threshold_choices_include_a_custom_value_in_order():
+    assert tray.threshold_choices(92.5) == [80.0, 85.0, 90.0, 92.5, 95.0, 98.0]
+
+
+def test_threshold_label_drops_a_zero_fraction():
+    assert tray.threshold_label(90.0) == "90%"
+    assert tray.threshold_label(92.5) == "92.5%"
+
+
+def test_account_rows_only_without_a_visible_pill():
+    assert tray.show_account_rows(pill_available=False, pill_enabled=False) is True
+    assert tray.show_account_rows(pill_available=True, pill_enabled=False) is True
+    assert tray.show_account_rows(pill_available=True, pill_enabled=True) is False
