@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import balance, oauth, pace_feed, poll_policy
+from claude_swap.decision_log import DecisionLog
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
@@ -1039,6 +1040,8 @@ class AutoSwitchEngine:
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
+        # One scrubbed line per event, next to the state file (bug reports).
+        self._decision_log = DecisionLog(self.state_path.parent)
         self.clock = clock
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change
@@ -3576,6 +3579,8 @@ class AutoSwitchEngine:
         return datetime.fromtimestamp(earliest, tz=timezone.utc), int(frees)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
+        # Decision log first: a frontend that raises must not lose the line.
+        self._decision_log.write(event)
         self.on_event(event)
 
     # -- loop -------------------------------------------------------------------

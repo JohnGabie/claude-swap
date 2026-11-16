@@ -97,3 +97,47 @@ def test_report_on_an_empty_folder(tmp_path):
     text = build_report(tmp_path)
     assert "(no file)" in text
     assert "(no decisions logged)" in text
+
+
+# ---- engine wiring and the CLI command -------------------------------------
+
+def test_engine_emit_writes_the_log_before_the_frontend(tmp_path):
+    from claude_swap.autoswitch import AutoSwitchEngine, NoSwitchEvent
+
+    seen = []
+    engine = AutoSwitchEngine.__new__(AutoSwitchEngine)
+    engine._decision_log = DecisionLog(tmp_path)
+    engine.on_event = lambda ev: seen.append((tmp_path / "decisions.jsonl").read_text())
+    engine._emit(NoSwitchEvent(reason="no-return", detail="held for a.person@example.com"))
+    assert len(seen) == 1
+    line = json.loads(seen[0])
+    assert line["event"] == "no-switch" and line["reason"] == "no-return"
+    assert "@" not in seen[0]
+
+
+def test_debug_report_command_prints_a_scrubbed_report(tmp_path, monkeypatch, capsys):
+    import pytest
+
+    from claude_swap import cli, paths
+
+    (tmp_path / "settings.json").write_text(json.dumps({"autoswitch": {"threshold": 95.0}}))
+    DecisionLog(tmp_path).write(FakeEvent(SWITCH))
+    monkeypatch.setattr(paths, "get_backup_root", lambda: tmp_path)
+    with pytest.raises(SystemExit) as exit_info:
+        cli._debug_report_command([])
+    assert exit_info.value.code == 0
+    out = capsys.readouterr().out
+    assert '"threshold": 95.0' in out and '"trigger":"balanced"' in out
+    assert "@" not in out
+
+
+def test_debug_report_command_writes_a_file(tmp_path, monkeypatch, capsys):
+    import pytest
+
+    from claude_swap import cli, paths
+
+    monkeypatch.setattr(paths, "get_backup_root", lambda: tmp_path)
+    target = tmp_path / "report.txt"
+    with pytest.raises(SystemExit):
+        cli._debug_report_command(["-o", str(target)])
+    assert "(no decisions logged)" in target.read_text()

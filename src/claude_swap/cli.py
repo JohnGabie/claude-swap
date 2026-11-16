@@ -1640,6 +1640,37 @@ def _record_if_switched(switcher, payload, active_before) -> None:
         pass
 
 
+def _debug_report_command(argv: list[str]) -> None:
+    """``cswap debug-report``: text for a bug report, with no email, no
+    organization or account name and no token. Read-only, no network."""
+    from pathlib import Path
+
+    from claude_swap import decision_log
+
+    parser = argparse.ArgumentParser(
+        prog="cswap debug-report",
+        description=(
+            "Print the settings, the auto-switch state and the last engine "
+            "decisions. Emails, organization names and tokens are removed."
+        ),
+    )
+    parser.add_argument(
+        "--lines", type=int, default=decision_log.REPORT_LINES,
+        help="How many of the last decisions to include (default: %(default)s)",
+    )
+    parser.add_argument("-o", "--output", help="Write the report to this file")
+    args = parser.parse_args(argv)
+    text = decision_log.build_report(
+        paths.get_backup_root(), version=__version__, lines=max(1, args.lines)
+    )
+    if args.output:
+        Path(args.output).write_text(text, encoding="utf-8")
+        print(f"report written to {args.output}")
+    else:
+        sys.stdout.write(text)
+    sys.exit(0)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1649,6 +1680,10 @@ def main() -> None:
     # and makes no network call.
     if argv and argv[0] == "pace":
         _pace_command(argv[1:])
+        return  # only reachable in tests where sys.exit is mocked
+    # `debug-report` reads local files only and prints plain text.
+    if argv and argv[0] == "debug-report":
+        _debug_report_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
     _use_native_tls()
     try:
@@ -1742,6 +1777,7 @@ Commands:
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s pace [--json]              print plan and stored usage as JSON (read-only)
+  %(prog)s debug-report [-o FILE]     settings, state and last decisions for a bug report (no emails)
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
