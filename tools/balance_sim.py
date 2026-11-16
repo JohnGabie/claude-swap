@@ -45,9 +45,14 @@ Policies
   the engine settings that `best` and `consume-first` use here.
 * ``best`` and ``consume-first`` are RE-IMPLEMENTED here, because
   ``AutoSwitchEngine._rank_candidates`` is an engine method that reads
-  ``self._binding`` / ``self._models`` and the persisted state file. The pure
-  function ``autoswitch._recovery_is_useful`` and the engine constants are
-  reused as they are. Simplifications, each one on purpose:
+  ``self._binding`` / ``self._models`` and the persisted state file. The
+  engine constants are reused as they are. The re-implementation is the
+  ranking of the engine BEFORE upstream v1.2.0b1: when every account is over
+  its line it chooses between the reset axis and the headroom axis with
+  ``_recovery_is_useful``, which the engine no longer has (it now ranks that
+  case by raw headroom, ``autoswitch._all_above_margin_met``). The predicate
+  is kept here as a copy, so that the recorded results do not change.
+  Simplifications, each one on purpose:
     1. One switch line (``threshold`` 90) for every window; no
        ``weeklyThreshold``, no per-account thresholds, no per-model windows.
        With one line, line headroom equals ``100 - max pct`` (lines.py).
@@ -428,6 +433,29 @@ def ahead_of_pace(acc: SimAccount, now: float) -> float | None:
 # --- Policies ------------------------------------------------------------------
 
 
+def _recovery_is_useful(
+    candidate_recovery_ts: float,
+    active_recovery_ts: float,
+    active_headroom: float,
+    best_candidate_headroom: float,
+    now: float,
+) -> bool:
+    """Rank this candidate by soonest reset, rather than by headroom?
+
+    A copy of the engine predicate of the same name, which upstream v1.2.0b1
+    removed from ``autoswitch.py`` (see the module docstring). Reset wins when
+    the active account and the best candidate are both spent, or when either
+    side is back within ``RECOVERY_HORIZON_S``.
+    """
+    spent = autoswitch.SPENT_HEADROOM_PCT
+    if active_headroom <= spent and best_candidate_headroom <= spent:
+        return True
+    return (
+        candidate_recovery_ts - now <= autoswitch.RECOVERY_HORIZON_S
+        or active_recovery_ts - now <= autoswitch.RECOVERY_HORIZON_S
+    )
+
+
 def _dominates(left_headroom: float, active_headroom: float) -> bool:
     """The dominance leg of `autoswitch._left_account_recovered` (S2e).
 
@@ -544,7 +572,7 @@ class EnginePolicy:
                 if c.over and not all_above:
                     continue
                 if all_above:
-                    by_rec = autoswitch._recovery_is_useful(
+                    by_rec = _recovery_is_useful(
                         rec, active_rec, h_act, best_cand_h, now
                     )
                     if by_rec:

@@ -607,7 +607,10 @@ class TestPlatformMigrationGuard:
         assert parse_one_document(out) == {"schemaVersion": 1, "accounts": []}
         assert tree_state(tmp_path) == tree_before
 
-    @pytest.mark.parametrize("platform", [Platform.MACOS, Platform.WINDOWS], ids=["macos", "windows"])
+    # Only macOS has a platform migration: upstream v1.2.0b1 retired the
+    # Windows one, so nothing is pending there (see
+    # test_guard_agrees_with_run_migrations).
+    @pytest.mark.parametrize("platform", [Platform.MACOS], ids=["macos"])
     def test_pending_platform_migration_is_not_run(
         self, temp_home, no_network, monkeypatch, capfd, tmp_path, platform
     ):

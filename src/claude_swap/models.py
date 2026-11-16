@@ -7,6 +7,7 @@ import math
 import os
 import re
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -104,13 +105,34 @@ def normalize_account_threshold(value: object) -> float:
     return pct
 
 
+ACCOUNT_PRIORITY_MAX = 1000
+
+
+def normalize_account_priority(value: object) -> int:
+    """Validate a priority tier. Higher numbers are preferred; zero is default."""
+    message = f"priority must be an integer between 0 and {ACCOUNT_PRIORITY_MAX}"
+    if isinstance(value, str):
+        value = value.strip()
+        if not value.isascii() or not value.isdecimal():
+            raise ValueError(message)
+        # Avoid converting an arbitrarily long hand-edited integer.
+        value = value.lstrip("0") or "0"
+        if len(value) > len(str(ACCOUNT_PRIORITY_MAX)):
+            raise ValueError(message)
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(message)
+    if not 0 <= value <= ACCOUNT_PRIORITY_MAX:
+        raise ValueError(message)
+    return value
+
+
 @dataclass(frozen=True)
 class AccountPolicy:
     """Per-account auto-switch overrides, stored in the sequence record.
 
-    Its one knob is unset by default, so a fleet with no policy set behaves
-    exactly as it did before this existed — the default-identity property
-    the acceptance criteria assert throughout.
+    Defaults preserve existing behavior. Priority is read only by the
+    opt-in ``priority-consume-first`` strategy.
 
     ``threshold``
         This account's own switch-away line, in binding-window utilization
@@ -123,6 +145,7 @@ class AccountPolicy:
     """
 
     threshold: float | None = None
+    priority: int = 0
 
 
 class Platform(Enum):
@@ -198,6 +221,15 @@ class AccountInfo:
         }
 
 
+def org_tag_shown(mode: str, email: str, emails: Sequence[str]) -> bool:
+    """Whether a per-account listing draws ``email``'s org tag under ``ui.orgTag``.
+
+    ``on`` always, ``off`` never, ``auto`` only when another managed account
+    (``emails`` lists every one, ``email`` included) has the same email.
+    """
+    return mode == "on" or (mode == "auto" and emails.count(email) > 1)
+
+
 @dataclass(frozen=True)
 class AccountSnapshot:
     """One managed account as seen by interactive UIs (the TUI).
@@ -221,6 +253,14 @@ class AccountSnapshot:
     #: Per-account auto-switch overrides. Appended last and defaulted, so every
     #: pre-existing construction site keeps working and yields the default.
     policy: AccountPolicy = AccountPolicy()
+    #: Stored subscription plan record (``subscription.PlanStore`` shape), or
+    #: None for a slot whose plan has never been fetched. Defaulted for the
+    #: same reason as ``policy``.
+    subscription_plan: dict | None = None
+    # Stored refresh token's expiry (epoch seconds), or None when missing/
+    # unreadable; see oauth.login_expires_at_epoch. Feeds the "re-login in
+    # 5d 12h" note every account view shows while the login is due.
+    login_expires_at: float | None = None
 
     @property
     def display_tag(self) -> str:

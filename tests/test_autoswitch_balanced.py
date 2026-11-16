@@ -149,13 +149,20 @@ PROACTIVE_EXPECTED = [
      {"lastSwitchAt": T0 + 560, "lastSwitchFrom": 2, "lastSwitchTo": "1"},
      STATE_AFTER_SWITCH),
 ]
+# U1 (merge of upstream v1.2.0b1): upstream #477 persists the unreadable-active
+# counters, so an unreadable tick now writes these state keys. The switch
+# clears them (F1 resets the counter, and the persist step then drops the keys).
+HEALTH_STATE = [
+    "healthAccount", "healthTickAt", "idleHoldSince", "schemaVersion",
+    "unhealthyTicks",
+]
 FAILOVER_EXPECTED = [
     ("NO_ACTION",
      [("poll", 1), ("no-switch", "active-usage-unknown", "1/3 before failover")],
-     NO_SWITCH_STATE, []),
+     NO_SWITCH_STATE, HEALTH_STATE),
     ("NO_ACTION",
      [("poll", 1), ("no-switch", "active-usage-unknown", "2/3 before failover")],
-     NO_SWITCH_STATE, []),
+     NO_SWITCH_STATE, HEALTH_STATE),
     ("SWITCHED", [("poll", 1), ("switch", "failover", 1, 3)],
      {"lastSwitchAt": T0 + 120, "lastSwitchFrom": 1, "lastSwitchTo": "3"},
      STATE_AFTER_SWITCH),

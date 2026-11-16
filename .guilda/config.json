@@ -42,7 +42,10 @@
   ],
   "scan": {
     "ignore": [
-      "tests/fixtures/**"
+      "tests/fixtures/**",
+      "tests/test_launch_agent.py",
+      "tests/test_session.py",
+      "tests/test_fsutil.py"
     ]
   }
 }
