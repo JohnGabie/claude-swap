@@ -190,3 +190,9 @@ def test_rank_of_accepts_only_one_to_three():
 def test_page_draws_the_sparkle_in_three_sizes_and_colors():
     for token in ("#e0a800", "#9aa3b0", "#b8692a", "function spark(rank)"):
         assert token in pill.PILL_PAGE
+
+
+def test_payload_reveal_is_off_unless_asked():
+    lay = pill.window_layout("top", 0, (0, 0, 1000, 800))
+    assert pill.pill_payload([], "top", "black", lay)["reveal"] is False
+    assert pill.pill_payload([], "top", "black", lay, reveal=True)["reveal"] is True

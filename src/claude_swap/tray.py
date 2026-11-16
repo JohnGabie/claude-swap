@@ -128,16 +128,61 @@ def tooltip(cards: list[dict]) -> str:
 
 # ---- menu shape ------------------------------------------------------------
 
-THRESHOLD_PRESETS = (80.0, 85.0, 90.0, 95.0, 98.0)
-
-
-def threshold_choices(current: float) -> list[float]:
-    """Switch lines offered in the menu: the presets plus the current value."""
-    return sorted({*THRESHOLD_PRESETS, float(current)})
+# Auto-switch strategies as the "Switch mode" submenu shows them.
+SWITCH_MODES = (
+    ("best", "Simple: most headroom"),
+    ("balanced", "Balanced: even use of all accounts"),
+    ("consume-first", "Consume first: soonest reset"),
+    ("weekly-first", "Weekly first"),
+    ("priority-consume-first", "Priority tiers"),
+)
+THRESHOLD_MIN, THRESHOLD_MAX = 50, 99
 
 
 def threshold_label(value: float) -> str:
     return f"{value:g}%"
+
+
+def clamp_threshold(value) -> int | None:
+    """The slider value as a whole percent in range, or None for a bad value."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number:  # NaN
+        return None
+    return int(max(THRESHOLD_MIN, min(THRESHOLD_MAX, round(number))))
+
+
+THRESHOLD_PAGE = """<!doctype html><meta charset=utf-8><style>
+*{box-sizing:border-box}html,body{margin:0;height:100%}
+body{background:#1b1b1f;color:#f2f0e3;font:14px system-ui,sans-serif;padding:20px 22px;display:flex;flex-direction:column;user-select:none}
+h1{font-size:15px;font-weight:600;margin:0 0 4px}
+p{margin:0;color:#a9a79c;font-size:12.5px;line-height:1.4}
+#val{font-size:44px;font-weight:700;font-variant-numeric:tabular-nums;text-align:center;margin:14px 0 6px}
+input[type=range]{width:100%;accent-color:#e0a800}
+.ends{display:flex;justify-content:space-between;color:#8d8b82;font-size:11px;margin-top:2px}
+.row{display:flex;gap:10px;justify-content:flex-end;margin-top:auto}
+button{font:inherit;padding:7px 16px;border-radius:8px;border:1px solid #3a3a41;background:#26262b;color:inherit;cursor:pointer}
+button.ok{background:#e0a800;border-color:#e0a800;color:#1b1b1f;font-weight:600}
+button:hover{filter:brightness(1.12)}
+</style>
+<h1>Switch threshold</h1>
+<p>Auto-switch leaves the active account when its usage reaches this value.</p>
+<div id=val>&ndash;</div>
+<input id=s type=range min=__MIN__ max=__MAX__ step=1>
+<div class=ends><span>__MIN__%</span><span>__MAX__%</span></div>
+<div class=row><button id=cancel>Cancel</button><button id=ok class=ok>Confirm</button></div>
+<script>
+const s=document.getElementById('s'), val=document.getElementById('val');
+const show=()=>{val.textContent=s.value+'%';};
+s.addEventListener('input',show);
+window.setValue=v=>{s.value=v;show();};
+document.getElementById('cancel').onclick=()=>pywebview.api.cancel();
+document.getElementById('ok').onclick=()=>pywebview.api.confirm(Number(s.value));
+document.addEventListener('keydown',e=>{if(e.key==='Escape')pywebview.api.cancel();if(e.key==='Enter')pywebview.api.confirm(Number(s.value));});
+window.addEventListener('pywebviewready',()=>pywebview.api.current().then(window.setValue));
+</script>""".replace("__MIN__", str(THRESHOLD_MIN)).replace("__MAX__", str(THRESHOLD_MAX))
 
 
 def show_account_rows(*, pill_available: bool, pill_enabled: bool) -> bool:
@@ -392,7 +437,7 @@ def run(switcher) -> int:
         if field == "pill_enabled":
             pill.set_visible(value)
         elif settings.pill_enabled:
-            pill.relayout()
+            pill.relayout(reveal=True)  # show where it went, also with "Show on hover"
         icon.update_menu()
 
     def pill_option(field, value):
@@ -409,32 +454,62 @@ def run(switcher) -> int:
         icon.stop()
         if pill is not None:
             pill.destroy()
+        threshold_window.destroy()
         window.destroy()
 
-    def set_threshold(value):
-        def action():
-            # save_settings validates, writes and restarts a running engine.
-            res = api.save_settings({"autoswitch.threshold": value}, {})
-            if not res["ok"] and res["output"]:
-                icon.notify(res["output"], "cswap")
-            icon.update_menu()
-        return lambda: threading.Thread(target=action, daemon=True).start()
+    def core_settings():
+        from claude_swap.settings import load_settings
 
-    def toggle_balanced():
-        def action():
-            from claude_swap.settings import load_settings
+        return load_settings(Path(switcher.backup_dir))
 
-            on = load_settings(Path(switcher.backup_dir)).strategy == "balanced"
-            # Off returns to the default strategy; the active account stays.
-            res = api.save_settings({"autoswitch.strategy": None if on else "balanced"}, {})
+    def save_core(key, value):
+        """Write one core setting off the menu thread; a running engine restarts."""
+        def action():
+            res = api.save_settings({key: value}, {})
             if not res["ok"] and res["output"]:
                 icon.notify(res["output"], "cswap")
             icon.update_menu()
         threading.Thread(target=action, daemon=True).start()
 
-    def build_menu():
-        from claude_swap.settings import load_settings
+    def set_mode(strategy):
+        return lambda: save_core("autoswitch.strategy", strategy)
 
+    class ThresholdDialog:
+        """What the threshold window calls through ``pywebview.api``."""
+
+        def current(self):
+            return clamp_threshold(core_settings().threshold)
+
+        def confirm(self, value):
+            number = clamp_threshold(value)
+            threshold_window.hide()
+            if number is not None:
+                save_core("autoswitch.threshold", number)
+
+        def cancel(self):
+            threshold_window.hide()
+
+    threshold_window = webview.create_window(
+        "cswap threshold", html=THRESHOLD_PAGE, js_api=ThresholdDialog(), width=380, height=290,
+        resizable=False, background_color=BG, hidden=True,
+    )
+
+    def on_threshold_closing():
+        if quitting.is_set():
+            return None
+        threshold_window.hide()
+        return False
+
+    threshold_window.events.closing += on_threshold_closing
+
+    def open_threshold():
+        def action():
+            threshold_window.show()
+            threshold_window.restore()
+            threshold_window.evaluate_js("window.setValue&&window.setValue(%d)" % clamp_threshold(core_settings().threshold))
+        threading.Thread(target=action, daemon=True).start()
+
+    def build_menu():
         accounts = ()
         if show_account_rows(pill_available=pill is not None, pill_enabled=settings.pill_enabled):
             accounts = [
@@ -444,17 +519,19 @@ def run(switcher) -> int:
                 )
                 for card in cards
             ] or [pystray.MenuItem("No managed accounts", None, enabled=False)]
-        core = load_settings(Path(switcher.backup_dir))
-        threshold = core.threshold
-        balanced = core.strategy == "balanced"
-        threshold_menu = pystray.MenuItem(
-            f"Switch at {threshold_label(threshold)}",
+        core = core_settings()
+        auto_on = lambda _i: settings.auto_switch  # noqa: E731 - mode and threshold belong to auto-switch
+        mode_menu = pystray.MenuItem(
+            "Switch mode",
             pystray.Menu(*(
-                pystray.MenuItem(threshold_label(v), set_threshold(v),
-                                 checked=lambda _i, v=v: v == threshold, radio=True)
-                for v in threshold_choices(threshold)
+                pystray.MenuItem(label, set_mode(name),
+                                 checked=lambda _i, n=name: core.strategy == n, radio=True)
+                for name, label in SWITCH_MODES
             )),
+            enabled=auto_on,
         )
+        threshold_item = pystray.MenuItem(
+            f"Switch threshold: {threshold_label(core.threshold)}\u2026", open_threshold, enabled=auto_on)
         pill_items = ()
         if pill is not None:
             pill_items = (
@@ -479,10 +556,9 @@ def run(switcher) -> int:
             pystray.MenuItem("Switch to best", switch_best),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Auto-switch", toggle_auto, checked=lambda _i: settings.auto_switch),
-            # Greyed, and still checked, while auto-switch is off.
-            pystray.MenuItem("Switch balanced", toggle_balanced, checked=lambda _i: balanced,
-                             enabled=lambda _i: settings.auto_switch),
-            threshold_menu,
+            mode_menu,
+            threshold_item,
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Notifications", toggle_notifications, checked=lambda _i: settings.notifications),
             *pill_items,
             pystray.Menu.SEPARATOR,

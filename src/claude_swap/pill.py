@@ -173,7 +173,8 @@ def rank_of(card: dict) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 3 else 0
 
 
-def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: bool = False) -> dict:
+def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: bool = False,
+                 reveal: bool = False) -> dict:
     """Everything the page needs to draw the pill and, on hover, each account's card."""
     pw, ph = pill_size(edge, len(cards))
     return {
@@ -184,6 +185,8 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
         "size": [pw, ph],
         "layout": layout,
         "fold": bool(fold),
+        # One-shot: unfold now and stay open for a moment (the user just moved or restyled the pill).
+        "reveal": bool(reveal),
         "pad": FLARE + PAD,
         "item": ITEM,
         "card": {"w": CARD_W, "arrow": ARROW, "gap": GAP},
@@ -411,7 +414,7 @@ function reportHot(){
 card.addEventListener('transitionend',e=>{ if(e.target===card&&(e.propertyName==='transform'||e.propertyName==='top'||e.propertyName==='left')) reportHot(); });
 
 /* Show on hover, as Codenotch: opens on contact, folds FOLD_GRACE after the pointer has gone. */
-const FOLD_GRACE=450, SLIVER_HOLD=2000; // after folding, the sliver itself fades away SLIVER_HOLD later
+const FOLD_GRACE=450, REVEAL_MS=4000, SLIVER_HOLD=2000; // after folding, the sliver itself fades away SLIVER_HOLD later
 let restTimer=null;
 function foldAllowed(){return !!(P&&P.fold)&&!pointerIn;}
 function setFolded(f){
@@ -498,6 +501,7 @@ function render(p){
  if(key!==builtKey){ build(p); builtKey=key; }
  else [...items.querySelectorAll('.item')].forEach((d,i)=>applyItem(d,p.items[i]));
  if(hoverId!==null){ if(hoverId<p.items.length) renderCard(); else hideCard(); }
+ if(p.reveal){ unfold(); reportHot(); foldTimer=setTimeout(()=>{if(foldAllowed())setFolded(true);},REVEAL_MS); return; }
  reportHot();
  scheduleFold();
 }
@@ -613,7 +617,7 @@ class PillController:
     def set_visible(self, on: bool) -> None:
         self._visible = on
         if on:
-            self.relayout()
+            self.relayout(reveal=True)
         else:
             _gtk_call(self.window, lambda w: w.hide())
 
@@ -626,11 +630,11 @@ class PillController:
         # Also when the layout moved under us: a bar came up, or a monitor changed.
         self.relayout() if resized or self._layout() != self._placed else self._push()
 
-    def relayout(self) -> None:
+    def relayout(self, reveal: bool = False) -> None:
         lay = self._layout()
         self._placed = lay
         self._hot = []  # until the page reports again, only the pill takes input
-        self._push()
+        self._push(reveal=reveal)
         _place(self.window, lay["win"], lambda: self._hot or [lay["pill"]])
 
     def _layout(self) -> dict:
@@ -642,12 +646,12 @@ class PillController:
         s = self._wv.screens[0]
         return s.x, s.y, s.width, s.height
 
-    def _push(self) -> None:
+    def _push(self, reveal: bool = False) -> None:
         if not self._loaded.is_set():
             return
         edge = normalize_edge(self.settings.pill_edge)
         payload = pill_payload(self.cards, edge, normalize_theme(self.settings.pill_theme), self._layout(),
-                               fold=bool(getattr(self.settings, "pill_fold", False)))
+                               fold=bool(getattr(self.settings, "pill_fold", False)), reveal=reveal)
         self._run_js("render(%s)" % json.dumps(payload))
 
     def _run_js(self, script: str) -> None:

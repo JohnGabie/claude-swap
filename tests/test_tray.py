@@ -66,17 +66,34 @@ def test_muted_kinds_follow_event_toggles():
 
 # ---- threshold submenu and account rows ------------------------------------
 
-def test_threshold_choices_are_the_presets():
-    assert tray.threshold_choices(90.0) == [80.0, 85.0, 90.0, 95.0, 98.0]
-
-
-def test_threshold_choices_include_a_custom_value_in_order():
-    assert tray.threshold_choices(92.5) == [80.0, 85.0, 90.0, 92.5, 95.0, 98.0]
-
-
 def test_threshold_label_drops_a_zero_fraction():
     assert tray.threshold_label(90.0) == "90%"
     assert tray.threshold_label(92.5) == "92.5%"
+
+
+def test_clamp_threshold_rounds_and_keeps_the_range():
+    assert tray.clamp_threshold(98.0) == 98
+    assert tray.clamp_threshold("95") == 95
+    assert tray.clamp_threshold(92.4) == 92
+    assert tray.clamp_threshold(10) == tray.THRESHOLD_MIN
+    assert tray.clamp_threshold(100) == tray.THRESHOLD_MAX
+    assert tray.clamp_threshold(None) is None
+    assert tray.clamp_threshold("x") is None
+    assert tray.clamp_threshold(float("nan")) is None
+
+
+def test_switch_modes_cover_every_strategy_once():
+    from claude_swap.settings import AUTOSWITCH_STRATEGIES
+
+    names = [name for name, _label in tray.SWITCH_MODES]
+    assert sorted(names) == sorted(AUTOSWITCH_STRATEGIES)
+    assert names[:2] == ["best", "balanced"]
+
+
+def test_threshold_page_has_a_slider_and_both_buttons():
+    page = tray.THRESHOLD_PAGE
+    assert "type=range min=50 max=99 step=1" in page
+    assert "id=cancel" in page and "id=ok" in page and "__M" not in page
 
 
 def test_account_rows_only_without_a_visible_pill():
