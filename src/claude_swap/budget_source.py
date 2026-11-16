@@ -11,54 +11,38 @@ import json
 import time
 from pathlib import Path
 
-from claude_swap import budget, paths
+from claude_swap import budget, paths, token_model
 
 CALIBRATION_FILENAME = "budget_calibration.json"
 HOOK_STATE_FILENAME = "budget_hook.json"
 
 
-# The measurement is run again when the stored one is older than this: the
-# sample grows with the decision log.
-RECALIBRATE_AFTER_S = 6 * 3600.0
+# New polls are added to the calibration store when it is older than this.
+RECALIBRATE_AFTER_S = 15 * 60.0
 
 
-def read_calibration(backup_root: Path) -> tuple[float | None, str | None, str | None]:
-    """``(tokens per percent point of a Pro account, date measured, confidence)`` or Nones."""
-    try:
-        raw = json.loads((Path(backup_root) / CALIBRATION_FILENAME).read_text(encoding="utf-8"))
-        value = raw.get("tokensPerPercentPro")
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-            return None, None, None
-        measured = raw.get("measuredAt")
-        word = raw.get("confidence")
-        return (
-            float(value),
-            measured if isinstance(measured, str) else None,
-            word if isinstance(word, str) else None,
-        )
-    except (OSError, ValueError, AttributeError):
-        return None, None, None
+def _plans(pace: dict) -> dict[str, str]:
+    return {
+        str(a.get("id")): a.get("plan")
+        for a in (pace.get("accounts") or [])
+        if isinstance(a, dict) and isinstance(a.get("plan"), str)
+    }
 
 
-def _refresh_calibration(root: Path, pace: dict, now: float) -> None:
-    """Measure again when there is no measurement or it is old. Never raises."""
+def token_rates(root: Path, pace: dict, now: float) -> dict:
+    """Per-account token rates; the store is brought up to date first. Never raises."""
+    from claude_swap import budget_calibrate
+
     try:
         path = Path(root) / CALIBRATION_FILENAME
         try:
-            if now - path.stat().st_mtime < RECALIBRATE_AFTER_S:
-                return
+            fresh = now - path.stat().st_mtime < RECALIBRATE_AFTER_S
         except OSError:
-            pass
-        from claude_swap import budget_calibrate
-
-        plans = {
-            str(a.get("id")): a.get("plan")
-            for a in (pace.get("accounts") or [])
-            if isinstance(a, dict) and isinstance(a.get("plan"), str)
-        }
-        budget_calibrate.calibrate(root, plans)
-    except Exception:  # noqa: BLE001 - the budget does not depend on the measurement
-        pass
+            fresh = False
+        store = budget_calibrate.load_store(root) if fresh else budget_calibrate.calibrate(root)
+    except Exception:  # noqa: BLE001 - the priors still give an estimate
+        store = budget_calibrate.empty_store()
+    return budget_calibrate.rates(store, _plans(pace))
 
 
 def current_budget(now: float | None = None) -> dict:
@@ -71,15 +55,12 @@ def current_budget(now: float | None = None) -> dict:
         root = paths.get_backup_root()
         pace, _code = _pace_payload()
         settings = load_settings(root)
-        _refresh_calibration(root, pace, now)
-        per_pct, measured_at, word = read_calibration(root)
         return budget.build_budget(
             pace, now,
             threshold=settings.threshold,
             weekly_threshold=settings.weekly_threshold,
-            tokens_per_percent_pro=per_pct,
-            tokens_measured_at=measured_at,
-            tokens_confidence=word,
+            token_rates=token_rates(root, pace, now),
+            token_meta=token_model.meta(),
         )
     except Exception:  # noqa: BLE001 - a planner must get an answer, not a traceback
         return budget.build_budget({}, now)

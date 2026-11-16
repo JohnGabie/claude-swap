@@ -124,21 +124,6 @@ def test_a_new_week_gives_no_projection():
     assert b["fleet"]["expectedLossUnits"] is None
 
 
-def test_tokens_are_absent_without_a_measurement():
-    assert build(acc(1, week=50.0))["tokens"] is None
-
-
-def test_tokens_scale_by_capacity_and_say_estimate():
-    b = build(acc(1, week=50.0), acc(2, "max", week=50.0),
-              tokens_per_percent_pro=1000.0, tokens_measured_at="2026-11-10")
-    assert b["tokens"] == {
-        "estimate": True, "tokensPerPercentPro": 1000, "measuredAt": "2026-11-10",
-        "confidence": None,
-        "definition": "input + output + cache creation tokens; cache reads not counted",
-        "remainingTokens": 300000, "usableNowTokens": 300000,
-    }
-
-
 def test_no_internal_field_and_no_identity_leaves():
     raw = acc(1, week=50.0)
     raw["email"] = "a.person@example.com"  # not part of pace; must not pass through
@@ -192,19 +177,9 @@ def test_current_budget_uses_the_settings_lines(monkeypatch, tmp_path):
     b = src.current_budget(NOW)
     assert b["fleet"]["thresholdPct"] == 98.0
     assert b["accounts"][0]["usableNow"] is True
-    assert b["tokens"] is None
-
-
-def test_current_budget_reads_the_calibration_file(monkeypatch, tmp_path):
-    (tmp_path / "budget_calibration.json").write_text(
-        json.dumps({"tokensPerPercentPro": 2000, "measuredAt": "2026-11-10", "confidence": "low"}))
-    src = _fake_source(monkeypatch, tmp_path, {"accounts": [acc(1, week=50.0)]})
-    monkeypatch.setattr(src, "_refresh_calibration", lambda *a: None)
-    tokens = src.current_budget(NOW)["tokens"]
-    assert tokens["remainingTokens"] == 100000 and tokens["confidence"] == "low"
-    for bad in ("{", json.dumps({"tokensPerPercentPro": -1}), json.dumps({"tokensPerPercentPro": True}), "[]"):
-        (tmp_path / "budget_calibration.json").write_text(bad)
-        assert src.current_budget(NOW)["tokens"] is None
+    # With no data of its own the account gets the prior of its plan.
+    assert b["tokens"]["confidence"] == "prior"
+    assert b["accounts"][0]["sevenDay"]["tokensPerPercent"] == 300_000
 
 
 def test_current_budget_never_raises(monkeypatch, tmp_path):
@@ -284,81 +259,6 @@ def test_mcp_run_without_the_sdk_says_how_to_install(monkeypatch, capsys):
     assert "claude-swap[mcp]" in capsys.readouterr().err
 
 
-# ---- calibration from the user's logs ---------------------------------------
-
-def _poll(ts, active, five, week):
-    return json.dumps({"event": "poll", "ts": iso(ts), "active": {"number": active},
-                       "windowsPct": {str(active): {"5h": five, "7d": week}}})
-
-
-def _msg(ts, mid, inp=0, out=0, create=0, read=0, text="secret text"):
-    stamp = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    return json.dumps({"timestamp": stamp, "requestId": "r" + mid, "type": "assistant",
-                       "message": {"id": mid, "content": text, "usage": {
-                           "input_tokens": inp, "output_tokens": out,
-                           "cache_creation_input_tokens": create, "cache_read_input_tokens": read}}})
-
-
-def test_measure_joins_polls_and_tokens_by_capacity():
-    from claude_swap import budget_calibrate as cal
-
-    polls = [(0.0, "1", 10.0, 20.0), (600.0, "1", 30.0, 24.0),      # pro: +4 weekly, +20 five-hour
-             (1200.0, "2", 5.0, 50.0), (1800.0, "2", 9.0, 51.0)]    # max: +1 weekly (5 pro points)
-    events = [(300.0, 40_000, 7), (1500.0, 50_000, 9), (5000.0, 999, 0)]
-    out = cal.measure(polls, events, {"1": "pro", "2": "max"})
-    assert out["enough"] is True and out["confidence"] == "low"
-    assert out["tokensPerPercentPro"] == 10_000  # 90_000 tokens / 9 pro points
-    assert out["sample"]["proWeeklyPoints"] == 9.0 and out["sample"]["intervals"] == 2
-    assert out["sample"]["accounts"]["2"] == {"plan": "max", "weeklyPoints": 1.0, "tokens": 50_000}
-
-
-def test_measure_skips_gaps_resets_and_account_changes():
-    from claude_swap import budget_calibrate as cal
-
-    polls = [(0.0, "1", 10.0, 20.0), (5000.0, "1", 30.0, 40.0),     # gap: the engine was off
-             (5600.0, "1", 0.0, 0.0),                               # reset: percent fell
-             (6200.0, "2", 5.0, 50.0)]                              # another account
-    out = cal.measure(polls, [(100.0, 1, 0)], {"1": "pro", "2": "pro"})
-    assert out["enough"] is False and out["tokensPerPercentPro"] is None and out["confidence"] is None
-
-
-def test_confidence_grows_with_the_sample():
-    from claude_swap import budget_calibrate as cal
-
-    assert [cal.confidence(v) for v in (3.0, 30.0, 100.0)] == ["low", "medium", "high"]
-
-
-def test_calibrate_reads_the_logs_once_per_message_and_keeps_no_text(tmp_path):
-    from claude_swap import budget_calibrate as cal
-
-    root, projects = tmp_path / "data", tmp_path / "projects" / "p1"
-    root.mkdir(), projects.mkdir(parents=True)
-    (root / "decisions.jsonl").write_text("\n".join([
-        _poll(NOW, 1, 10.0, 20.0), json.dumps({"event": "no-switch"}), _poll(NOW + 600, 1, 30.0, 25.0)]) + "\n")
-    (projects / "s.jsonl").write_text("\n".join([
-        _msg(NOW + 60, "m1", inp=100, out=900, create=4000, read=50_000),
-        _msg(NOW + 61, "m1", inp=100, out=900, create=4000, read=50_000),  # the same message again
-        _msg(NOW + 120, "m2", out=5000),
-        _msg(NOW - 60, "m0", out=7777),  # before the first poll
-        "not json", json.dumps({"type": "user", "message": {"content": "hello"}}),
-    ]) + "\n")
-    out = cal.calibrate(root, {"1": "pro"}, projects_dir=tmp_path / "projects", now=NOW + 700)
-    assert out["written"] is True
-    assert out["tokensPerPercentPro"] == 2000  # 10_000 tokens / 5 points
-    assert out["cacheReadTokensPerPercentPro"] == 10_000
-    stored = (root / "budget_calibration.json").read_text()
-    assert json.loads(stored)["tokensPerPercentPro"] == 2000
-    assert "secret" not in stored and "hello" not in stored
-
-
-def test_calibrate_with_no_data_writes_nothing(tmp_path):
-    from claude_swap import budget_calibrate as cal
-
-    out = cal.calibrate(tmp_path, {}, projects_dir=tmp_path / "none")
-    assert out["written"] is False and out["enough"] is False
-    assert not (tmp_path / "budget_calibration.json").exists()
-
-
 # ---- horizons: the fuel for a plan ------------------------------------------
 
 def test_horizons_add_the_refills_inside_each_window():
@@ -379,7 +279,197 @@ def test_an_exhausted_account_gives_fuel_only_after_its_reset():
     assert three["refillUnits"] == 1.0 and three["availableUnits"] == 1.0
 
 
-def test_horizons_carry_tokens_when_measured():
-    b = build(acc(1, week=50.0, week_reset_h=10.0), tokens_per_percent_pro=1000.0)
-    assert b["horizons"][0]["availableTokens"] == 150_000  # 0.5 left + 1.0 refill
-    assert "availableTokens" not in build(acc(1, week=50.0))["horizons"][0]
+# ---- tokens ------------------------------------------------------------------
+
+RATE_PRO = {"weekPerPct": 1000.0, "fivePerPct": 100.0, "confidence": "low"}
+RATE_MAX = {"weekPerPct": 5000.0, "fivePerPct": 500.0, "confidence": "high"}
+
+
+def test_tokens_are_absent_without_rates():
+    b = build(acc(1, week=50.0))
+    assert b["tokens"] is None
+    assert "remainingTokens" not in b["accounts"][0]["sevenDay"]
+    assert "availableTokens" not in b["horizons"][0]
+
+
+def test_each_account_uses_its_own_rate():
+    b = build(acc(1, five=10.0, week=50.0), acc(2, "max", five=20.0, week=50.0),
+              token_rates={"1": RATE_PRO, "2": RATE_MAX}, token_meta={"unit": "u"})
+    one, two = b["accounts"]
+    assert one["sevenDay"]["remainingTokens"] == 50_000 and one["sevenDay"]["tokensPerPercent"] == 1000
+    assert two["sevenDay"]["remainingTokens"] == 250_000
+    assert one["fiveHour"]["headroomTokens"] == 8_000  # (90 - 10) points * 100
+    assert one["tokenConfidence"] == "low"
+    assert b["tokens"] == {
+        "estimate": True, "unit": "u", "confidence": "low",
+        "remainingTokens": 300_000, "usableNowTokens": 300_000,
+        "fiveHourHeadroomTokens": 8_000 + 35_000,
+    }
+
+
+def test_tokens_need_a_rate_for_every_measured_account():
+    b = build(acc(1, week=50.0), acc(2, week=50.0), token_rates={"1": RATE_PRO})
+    assert b["tokens"] is None and "availableTokens" not in b["horizons"][0]
+
+
+def test_reachable_tokens_follow_the_five_hour_windows():
+    # 80% of the week left = 80_000 tokens. One open window with 40 points of
+    # headroom (4_000 tokens) that closes in 2 h, then 22 h = 5 more windows of
+    # 90 points (9_000 tokens each): 49_000 tokens fit in 24 h.
+    b = build(acc(1, five=50.0, five_reset_h=2.0, week=20.0, week_reset_h=200.0),
+              token_rates={"1": RATE_PRO})
+    day, three, week = b["horizons"]
+    assert day["availableTokens"] == 80_000
+    assert day["reachableTokens"] == 49_000 and day["reachablePctOfAvailable"] == 61.2
+    assert three["reachableTokens"] == 80_000  # 15 windows hold more than the week has
+
+
+def test_reachable_tokens_count_a_refill_inside_the_horizon():
+    b = build(acc(1, five=0.0, five_reset_h=-1.0, week=100.0, week_reset_h=10.0),
+              token_rates={"1": RATE_PRO})
+    week = b["horizons"][2]
+    assert week["availableTokens"] == 100_000 and week["reachableTokens"] == 100_000
+    assert b["horizons"][0]["reachableTokens"] == 45_000  # 5 windows of 9_000 in 24 h
+
+
+def test_ultra_reach_has_no_five_hour_cap():
+    b = build(acc(1, "ultra", week=50.0, week_reset_h=200.0),
+              token_rates={"1": {"weekPerPct": 10_000.0, "fivePerPct": 1000.0, "confidence": "prior"}})
+    assert b["horizons"][0]["reachableTokens"] == 500_000
+
+
+# ---- token model -----------------------------------------------------------
+
+def test_weighted_tokens_use_type_and_model_weights():
+    from claude_swap import token_model as tm
+
+    usage = {"input_tokens": 100, "output_tokens": 10, "cache_creation_input_tokens": 50,
+             "cache_read_input_tokens": 10_000, "service_tier": "x", "other": True}
+    assert tm.weighted_tokens("claude-opus-5-5", usage) == 300.0  # 100 + 50 + 50 + 100
+    assert tm.weighted_tokens("claude-sonnet-5-5", usage) == 180.0
+    assert tm.weighted_tokens("claude-fable-5-2", usage) == 900.0
+    assert tm.weighted_tokens(None, {}) == 0.0
+    assert tm.model_weight("claude-fable-5-1") == 3.8 and tm.model_weight("unknown-model") == 1.0
+
+
+def test_the_rate_moves_from_the_prior_to_the_account_data():
+    from claude_swap import token_model as tm
+
+    assert tm.prior_rate("pro", "week") == 300_000 and tm.prior_rate("max", "week") == 1_500_000
+    assert tm.blended_rate("pro", "week", 0, 0) == 300_000
+    # 10 prior points at 300k and 10 own points at 100k give 200k.
+    assert tm.blended_rate("pro", "week", 10, 1_000_000) == 200_000
+    assert abs(tm.blended_rate("pro", "week", 1000, 100_000_000) - 100_000) < 2_100
+    assert [tm.confidence(v) for v in (0, 10, 30, 100)] == ["prior", "low", "medium", "high"]
+
+
+# ---- calibration from the user's logs ---------------------------------------
+
+def _poll(ts, active, five, week):
+    return json.dumps({"event": "poll", "ts": iso(ts), "active": {"number": active},
+                       "windowsPct": {str(active): {"5h": five, "7d": week}}})
+
+
+def _msg(ts, mid, model="claude-opus-5-5", inp=0, out=0, create=0, read=0, text="secret text"):
+    stamp = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return json.dumps({"timestamp": stamp, "requestId": "r" + mid, "type": "assistant",
+                       "message": {"id": mid, "model": model, "content": text, "usage": {
+                           "input_tokens": inp, "output_tokens": out,
+                           "cache_creation_input_tokens": create, "cache_read_input_tokens": read}}})
+
+
+def test_accumulate_sums_points_and_tokens_per_account():
+    from claude_swap import budget_calibrate as cal
+
+    polls = [(0.0, "1", 10.0, 20.0), (600.0, "1", 30.0, 24.0),
+             (1200.0, "2", 5.0, 50.0), (1800.0, "2", 9.0, 51.0)]
+    events = [(300.0, 40_000.0), (1500.0, 50_000.0), (5000.0, 999.0)]
+    store = cal.accumulate(cal.empty_store(), polls, events)
+    assert store["accounts"]["1"] == {"week": {"points": 4.0, "tokens": 40_000.0},
+                                      "five": {"points": 20.0, "tokens": 40_000.0}}
+    assert store["accounts"]["2"]["week"] == {"points": 1.0, "tokens": 50_000.0}
+    assert store["lastPoll"] == [1800.0, "2", 9.0, 51.0]
+
+
+def test_accumulate_continues_from_the_last_poll():
+    from claude_swap import budget_calibrate as cal
+
+    first = [(0.0, "1", 10.0, 20.0), (600.0, "1", 20.0, 22.0)]
+    more = first + [(1200.0, "1", 35.0, 25.0)]
+    events = [(300.0, 1000.0), (900.0, 3000.0)]
+    store = cal.accumulate(cal.empty_store(), first, events)
+    store = cal.accumulate(store, more, events)  # the first interval is not counted twice
+    assert store["accounts"]["1"]["week"] == {"points": 5.0, "tokens": 4000.0}
+    assert cal.accumulate(store, more, events) == store  # nothing new: no change
+
+
+def test_accumulate_skips_gaps_resets_and_external_use():
+    from claude_swap import budget_calibrate as cal
+
+    polls = [(0.0, "1", 10.0, 20.0), (5000.0, "1", 30.0, 40.0),   # gap: the engine was off
+             (5600.0, "1", 0.0, 41.0),                            # 5h reset: only the week counts
+             (6200.0, "2", 5.0, 50.0), (6800.0, "2", 9.0, 53.0)]  # no token: external use
+    store = cal.accumulate(cal.empty_store(), polls, [(5300.0, 700.0)])
+    assert store["accounts"]["1"] == {"week": {"points": 1.0, "tokens": 700.0},
+                                      "five": {"points": 0.0, "tokens": 0.0}}
+    assert store["accounts"]["2"] == {"externalPoints": 3.0}
+
+
+def test_rates_blend_own_data_with_the_prior():
+    from claude_swap import budget_calibrate as cal
+
+    store = cal.empty_store()
+    store["accounts"]["1"] = {"week": {"points": 10.0, "tokens": 1_000_000.0},
+                              "five": {"points": 30.0, "tokens": 600_000.0}}
+    out = cal.rates(store, {"1": "pro", "2": "max"})
+    assert out["1"]["weekPerPct"] == 200_000 and out["1"]["confidence"] == "low"
+    assert out["1"]["fivePerPct"] == 25_000  # (30 * 30k + 600k) / 60
+    assert out["2"] == {"weekPerPct": 1_500_000.0, "fivePerPct": 150_000.0, "confidence": "prior",
+                        "ownWeekPoints": 0.0, "ownFivePoints": 0.0}
+    assert cal.rates({"schemaVersion": 1, "tokensPerPercentPro": 5}, {"1": "pro"})["1"]["confidence"] == "prior"
+
+
+def test_calibrate_reads_the_logs_once_per_message_and_keeps_no_text(tmp_path):
+    from claude_swap import budget_calibrate as cal
+
+    root, projects = tmp_path / "data", tmp_path / "projects" / "p1"
+    root.mkdir(), projects.mkdir(parents=True)
+    (root / "decisions.jsonl").write_text("\n".join([
+        _poll(NOW, 1, 10.0, 20.0), json.dumps({"event": "no-switch"}), _poll(NOW + 600, 1, 30.0, 25.0)]) + "\n")
+    (projects / "s.jsonl").write_text("\n".join([
+        _msg(NOW + 60, "m1", inp=100, out=900, create=4000, read=50_000),   # 9_100 weighted
+        _msg(NOW + 61, "m1", inp=100, out=900, create=4000, read=50_000),   # the same message again
+        _msg(NOW + 120, "m2", model="claude-sonnet-5-5", out=1000),         # 3_000 weighted
+        _msg(NOW - 60, "m0", out=7777),                                      # before the first poll
+        "not json", json.dumps({"type": "user", "message": {"content": "hello"}}),
+    ]) + "\n")
+    store = cal.calibrate(root, projects_dir=tmp_path / "projects", now=NOW + 700)
+    assert store["accounts"]["1"]["week"] == {"points": 5.0, "tokens": 12_100.0}
+    stored = (root / "budget_calibration.json").read_text()
+    assert json.loads(stored)["accounts"] == store["accounts"]
+    assert "secret" not in stored and "hello" not in stored and "@" not in stored
+    again = cal.calibrate(root, projects_dir=tmp_path / "projects", now=NOW + 800)
+    assert again["accounts"] == store["accounts"]
+
+
+def test_calibrate_with_no_data_gives_an_empty_store(tmp_path):
+    from claude_swap import budget_calibrate as cal
+
+    store = cal.calibrate(tmp_path, projects_dir=tmp_path / "none")
+    assert store["accounts"] == {} and store["lastPoll"] is None
+
+
+def test_current_budget_uses_the_calibration_store(monkeypatch, tmp_path):
+    (tmp_path / "decisions.jsonl").write_text(
+        _poll(NOW - 600, 1, 10.0, 20.0) + "\n" + _poll(NOW, 1, 30.0, 30.0) + "\n")
+    projects = tmp_path / "projects" / "p"
+    projects.mkdir(parents=True)
+    (projects / "s.jsonl").write_text(_msg(NOW - 300, "m1", inp=1_000_000) + "\n")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    src = _fake_source(monkeypatch, tmp_path, {"accounts": [acc(1, week=30.0)]})
+    b = src.current_budget(NOW)
+    # 10 prior points at 300k and 10 own points at 100k give 200k per point.
+    assert b["accounts"][0]["sevenDay"]["tokensPerPercent"] == 200_000
+    assert b["accounts"][0]["tokenConfidence"] == "low"
+    assert b["tokens"]["remainingTokens"] == 14_000_000
+    assert "weighted" in b["tokens"]["unit"]

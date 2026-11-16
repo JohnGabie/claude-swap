@@ -1670,12 +1670,14 @@ def _budget_command(argv: list[str]) -> None:
         from claude_swap import budget_calibrate
 
         pace, _code = _pace_payload()
-        plans = {
-            str(a.get("id")): a.get("plan")
-            for a in (pace.get("accounts") or [])
-            if isinstance(a, dict) and isinstance(a.get("plan"), str)
+        store = budget_calibrate.calibrate(paths.get_backup_root())
+        out = {
+            "updatedAt": store.get("updatedAt"),
+            "unit": store.get("unit"),
+            "rates": budget_calibrate.rates(store, budget_source._plans(pace)),
+            "sums": store.get("accounts"),
         }
-        print(json.dumps(budget_calibrate.calibrate(paths.get_backup_root(), plans), indent=2))
+        print(json.dumps(out, indent=2))
         sys.exit(0)
     if args.hook:
         session = "default"

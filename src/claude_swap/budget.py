@@ -41,7 +41,10 @@ NOTES = (
     "horizons: the fuel for a plan. inTankUnits is what is left now; expiringUnits is the part of "
     "it that is lost at a weekly reset inside the horizon unless it is used first; refillUnits "
     "comes back at those resets; availableUnits = inTankUnits + refillUnits. It is an upper "
-    "bound: the 5-hour windows limit how fast one account can be used.",
+    "bound: the 5-hour windows limit how fast one account can be used. reachableTokens "
+    "applies that limit: plan with reachableTokens.",
+    "Token figures are weighted tokens (see tokens.definition): output counts 5 times input, "
+    "a cache read 0.01, and each model has a weight. They are estimates with a confidence word.",
 )
 
 
@@ -132,7 +135,54 @@ def _account(raw: dict, now: float, threshold: float, weekly_threshold: float) -
         }
     # Internal fields for the fleet sums; removed before the payload leaves.
     out["_u"], out["_e"], out["_counted"], out["_reset7"] = pct7 / 100.0, elapsed, counted, reset7
+    out["_reset5"], out["_head5"] = reset5, (None if no_five or pct5 is None else max(0.0, threshold - pct5))
+    out["_line5"] = None if no_five else threshold
     return out
+
+
+def _add_tokens(account: dict, rate: dict | None) -> None:
+    """Token figures of one measured account, from its per-percent rates."""
+    account["_week_rate"] = account["_five_rate"] = None
+    if not isinstance(rate, dict):
+        return
+    week, five = rate.get("weekPerPct"), rate.get("fivePerPct")
+    if not isinstance(week, (int, float)) or week <= 0:
+        return
+    account["_week_rate"] = float(week)
+    account["tokenConfidence"] = rate.get("confidence")
+    seven = account["sevenDay"]
+    seven["tokensPerPercent"] = round(week)
+    seven["remainingTokens"] = round(seven["remainingPct"] * week)
+    if "fiveHour" in account and isinstance(five, (int, float)) and five > 0:
+        account["_five_rate"] = float(five)
+        account["fiveHour"]["tokensPerPercent"] = round(five)
+        account["fiveHour"]["headroomTokens"] = round(account["fiveHour"]["headroomPct"] * five)
+
+
+FIVE_HOURS_S = 5 * 3600.0
+
+
+def _reachable_tokens(account: dict, now: float, end: float) -> float | None:
+    """Tokens of one account that fit before ``end``: the weekly quota in
+    reach, limited by what its 5-hour windows let through. None with no rate."""
+    week = account["_week_rate"]
+    if week is None:
+        return None
+    weekly = account["sevenDay"]["remainingPct"] * week
+    if account["_reset7"] is not None and account["_reset7"] <= end:
+        weekly += 100.0 * week
+    line, five = account["_line5"], account["_five_rate"]
+    if line is None or five is None:  # no 5-hour limit, or no rate for it
+        return weekly
+    start = now
+    through = 0.0
+    if account["_reset5"] is not None and account["_reset5"] > now:  # a window is open
+        through += (account["_head5"] or 0.0) * five
+        start = account["_reset5"]
+    if end > start:
+        windows = -(-(end - start) // FIVE_HOURS_S)  # ceil: a window started late still counts
+        through += windows * line * five
+    return min(weekly, through)
 
 
 def _advice(accounts: list[dict], pace_ratio: float | None, next_usable: float | None) -> tuple[str, str]:
@@ -160,15 +210,18 @@ def build_budget(
     *,
     threshold: float = balance.DEFAULT_THRESHOLD,
     weekly_threshold: float | None = None,
-    tokens_per_percent_pro: float | None = None,
-    tokens_measured_at: str | None = None,
-    tokens_confidence: str | None = None,
+    token_rates: dict | None = None,
+    token_meta: dict | None = None,
 ) -> dict:
     """The budget of the fleet at ``now``, from one ``cswap pace`` payload.
 
     ``threshold`` and ``weekly_threshold`` are the switch lines of the
     engine: an account at or over a line is not usable. A source that failed
     (``pace`` with an ``error``) gives advice ``unknown`` and no account.
+
+    ``token_rates`` maps an account id to ``{"weekPerPct", "fivePerPct",
+    "confidence"}`` (see ``budget_calibrate.rates``). With it, every quota
+    figure also comes in tokens. ``token_meta`` describes the token unit.
     """
     weekly_line = threshold if weekly_threshold is None else weekly_threshold
     raw_accounts = pace.get("accounts") if isinstance(pace, dict) else None
@@ -210,9 +263,11 @@ def build_budget(
         ),
         key=lambda r: r["at"],
     )
-    per_unit_tokens = (
-        100.0 * tokens_per_percent_pro if tokens_per_percent_pro and tokens_per_percent_pro > 0 else None
-    )
+    rates = token_rates if isinstance(token_rates, dict) else {}
+    measured_accounts = [a for a in accounts if a["measured"]]
+    for a in measured_accounts:
+        _add_tokens(a, rates.get(str(a["id"])))
+    has_tokens = bool(measured_accounts) and all(a["_week_rate"] is not None for a in measured_accounts)
     horizons = []
     for hours in HORIZON_HOURS:
         end = now + hours * 3600.0
@@ -228,28 +283,42 @@ def build_budget(
             "refillUnits": _round(refill, 3),
             "availableUnits": _round(total, 3),
         }
-        if per_unit_tokens is not None:
-            row["availableTokens"] = round(total * per_unit_tokens)
+        if has_tokens:
+            row["availableTokens"] = round(
+                sum(a["sevenDay"]["remainingTokens"] for a in measured_accounts)
+                + sum(100.0 * a["_week_rate"] for a in inside)
+            )
+            row["reachableTokens"] = min(
+                row["availableTokens"],
+                round(sum(_reachable_tokens(a, now, end) for a in measured_accounts)),
+            )
+            row["reachablePctOfAvailable"] = (
+                _round(100.0 * row["reachableTokens"] / row["availableTokens"], 1)
+                if row["availableTokens"] else None
+            )
         horizons.append(row)
 
-    for a in accounts:
-        for key in ("_u", "_e", "_counted", "_reset7"):
-            a.pop(key, None)
-
     tokens = None
-    if tokens_per_percent_pro and tokens_per_percent_pro > 0:
+    if has_tokens:
+        order = {"prior": 0, "low": 1, "medium": 2, "high": 3}
+        words = [a.get("tokenConfidence") for a in measured_accounts]
         tokens = {
             "estimate": True,
-            "tokensPerPercentPro": round(tokens_per_percent_pro),
-            "measuredAt": tokens_measured_at,
-            "confidence": tokens_confidence,
-            "definition": "input + output + cache creation tokens; cache reads not counted",
-            "remainingTokens": round(remaining * 100.0 * tokens_per_percent_pro),
-            "usableNowTokens": round(
-                sum(a["sevenDay"]["remainingUnits"] for a in accounts if a["measured"] and a["usableNow"])
-                * 100.0 * tokens_per_percent_pro
+            **(token_meta if isinstance(token_meta, dict) else {}),
+            "confidence": min(words, key=lambda w: order.get(w, 0)) if words else None,
+            "remainingTokens": sum(a["sevenDay"]["remainingTokens"] for a in measured_accounts),
+            "usableNowTokens": sum(
+                a["sevenDay"]["remainingTokens"] for a in measured_accounts if a["usableNow"]
+            ),
+            "fiveHourHeadroomTokens": sum(
+                a["fiveHour"].get("headroomTokens", 0)
+                for a in measured_accounts if a["usableNow"] and "fiveHour" in a
             ),
         }
+
+    for a in accounts:
+        for key in [k for k in a if k.startswith("_")]:
+            a.pop(key, None)
 
     measured = [a for a in accounts if a["measured"]]
     return {
