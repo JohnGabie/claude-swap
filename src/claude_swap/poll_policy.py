@@ -90,6 +90,9 @@ MIN_INTERVAL_S = 180.0
 # inside the measured ~28-30 request rolling-hour window; overshoot on top of
 # steady traffic is absorbed by the post-429 floor below.
 URGENT_INTERVAL_S = 60.0
+# Urgent mode also starts outside the band when the last rise, repeated this
+# many times, reaches the line.
+URGENT_POLLS_TO_LINE = 3.0
 
 # Decay ceilings for an account whose usage is not moving: the active account
 # stays reasonably fresh, an idle alternate drifts out to ten minutes.
@@ -302,10 +305,18 @@ def plan_after_fetch(
     prev_pcts = {
         label: pct for label, pct, _ in oauth.relevant_windows(prev_usage, models)
     }
+    # In the band, OR rising fast enough to reach the line within
+    # URGENT_POLLS_TO_LINE more polls at the movement just seen: a small
+    # account under a heavy load crosses the whole band between two normal
+    # polls (incident 2026-11-16: 48% -> 82% -> 84% -> full, 3 minutes apart).
     rising_in_band = any(
         label in prev_pcts
         and pct - prev_pcts[label] >= MOVEMENT_DELTA_PCT
-        and pct >= window_line(label, threshold, weekly_threshold) - ESCALATION_MARGIN_PCT
+        and (
+            pct >= window_line(label, threshold, weekly_threshold) - ESCALATION_MARGIN_PCT
+            or pct + URGENT_POLLS_TO_LINE * (pct - prev_pcts[label])
+            >= window_line(label, threshold, weekly_threshold)
+        )
         for label, pct, _ in oauth.relevant_windows(new_usage, models)
     )
     if is_active and rising_in_band and not recent_429:

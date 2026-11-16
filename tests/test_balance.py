@@ -1215,3 +1215,60 @@ def test_proactive_switch_needs_the_deficit_margin_or_the_loss_guard():
     # reasons for a proactive move.
     assert seen_inside >= 20
     assert by_margin >= 20 and by_guard >= 1
+
+
+class TestRunwayRule:
+    """A proactive move never goes to an account with less 5-hour room."""
+
+    NOW = 1_000_000.0
+    WEEK_END = NOW + 84 * 3600.0
+
+    def _acc(self, num, plan, five, week):
+        return balance.Account(num, plan, balance.Window(five, self.NOW + 3600.0),
+                               balance.Window(week, self.WEEK_END))
+
+    # The incident: the Max 5-hour percent rose 4.3 points a minute = 21.5 Pro points.
+    BURN = 21.5 / 60.0
+
+    def _decide(self, accounts, active, at_threshold=False, burn=BURN):
+        return balance.decide(accounts, active, self.NOW, None, None, at_threshold,
+                              threshold=99.0, burn_rate=burn)
+
+    def test_five_hour_room_is_capacity_times_points_below_the_line(self):
+        assert balance.five_hour_room(self._acc(5, "max", 80.0, 18.0), self.NOW, 99.0) == 95.0
+        assert balance.five_hour_room(self._acc(4, "pro", 29.0, 27.0), self.NOW, 99.0) == 70.0
+        assert balance.five_hour_room(self._acc(9, "ultra", 99.0, 10.0), self.NOW, 99.0) == float("inf")
+        unmeasured = balance.Account(1, "pro", None, balance.Window(10.0, self.WEEK_END))
+        assert balance.five_hour_room(unmeasured, self.NOW, 99.0) == 0.0
+
+    def test_the_incident_max_at_80_does_not_move_to_pro_at_29(self):
+        # 2026-11-16: the active Max had more 5-hour room than the Pro target.
+        accounts = [self._acc(5, "max", 80.0, 18.0), self._acc(4, "pro", 29.0, 0.0)]
+        assert isinstance(self._decide(accounts, 5), balance.Stay)
+
+    def test_with_no_burn_the_rule_changes_nothing(self):
+        accounts = [self._acc(5, "max", 80.0, 18.0), self._acc(4, "pro", 29.0, 0.0)]
+        out = self._decide(accounts, 5, burn=0.0)
+        assert isinstance(out, balance.SwitchTo) and out.account_id == 4
+
+    def test_a_light_burn_lets_the_move_happen(self):
+        # 1 Pro point a minute: 30 points last half an hour; the Pro has 70.
+        accounts = [self._acc(5, "max", 80.0, 18.0), self._acc(4, "pro", 29.0, 0.0)]
+        out = self._decide(accounts, 5, burn=1.0 / 60.0)
+        assert isinstance(out, balance.SwitchTo) and out.account_id == 4
+
+    def test_a_target_with_more_room_than_the_active_is_still_chosen(self):
+        accounts = [self._acc(5, "max", 90.0, 60.0), self._acc(4, "pro", 0.0, 0.0)]
+        out = self._decide(accounts, 5)  # active room 45, target room 99
+        assert isinstance(out, balance.SwitchTo) and out.account_id == 4 and out.reason == "proactive"
+
+    def test_the_next_candidate_with_enough_room_is_used(self):
+        accounts = [self._acc(5, "max", 60.0, 60.0), self._acc(4, "pro", 0.0, 0.0),
+                    self._acc(6, "max", 0.0, 10.0)]
+        out = self._decide(accounts, 5)  # active room 195: only the other Max has more
+        assert isinstance(out, balance.SwitchTo) and out.account_id == 6
+
+    def test_a_forced_switch_is_not_limited_by_the_rule(self):
+        accounts = [self._acc(5, "max", 99.0, 18.0), self._acc(4, "pro", 29.0, 27.0)]
+        out = self._decide(accounts, 5, at_threshold=True)
+        assert isinstance(out, balance.SwitchTo) and out.account_id == 4 and out.reason == "threshold"

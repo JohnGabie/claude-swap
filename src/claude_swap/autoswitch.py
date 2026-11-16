@@ -89,6 +89,13 @@ _FORCED_TRIGGERS = ("at-limit", "failover")
 # `all-exhausted` event at most once in this many seconds. The first tick of
 # the state always reports. In memory only: a new engine (a `--once` run)
 # reports on its first tick.
+# Burn lookahead (incident 2026-11-16: an account went from 84% to 100%
+# between two readings and the work stopped).
+BURN_MIN_GAP_S = 60.0          # the shortest time assumed until the next reading
+BURN_MAX_GAP_S = 600.0         # a longer gap between readings counts as this
+BURN_STALE_S = 900.0           # a rate from a reading older than this is dropped
+BURN_LOOKAHEAD_MAX_PTS = 40.0  # the line is never lowered by more than this
+BURN_LINE_FLOOR = 50.0         # and never below this percent
 ALL_EXHAUSTED_REPEAT_S = 900
 # E3b: an account left by one of these can be "recovered" inside the bar once
 # its window reset. An account left by `failover` (or an unknown trigger) never.
@@ -1074,6 +1081,11 @@ class AutoSwitchEngine:
         # Balanced strategy: account numbers of the last decision, best
         # first. Memory only; read by the tray pill for its ranking sign.
         self.balanced_rank: tuple[int, ...] = ()
+        # Burn of the active account: its last 5-hour reading and the rate
+        # between the last two (percent points per second). Memory only.
+        self._burn_reading: tuple[str, float, float] | None = None
+        self._burn_rate = 0.0
+        self._burn_gap = BURN_MIN_GAP_S
         # The active account number the engine saw last (S3b-2), in memory
         # only. A balanced tick that sees another active account, which the
         # engine did not switch to, invalidates the plan of both accounts.
@@ -1510,6 +1522,18 @@ class AutoSwitchEngine:
             threshold=thresholds[current],
             weekly_threshold=settings.weekly_threshold,
         )
+        # Readings are 1 to 4 minutes apart and a heavy load fills a small
+        # account between two of them. The active account's 5-hour line is
+        # lowered by the points it is expected to use before the next reading.
+        lookahead = self._burn_lookahead(current, entries.get(current), usage.get(current))
+        if lookahead > 0.0:
+            thresholds = ThresholdMap(
+                {
+                    **thresholds,
+                    current: max(BURN_LINE_FLOOR, thresholds[current] - lookahead),
+                },
+                thresholds.default,
+            )
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -3444,6 +3468,7 @@ class AutoSwitchEngine:
                 at_threshold,
                 settings.balanced_cooldown_seconds,
                 candidate_margin=settings.balanced_margin,
+                burn_rate=self._burn_rate * balance.plan_capacity(plan_of(current)),
                 **lines_kw,
             )
 
@@ -3589,6 +3614,46 @@ class AutoSwitchEngine:
         if earliest is None or frees is None:
             return None, None
         return datetime.fromtimestamp(earliest, tz=timezone.utc), int(frees)
+
+    def _burn_lookahead(self, current: str, entry, value) -> float:
+        """Points of the 5-hour window the active account is expected to use
+        before the next reading; 0.0 with no rate.
+
+        The rate comes from two readings of the same account with different
+        fetch times. A percent that fell (the window reset), a change of
+        account or a rate older than ``BURN_STALE_S`` clears it. The points
+        are ``rate * (age of the reading + gap between readings)``, capped at
+        ``BURN_LOOKAHEAD_MAX_PTS``.
+        """
+        pct = _window_pcts(value if isinstance(value, dict) else None, self._models).get(
+            oauth.FIVE_HOUR_LABEL
+        )
+        fetched = getattr(entry, "fetched_at", None)
+        if pct is None or not isinstance(fetched, (int, float)):
+            return 0.0 if self._burn_reading is None or self._burn_reading[0] != current else (
+                self._lookahead_points(None)
+            )
+        previous = self._burn_reading
+        if previous is None or previous[0] != current:
+            self._burn_rate, self._burn_gap = 0.0, BURN_MIN_GAP_S
+            self._burn_reading = (current, float(fetched), float(pct))
+        elif fetched > previous[1]:
+            gap = fetched - previous[1]
+            self._burn_rate = max(0.0, (pct - previous[2]) / gap) if pct >= previous[2] else 0.0
+            self._burn_gap = gap
+            self._burn_reading = (current, float(fetched), float(pct))
+        return self._lookahead_points(float(fetched))
+
+    def _lookahead_points(self, fetched: float | None) -> float:
+        reading = self._burn_reading
+        if reading is None or self._burn_rate <= 0.0:
+            return 0.0
+        age = max(0.0, self.clock() - (fetched if fetched is not None else reading[1]))
+        if age > BURN_STALE_S:
+            self._burn_rate = 0.0
+            return 0.0
+        horizon = age + min(max(self._burn_gap, BURN_MIN_GAP_S), BURN_MAX_GAP_S)
+        return min(BURN_LOOKAHEAD_MAX_PTS, self._burn_rate * horizon)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         # Decision log first: a frontend that raises must not lose the line.

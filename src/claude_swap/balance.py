@@ -107,6 +107,8 @@ MIN_HEADROOM_7D = 3.0
 # decided: cooldown (dwell) after a proactive `balanced` switch, and the
 # same after a manual switch. The engine passes `balancedCooldownSeconds`.
 BALANCED_COOLDOWN_S = 900.0
+# Runway rule: a proactive target must last this long at the measured burn.
+MIN_RUNWAY_S = 1800.0
 
 # decided: the engine's switch line. It mirrors `AutoSwitchSettings.threshold`
 # (settings.py). A candidate must sit strictly below it in every window, and
@@ -216,6 +218,18 @@ def _window(window: Window | None, now: float) -> tuple[float | None, float | No
     if window.resets_at is not None and window.resets_at <= now:
         return 0.0, None
     return max(0.0, min(100.0, float(window.pct))), window.resets_at
+
+
+def five_hour_room(account: Account, now: float, threshold: float = DEFAULT_THRESHOLD) -> float:
+    """Room left in the 5-hour window, in Pro percent points: capacity times
+    the points below the switch line. Infinite for a plan with no 5-hour
+    limit; 0.0 for an unmeasured window."""
+    if _plan_key(account.plan) in NO_FIVE_HOUR_LIMIT_PLANS:
+        return math.inf
+    pct5, _ = _window(account.five_hour, now)
+    if pct5 is None:
+        return 0.0
+    return plan_capacity(account.plan) * max(0.0, threshold - pct5)
 
 
 def clamp_margin(candidate_margin: float) -> float:
@@ -436,6 +450,7 @@ def decide(
     threshold: float = DEFAULT_THRESHOLD,
     weekly_threshold: float | None = None,
     candidate_margin: float = DEFAULT_CANDIDATE_MARGIN,
+    burn_rate: float = 0.0,
 ) -> Decision:
     """Decide whether to leave the active account, and for which account.
 
@@ -461,6 +476,13 @@ def decide(
          ``DEFICIT_MARGIN_PTS``.
 
        A move then waits for the cooldowns: ``Hold`` while one runs.
+
+       Runway rule: ``burn_rate`` is the measured use of the active
+       account in Pro percent points of the 5-hour window per second (0.0
+       when unknown). With a burn, a proactive target needs a 5-hour room
+       (``five_hour_room``: capacity times the points below the line) that
+       lasts ``MIN_RUNWAY_S`` at that burn, or at least the room the active
+       account has left. With no burn the rule changes nothing.
 
     ``candidate_margin`` (S1g) applies to the candidate list only. The
     active account is scored at margin 0, for the forced switch and for the
@@ -504,6 +526,20 @@ def decide(
         return Stay()
 
     others = [s for s in ranked if s.id != active_id]
+    # Runway rule: under a measured burn, a proactive move needs a target
+    # whose 5-hour room lasts MIN_RUNWAY_S at that burn, or that has at least
+    # the room the active account has left.
+    # Incident 2026-11-16: under a heavy load the rule moved from a Max
+    # account at 80% (room of 5 * 19 = 95 Pro points) to a Pro account at 29%
+    # (room of 70 Pro points); the Pro window was full 9 minutes later and
+    # the work stopped. The forced switch (rule 1) is not limited by this.
+    if burn_rate > 0.0 and math.isfinite(burn_rate):
+        by_id = {a.id: a for a in accounts}
+        active_account = by_id.get(active_id)
+        need = burn_rate * MIN_RUNWAY_S
+        if active_account is not None:
+            need = min(need, five_hour_room(active_account, now, threshold))
+        others = [s for s in others if five_hour_room(by_id[s.id], now, threshold) >= need]
     if not others:
         return Stay()
     best = others[0]
