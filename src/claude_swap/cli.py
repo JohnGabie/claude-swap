@@ -1661,7 +1661,22 @@ def _budget_command(argv: list[str]) -> None:
         "--hook", action="store_true",
         help="Prompt-hook mode: one advice line, only when it changed for the session",
     )
+    parser.add_argument(
+        "--calibrate", action="store_true",
+        help="Measure tokens per percent point from the decision log and the local Claude Code logs",
+    )
     args = parser.parse_args(argv)
+    if args.calibrate:
+        from claude_swap import budget_calibrate
+
+        pace, _code = _pace_payload()
+        plans = {
+            str(a.get("id")): a.get("plan")
+            for a in (pace.get("accounts") or [])
+            if isinstance(a, dict) and isinstance(a.get("plan"), str)
+        }
+        print(json.dumps(budget_calibrate.calibrate(paths.get_backup_root(), plans), indent=2))
+        sys.exit(0)
     if args.hook:
         session = "default"
         try:

@@ -156,6 +156,7 @@ def build_budget(
     weekly_threshold: float | None = None,
     tokens_per_percent_pro: float | None = None,
     tokens_measured_at: str | None = None,
+    tokens_confidence: str | None = None,
 ) -> dict:
     """The budget of the fleet at ``now``, from one ``cswap pace`` payload.
 
@@ -212,6 +213,8 @@ def build_budget(
             "estimate": True,
             "tokensPerPercentPro": round(tokens_per_percent_pro),
             "measuredAt": tokens_measured_at,
+            "confidence": tokens_confidence,
+            "definition": "input + output + cache creation tokens; cache reads not counted",
             "remainingTokens": round(remaining * 100.0 * tokens_per_percent_pro),
             "usableNowTokens": round(
                 sum(a["sevenDay"]["remainingUnits"] for a in accounts if a["measured"] and a["usableNow"])

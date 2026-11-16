@@ -132,6 +132,8 @@ def test_tokens_scale_by_capacity_and_say_estimate():
               tokens_per_percent_pro=1000.0, tokens_measured_at="2026-11-10")
     assert b["tokens"] == {
         "estimate": True, "tokensPerPercentPro": 1000, "measuredAt": "2026-11-10",
+        "confidence": None,
+        "definition": "input + output + cache creation tokens; cache reads not counted",
         "remainingTokens": 300000, "usableNowTokens": 300000,
     }
 
@@ -194,9 +196,11 @@ def test_current_budget_uses_the_settings_lines(monkeypatch, tmp_path):
 
 def test_current_budget_reads_the_calibration_file(monkeypatch, tmp_path):
     (tmp_path / "budget_calibration.json").write_text(
-        json.dumps({"tokensPerPercentPro": 2000, "measuredAt": "2026-11-10"}))
+        json.dumps({"tokensPerPercentPro": 2000, "measuredAt": "2026-11-10", "confidence": "low"}))
     src = _fake_source(monkeypatch, tmp_path, {"accounts": [acc(1, week=50.0)]})
-    assert src.current_budget(NOW)["tokens"]["remainingTokens"] == 100000
+    monkeypatch.setattr(src, "_refresh_calibration", lambda *a: None)
+    tokens = src.current_budget(NOW)["tokens"]
+    assert tokens["remainingTokens"] == 100000 and tokens["confidence"] == "low"
     for bad in ("{", json.dumps({"tokensPerPercentPro": -1}), json.dumps({"tokensPerPercentPro": True}), "[]"):
         (tmp_path / "budget_calibration.json").write_text(bad)
         assert src.current_budget(NOW)["tokens"] is None
@@ -277,3 +281,78 @@ def test_mcp_run_without_the_sdk_says_how_to_install(monkeypatch, capsys):
     monkeypatch.setattr(mcp_server, "_server_class", lambda: None)
     assert mcp_server.run() == 1
     assert "claude-swap[mcp]" in capsys.readouterr().err
+
+
+# ---- calibration from the user's logs ---------------------------------------
+
+def _poll(ts, active, five, week):
+    return json.dumps({"event": "poll", "ts": iso(ts), "active": {"number": active},
+                       "windowsPct": {str(active): {"5h": five, "7d": week}}})
+
+
+def _msg(ts, mid, inp=0, out=0, create=0, read=0, text="secret text"):
+    stamp = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    return json.dumps({"timestamp": stamp, "requestId": "r" + mid, "type": "assistant",
+                       "message": {"id": mid, "content": text, "usage": {
+                           "input_tokens": inp, "output_tokens": out,
+                           "cache_creation_input_tokens": create, "cache_read_input_tokens": read}}})
+
+
+def test_measure_joins_polls_and_tokens_by_capacity():
+    from claude_swap import budget_calibrate as cal
+
+    polls = [(0.0, "1", 10.0, 20.0), (600.0, "1", 30.0, 24.0),      # pro: +4 weekly, +20 five-hour
+             (1200.0, "2", 5.0, 50.0), (1800.0, "2", 9.0, 51.0)]    # max: +1 weekly (5 pro points)
+    events = [(300.0, 40_000, 7), (1500.0, 50_000, 9), (5000.0, 999, 0)]
+    out = cal.measure(polls, events, {"1": "pro", "2": "max"})
+    assert out["enough"] is True and out["confidence"] == "low"
+    assert out["tokensPerPercentPro"] == 10_000  # 90_000 tokens / 9 pro points
+    assert out["sample"]["proWeeklyPoints"] == 9.0 and out["sample"]["intervals"] == 2
+    assert out["sample"]["accounts"]["2"] == {"plan": "max", "weeklyPoints": 1.0, "tokens": 50_000}
+
+
+def test_measure_skips_gaps_resets_and_account_changes():
+    from claude_swap import budget_calibrate as cal
+
+    polls = [(0.0, "1", 10.0, 20.0), (5000.0, "1", 30.0, 40.0),     # gap: the engine was off
+             (5600.0, "1", 0.0, 0.0),                               # reset: percent fell
+             (6200.0, "2", 5.0, 50.0)]                              # another account
+    out = cal.measure(polls, [(100.0, 1, 0)], {"1": "pro", "2": "pro"})
+    assert out["enough"] is False and out["tokensPerPercentPro"] is None and out["confidence"] is None
+
+
+def test_confidence_grows_with_the_sample():
+    from claude_swap import budget_calibrate as cal
+
+    assert [cal.confidence(v) for v in (3.0, 30.0, 100.0)] == ["low", "medium", "high"]
+
+
+def test_calibrate_reads_the_logs_once_per_message_and_keeps_no_text(tmp_path):
+    from claude_swap import budget_calibrate as cal
+
+    root, projects = tmp_path / "data", tmp_path / "projects" / "p1"
+    root.mkdir(), projects.mkdir(parents=True)
+    (root / "decisions.jsonl").write_text("\n".join([
+        _poll(NOW, 1, 10.0, 20.0), json.dumps({"event": "no-switch"}), _poll(NOW + 600, 1, 30.0, 25.0)]) + "\n")
+    (projects / "s.jsonl").write_text("\n".join([
+        _msg(NOW + 60, "m1", inp=100, out=900, create=4000, read=50_000),
+        _msg(NOW + 61, "m1", inp=100, out=900, create=4000, read=50_000),  # the same message again
+        _msg(NOW + 120, "m2", out=5000),
+        _msg(NOW - 60, "m0", out=7777),  # before the first poll
+        "not json", json.dumps({"type": "user", "message": {"content": "hello"}}),
+    ]) + "\n")
+    out = cal.calibrate(root, {"1": "pro"}, projects_dir=tmp_path / "projects", now=NOW + 700)
+    assert out["written"] is True
+    assert out["tokensPerPercentPro"] == 2000  # 10_000 tokens / 5 points
+    assert out["cacheReadTokensPerPercentPro"] == 10_000
+    stored = (root / "budget_calibration.json").read_text()
+    assert json.loads(stored)["tokensPerPercentPro"] == 2000
+    assert "secret" not in stored and "hello" not in stored
+
+
+def test_calibrate_with_no_data_writes_nothing(tmp_path):
+    from claude_swap import budget_calibrate as cal
+
+    out = cal.calibrate(tmp_path, {}, projects_dir=tmp_path / "none")
+    assert out["written"] is False and out["enough"] is False
+    assert not (tmp_path / "budget_calibration.json").exists()
