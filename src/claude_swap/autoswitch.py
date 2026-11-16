@@ -785,6 +785,9 @@ class _BalancedChoice:
     decision: balance.Decision
     ordered: list[str]
     at_threshold: bool
+    # ``balance.rank`` of this snapshot, best first, without the no-return
+    # bar: what the UI shows as the ranking.
+    rank: tuple[int, ...] = ()
 
 
 def _binding_recovery_ts(
@@ -1068,6 +1071,9 @@ class AutoSwitchEngine:
         # starts with an empty cache; ``_perform`` invalidates both ends of a
         # performed switch.
         self._plan_cache = _PlanCache(switcher)
+        # Balanced strategy: account numbers of the last decision, best
+        # first. Memory only; read by the tray pill for its ranking sign.
+        self.balanced_rank: tuple[int, ...] = ()
         # The active account number the engine saw last (S3b-2), in memory
         # only. A balanced tick that sees another active account, which the
         # engine did not switch to, invalidates the plan of both accounts.
@@ -1480,6 +1486,8 @@ class AutoSwitchEngine:
 
         if settings.strategy == "balanced":
             self._note_active_account(current)
+        else:
+            self.balanced_rank = ()
 
         current_email = self.switcher.account_email(current)
         active_ref = _ref(current, current_email) if current_email else {
@@ -1895,6 +1903,7 @@ class AutoSwitchEngine:
                     plan_of=plan_of,
                 )
             decision = choice.decision
+            self.balanced_rank = choice.rank
             if isinstance(decision, balance.Hold):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
@@ -3466,7 +3475,10 @@ class AutoSwitchEngine:
                 ordered += [
                     str(n) for n in ranked if str(n) not in (target, current)
                 ]
-        return _BalancedChoice(decision, ordered, at_threshold)
+        shown = balance.rank(
+            accounts, now, candidate_margin=settings.balanced_margin, **lines_kw
+        )
+        return _BalancedChoice(decision, ordered, at_threshold, tuple(shown))
 
     def _below_threshold_event(
         self,

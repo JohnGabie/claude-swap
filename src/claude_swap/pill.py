@@ -167,6 +167,12 @@ def _pct(row: dict | None) -> float | None:
     return float(v) if isinstance(v, (int, float)) else None
 
 
+def rank_of(card: dict) -> int:
+    """1, 2 or 3 for the gold, silver and bronze sign; 0 for no sign."""
+    v = card.get("rank")
+    return v if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 3 else 0
+
+
 def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: bool = False) -> dict:
     """Everything the page needs to draw the pill and, on hover, each account's card."""
     pw, ph = pill_size(edge, len(cards))
@@ -188,6 +194,7 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
                 "disabled": bool(c.get("disabled")),
                 "five": _pct(_row(c, "5h")),
                 "week": _pct(_row(c, "7d")),
+                "rank": rank_of(c),
                 "title": c.get("title", ""),
                 "tag": c.get("tag", ""),
                 "message": c.get("message"),
@@ -245,7 +252,8 @@ body.folded .item,body.folded .add{transition:opacity .18s ease calc(var(--i,0) 
 .item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;border-radius:12px;
  cursor:pointer;position:relative}
 .item:hover{background:var(--hover)}
-.item .pct{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}
+.item .pct{font-size:12px;font-weight:600;font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:2px;height:14px}
+.item .pct svg{display:block}
 .item.off{opacity:.45}
 .item .ring{transition:transform .3s var(--spring)}
 .item:hover .ring{transform:scale(1.07)}
@@ -296,6 +304,12 @@ const resetText=t=>!t?'':/^resets/i.test(t)?t[0].toUpperCase()+t.slice(1):'Reset
 const dash=(c,p)=>`${p==null?0:c*Math.min(p,100)/100} ${c}`;
 const arc=(r,c,p,w,k)=>`<circle class=track cx=21 cy=21 r=${r} fill=none stroke-width=${w}></circle>`+
  `<circle class="arc ${k}" cx=21 cy=21 r=${r} fill=none stroke-width=${w} stroke-dasharray="${dash(c,p)}" transform="rotate(-90 21 21)"></circle>`;
+// Ranking sign of the balanced strategy: a four-pointed sparkle, gold, silver or bronze, left of the percent
+const SPARK={1:[14,'#e0a800'],2:[12,'#9aa3b0'],3:[10,'#b8692a']};
+function spark(rank){
+ const k=SPARK[rank]; if(!k) return '';
+ return `<svg width=${k[0]} height=${k[0]} viewBox="0 0 24 24"><path d="M12 2.6C12.5 8 16 11.5 21.4 12C16 12.5 12.5 16 12 21.4C11.5 16 8 12.5 2.6 12C8 11.5 11.5 8 12 2.6Z" fill="${k[1]}" stroke="${k[1]}" stroke-width="2.2" stroke-linejoin="round"/></svg>`;
+}
 function ring(it){
  return `<svg class=ring width=42 height=42 viewBox="0 0 42 42">`+arc(R5,C5,it.five,4,'five')+arc(R7,C7,it.week,2.5,'week')+
   `<circle class=disc cx=21 cy=21 r=8.5 fill=none></circle><text class=num x=21 y=25 text-anchor=middle>${esc(it.num)}</text></svg>`;
@@ -444,7 +458,7 @@ function applyItem(d,it){
  for(const [k,p,c] of [['five',it.five,C5],['week',it.week,C7]]){
   const el=d.querySelector('.arc.'+k); if(el) el.setAttribute('stroke-dasharray',dash(c,p));
  }
- d.querySelector('.pct').textContent=it.five==null?'\\u2013':Math.round(it.five)+'%';
+ d.querySelector('.pct').innerHTML=spark(it.rank)+(it.five==null?'\\u2013':Math.round(it.five)+'%');
 }
 // The structure is rebuilt only when it changes, so a refresh animates the arcs rather than replaying the entrance
 function build(p){

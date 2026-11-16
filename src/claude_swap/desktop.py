@@ -138,6 +138,15 @@ def card_dict(acc: AccountSnapshot, now: float) -> dict:
     return d
 
 
+def with_ranks(cards: list[dict], rank) -> list[dict]:
+    """Set ``rank`` on each card: 1, 2, 3 for the first three accounts of the
+    balanced ranking, else 0."""
+    place = {str(num): i + 1 for i, num in enumerate(list(rank)[:3])}
+    for card in cards:
+        card["rank"] = place.get(str(card.get("num")), 0)
+    return cards
+
+
 class _EngineCrash:
     """Minimal event stand-in so a crashed engine thread shows up in the log."""
 
@@ -184,7 +193,13 @@ class DesktopApi:
                 snap = self._source.take()
             except Exception as e:
                 return {"error": f"{type(e).__name__}: {e}"}
-        return {"accounts": [card_dict(a, snap.taken_at) for a in snap.accounts]}
+        cards = [card_dict(a, snap.taken_at) for a in snap.accounts]
+        return {"accounts": with_ranks(cards, self._balanced_rank())}
+
+    def _balanced_rank(self) -> tuple:
+        """The running engine's balanced ranking; empty with no engine or
+        another strategy."""
+        return tuple(getattr(self._engine, "balanced_rank", ()) or ())
 
     def poll(self) -> dict:
         """Engine events since last poll, plus refresh/close/auto state for the page."""

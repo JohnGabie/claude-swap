@@ -1020,3 +1020,29 @@ class TestBalancedNoOauthPeer:
         assert outcome is TickOutcome.NO_ACTION
         assert _reasons(h) == ["below-threshold"]
         assert h.active_number() == 1
+
+
+class TestBalancedRank:
+    """``engine.balanced_rank``: what the pill shows as gold, silver, bronze."""
+
+    def test_rank_lists_usable_accounts_best_first(self, temp_home):
+        h = _fleet(temp_home, "balanced")
+        h.tick_with_usage({"1": _usage7(10, 50, R_LATER),
+                           "2": _usage7(10, 10, R_LATER),
+                           "3": _usage7(10, 30, R_LATER)})
+        # Equal plans, equal reset: the least weekly use leads.
+        assert h.engine.balanced_rank == (2, 3, 1)
+
+    def test_an_account_at_its_limit_has_no_rank(self, temp_home):
+        h = _fleet(temp_home, "balanced")
+        h.tick_with_usage({"1": _usage7(10, 50, R_LATER),
+                           "2": _usage7(100, 10, R_LATER),
+                           "3": _usage7(10, 30, R_LATER)})
+        assert h.engine.balanced_rank == (3, 1)
+
+    def test_other_strategies_keep_no_rank(self, temp_home):
+        h = _fleet(temp_home, "best")
+        h.tick_with_usage({"1": _usage7(10, 50, R_LATER),
+                           "2": _usage7(10, 10, R_LATER),
+                           "3": _usage7(10, 30, R_LATER)})
+        assert h.engine.balanced_rank == ()

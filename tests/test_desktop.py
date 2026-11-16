@@ -347,3 +347,19 @@ def test_save_settings_passes_app_options_through(tmp_path):
     api.app_options = SimpleNamespace(get=lambda: [], set=lambda k, v: seen.update({k: v}))
     assert api.save_settings({}, {"notifications": True})["ok"]
     assert seen == {"notifications": True}
+
+
+# ---- balanced ranking on the cards -----------------------------------------
+
+def test_with_ranks_marks_the_first_three():
+    from claude_swap.desktop import with_ranks
+
+    cards = [{"num": str(n)} for n in (1, 2, 3, 4, 5)]
+    out = with_ranks(cards, (4, 2, 5, 1))
+    assert {c["num"]: c["rank"] for c in out} == {"1": 0, "2": 2, "3": 0, "4": 1, "5": 3}
+
+
+def test_with_ranks_without_a_ranking():
+    from claude_swap.desktop import with_ranks
+
+    assert [c["rank"] for c in with_ranks([{"num": "1"}], ())] == [0]

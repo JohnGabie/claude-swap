@@ -177,3 +177,16 @@ def test_controller_never_blocks_on_the_page():
 
     code = [ln for ln in inspect.getsource(pill.PillController).splitlines() if ".evaluate_js(" in ln]
     assert code == [], code
+
+
+# ---- ranking sign ----------------------------------------------------------
+
+def test_rank_of_accepts_only_one_to_three():
+    assert [pill.rank_of({"rank": v}) for v in (1, 2, 3)] == [1, 2, 3]
+    assert [pill.rank_of({"rank": v}) for v in (0, 4, None, "1", True, 1.0)] == [0] * 6
+    assert pill.rank_of({}) == 0
+
+
+def test_page_draws_the_sparkle_in_three_sizes_and_colors():
+    for token in ("#e0a800", "#9aa3b0", "#b8692a", "function spark(rank)"):
+        assert token in pill.PILL_PAGE
