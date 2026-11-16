@@ -126,6 +126,25 @@ def tooltip(cards: list[dict]) -> str:
     return f"cswap — {active['title']}  {_usage_text(active)}"[:TOOLTIP_MAX]
 
 
+# ---- menu shape ------------------------------------------------------------
+
+THRESHOLD_PRESETS = (80.0, 85.0, 90.0, 95.0, 98.0)
+
+
+def threshold_choices(current: float) -> list[float]:
+    """Switch lines offered in the menu: the presets plus the current value."""
+    return sorted({*THRESHOLD_PRESETS, float(current)})
+
+
+def threshold_label(value: float) -> str:
+    return f"{value:g}%"
+
+
+def show_account_rows(*, pill_available: bool, pill_enabled: bool) -> bool:
+    """The menu lists the accounts only when no pill shows them."""
+    return not (pill_available and pill_enabled)
+
+
 # ---- start with Windows ----------------------------------------------------
 
 def startup_command(python: str | None = None) -> str:
@@ -317,6 +336,7 @@ def run(switcher) -> int:
         settings.auto_switch = not settings.auto_switch
         settings.save(settings_path)
         api.auto(settings.auto_switch)
+        icon.update_menu()  # greys or restores 'Switch balanced'
 
     def set_notifications(on):
         settings.notifications = on
@@ -391,14 +411,50 @@ def run(switcher) -> int:
             pill.destroy()
         window.destroy()
 
+    def set_threshold(value):
+        def action():
+            # save_settings validates, writes and restarts a running engine.
+            res = api.save_settings({"autoswitch.threshold": value}, {})
+            if not res["ok"] and res["output"]:
+                icon.notify(res["output"], "cswap")
+            icon.update_menu()
+        return lambda: threading.Thread(target=action, daemon=True).start()
+
+    def toggle_balanced():
+        def action():
+            from claude_swap.settings import load_settings
+
+            on = load_settings(Path(switcher.backup_dir)).strategy == "balanced"
+            # Off returns to the default strategy; the active account stays.
+            res = api.save_settings({"autoswitch.strategy": None if on else "balanced"}, {})
+            if not res["ok"] and res["output"]:
+                icon.notify(res["output"], "cswap")
+            icon.update_menu()
+        threading.Thread(target=action, daemon=True).start()
+
     def build_menu():
-        accounts = [
-            pystray.MenuItem(
-                account_label(card), switch_to(card["num"]),
-                checked=lambda _item, c=card: c["active"], radio=True,
-            )
-            for card in cards
-        ] or [pystray.MenuItem("No managed accounts", None, enabled=False)]
+        from claude_swap.settings import load_settings
+
+        accounts = ()
+        if show_account_rows(pill_available=pill is not None, pill_enabled=settings.pill_enabled):
+            accounts = [
+                pystray.MenuItem(
+                    account_label(card), switch_to(card["num"]),
+                    checked=lambda _item, c=card: c["active"], radio=True,
+                )
+                for card in cards
+            ] or [pystray.MenuItem("No managed accounts", None, enabled=False)]
+        core = load_settings(Path(switcher.backup_dir))
+        threshold = core.threshold
+        balanced = core.strategy == "balanced"
+        threshold_menu = pystray.MenuItem(
+            f"Switch at {threshold_label(threshold)}",
+            pystray.Menu(*(
+                pystray.MenuItem(threshold_label(v), set_threshold(v),
+                                 checked=lambda _i, v=v: v == threshold, radio=True)
+                for v in threshold_choices(threshold)
+            )),
+        )
         pill_items = ()
         if pill is not None:
             pill_items = (
@@ -423,6 +479,10 @@ def run(switcher) -> int:
             pystray.MenuItem("Switch to best", switch_best),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Auto-switch", toggle_auto, checked=lambda _i: settings.auto_switch),
+            # Greyed, and still checked, while auto-switch is off.
+            pystray.MenuItem("Switch balanced", toggle_balanced, checked=lambda _i: balanced,
+                             enabled=lambda _i: settings.auto_switch),
+            threshold_menu,
             pystray.MenuItem("Notifications", toggle_notifications, checked=lambda _i: settings.notifications),
             *pill_items,
             pystray.Menu.SEPARATOR,

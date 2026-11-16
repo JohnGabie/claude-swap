@@ -223,11 +223,30 @@ class DesktopApi:
             if self.closing and self.on_idle is not None:
                 self.on_idle()
 
+    def _manual_switch(self, call) -> dict:
+        """Run a user's switch and record it in the engine state if it switched (S3c).
+
+        The tray menu and the pill switch through here too, so this is their one
+        record. The switcher prints its result and returns None, so the recorded
+        active account before and after decides (the CLI's rule and helper): a
+        refused switch raises before the record, and a no-op changes nothing.
+        The engine switches on the switcher itself and never comes through here.
+        """
+        from claude_swap.cli import _active_number, _record_if_switched
+
+        def run():
+            before = _active_number(self._switcher)
+            payload = call()
+            _record_if_switched(self._switcher, payload, before)
+            return payload
+
+        return self._act(run)
+
     def switch(self, num) -> dict:
-        return self._act(lambda: self._switcher.switch_to(str(num)))
+        return self._manual_switch(lambda: self._switcher.switch_to(str(num)))
 
     def best(self) -> dict:
-        return self._act(lambda: self._switcher.switch(strategy="best"))
+        return self._manual_switch(lambda: self._switcher.switch(strategy="best"))
 
     def add_current(self) -> dict:
         return self._act(lambda: self._switcher.add_account(assume_yes=True))
