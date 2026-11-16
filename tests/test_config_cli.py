@@ -49,10 +49,12 @@ class TestConfigList:
             "autoswitch.includeApiKeyAccounts",
             "autoswitch.unhealthyTicks",
             "autoswitch.model",
+            "autoswitch.balancedCooldownSeconds",
+            "autoswitch.balancedMargin",
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 10
+        assert out.count("(default)") == 12
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -79,7 +81,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 10
+        assert len(by_key) == 12
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back
@@ -328,3 +330,124 @@ class TestWeeklyThresholdConfig:
                 cli.main()
         assert captured["settings"].threshold == 85.0
         assert captured["settings"].weekly_threshold == 97.0
+
+
+class TestBalancedConfig:
+    def test_set_get_strategy_balanced(self, temp_home, capsys):
+        code, _, _ = _run(["set", "autoswitch.strategy", "balanced"], capsys)
+        assert code == 0
+        code, out, _ = _run(["get", "autoswitch.strategy"], capsys)
+        assert code == 0
+        assert out.strip() == "balanced"
+
+    def test_unknown_strategy_rejected(self, temp_home, capsys):
+        code, _, err = _run(["set", "autoswitch.strategy", "chaos"], capsys)
+        assert code == 1
+        assert "must be one of: best, consume-first, balanced" in err
+
+    @pytest.mark.parametrize(
+        "key,default,mid",
+        [
+            ("autoswitch.balancedCooldownSeconds", "900", "120"),
+            ("autoswitch.balancedMargin", "5", "12"),
+        ],
+    )
+    def test_default_set_get_unset(self, temp_home, capsys, key, default, mid):
+        _, out, _ = _run(["get", key], capsys)
+        assert out.strip() == default
+        assert _run(["set", key, mid], capsys)[0] == 0
+        _, out, _ = _run(["get", key], capsys)
+        assert out.strip() == mid
+        assert _run(["unset", key], capsys)[0] == 0
+        _, out, _ = _run(["get", key], capsys)
+        assert out.strip() == default
+
+    @pytest.mark.parametrize(
+        "key,bad",
+        [
+            ("autoswitch.balancedCooldownSeconds", "-1"),
+            ("autoswitch.balancedCooldownSeconds", "86401"),
+            ("autoswitch.balancedMargin", "-0.5"),
+            ("autoswitch.balancedMargin", "51"),
+        ],
+    )
+    def test_out_of_range_rejected(self, temp_home, capsys, key, bad):
+        code, _, err = _run(["set", key, bad], capsys)
+        assert code == 1
+        assert "between" in err
+
+    @pytest.mark.parametrize(
+        "key",
+        ["autoswitch.balancedCooldownSeconds", "autoswitch.balancedMargin"],
+    )
+    def test_non_number_rejected(self, temp_home, capsys, key):
+        code, _, err = _run(["set", key, "abc"], capsys)
+        assert code == 1
+        assert "expects a number" in err
+
+    def test_json_list_entries_match_other_floats(self, temp_home, capsys):
+        _, out, _ = _run(["--json"], capsys)
+        payload = json.loads(out)
+        assert payload["schemaVersion"] == 1
+        by_key = {e["key"]: e for e in payload["settings"]}
+        ref = by_key["autoswitch.cooldownSeconds"]
+        for key, value in (
+            ("autoswitch.balancedCooldownSeconds", 900.0),
+            ("autoswitch.balancedMargin", 5.0),
+        ):
+            entry = by_key[key]
+            assert entry["value"] == value
+            assert entry["isSet"] is False
+            assert set(entry) == set(ref)
+
+
+class TestAutoStrategyFlag:
+    """`cswap auto --strategy`: the flag reaches the engine's settings."""
+
+    def _run_auto(self, extra_argv, capsys, temp_home):
+        captured = {}
+
+        class FakeEngine:
+            def __init__(self, switcher, settings, on_event, *, dry_run=False,
+                         state_path=None, clock=None):
+                captured["settings"] = settings
+
+            def tick(self):
+                from claude_swap.autoswitch import TickOutcome
+
+                return TickOutcome.NO_ACTION
+
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", FakeEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once", *extra_argv]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        return captured
+
+    def test_strategy_balanced_reaches_engine(self, temp_home, capsys):
+        captured = self._run_auto(["--strategy", "balanced"], capsys, temp_home)
+        assert captured["settings"].strategy == "balanced"
+
+    def test_strategy_consume_first_reaches_engine(self, temp_home, capsys):
+        captured = self._run_auto(["--strategy", "consume-first"], capsys, temp_home)
+        assert captured["settings"].strategy == "consume-first"
+
+    def test_no_flag_keeps_default_strategy(self, temp_home, capsys):
+        captured = self._run_auto([], capsys, temp_home)
+        assert captured["settings"].strategy == "best"
+
+    def test_no_flag_keeps_stored_strategy(self, temp_home, capsys):
+        _run(["set", "autoswitch.strategy", "balanced"], capsys)
+        captured = self._run_auto([], capsys, temp_home)
+        assert captured["settings"].strategy == "balanced"
+
+    def test_unknown_strategy_is_argparse_error(self, temp_home, capsys):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--strategy", "chaos"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        err = capsys.readouterr().err
+        assert "invalid choice" in err
+        for allowed in ("best", "consume-first", "balanced"):
+            assert allowed in err

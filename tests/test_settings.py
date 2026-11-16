@@ -437,3 +437,94 @@ class TestWeeklyThreshold:
     def test_cli_value_is_clamped(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(weekly_threshold=970.0))
         assert merged.weekly_threshold == 99.9
+
+
+class TestBalancedSettings:
+    def test_defaults(self):
+        s = AutoSwitchSettings()
+        assert s.balanced_cooldown_seconds == 900.0
+        assert s.balanced_margin == 5.0
+        assert s.strategy == "best"
+
+    def test_balanced_is_a_valid_strategy(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.strategy", "balanced")
+        assert load_settings(tmp_path).strategy == "balanced"
+
+    def test_unknown_strategy_rejected_by_set(self, tmp_path: Path):
+        with pytest.raises(ConfigError):
+            set_setting(tmp_path, "autoswitch.strategy", "chaos")
+
+    def test_old_file_without_new_keys_loads_defaults(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps(
+            {"schemaVersion": 1, "autoswitch": {"threshold": 80, "strategy": "best"}}
+        ))
+        loaded = load_settings(tmp_path)
+        assert loaded.threshold == 80.0
+        assert loaded.balanced_cooldown_seconds == 900.0
+        assert loaded.balanced_margin == 5.0
+
+    def test_missing_file_gives_defaults(self, tmp_path: Path):
+        loaded = load_settings(tmp_path)
+        assert loaded.balanced_cooldown_seconds == 900.0
+        assert loaded.balanced_margin == 5.0
+
+    def test_corrupt_file_gives_defaults(self, tmp_path: Path):
+        settings_path(tmp_path).write_text("{nope")
+        loaded = load_settings(tmp_path)
+        assert loaded.balanced_cooldown_seconds == 900.0
+        assert loaded.balanced_margin == 5.0
+
+    def test_values_clamped_at_both_ends(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {
+            "balancedCooldownSeconds": 999999, "balancedMargin": -3}}))
+        loaded = load_settings(tmp_path)
+        assert loaded.balanced_cooldown_seconds == 86400.0
+        assert loaded.balanced_margin == 0.0
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {
+            "balancedCooldownSeconds": -1, "balancedMargin": 500}}))
+        loaded = load_settings(tmp_path)
+        assert loaded.balanced_cooldown_seconds == 0.0
+        assert loaded.balanced_margin == 50.0
+
+    def test_non_number_falls_back_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"autoswitch": {
+            "balancedCooldownSeconds": "soon", "balancedMargin": True}}))
+        loaded = load_settings(tmp_path)
+        assert loaded.balanced_cooldown_seconds == 900.0
+        assert loaded.balanced_margin == 5.0
+
+    def test_set_rejects_out_of_range_and_non_number(self, tmp_path: Path):
+        for key, bad in (
+            ("autoswitch.balancedMargin", "51"),
+            ("autoswitch.balancedMargin", "-1"),
+            ("autoswitch.balancedCooldownSeconds", "-1"),
+            ("autoswitch.balancedCooldownSeconds", "abc"),
+        ):
+            with pytest.raises(ConfigError):
+                set_setting(tmp_path, key, bad)
+
+    def test_set_unset_roundtrip(self, tmp_path: Path):
+        set_setting(tmp_path, "autoswitch.balancedMargin", "12")
+        assert load_settings(tmp_path).balanced_margin == 12.0
+        unset_setting(tmp_path, "autoswitch.balancedMargin")
+        assert load_settings(tmp_path).balanced_margin == 5.0
+
+    def test_new_keys_survive_save_and_unknown_keys_preserved(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "futureSection": {"x": 1},
+            "autoswitch": {"futureKnob": True},
+        }))
+        custom = AutoSwitchSettings(
+            strategy="balanced", balanced_cooldown_seconds=60.0, balanced_margin=8.0
+        )
+        save_settings(tmp_path, custom)
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["futureSection"] == {"x": 1}
+        assert raw["autoswitch"]["futureKnob"] is True
+        assert raw["autoswitch"]["balancedCooldownSeconds"] == 60.0
+        assert raw["autoswitch"]["balancedMargin"] == 8.0
+        assert load_settings(tmp_path) == custom
+
+    def test_cli_strategy_balanced_merges(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="balanced"))
+        assert merged.strategy == "balanced"

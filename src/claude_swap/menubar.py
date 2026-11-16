@@ -516,6 +516,19 @@ def framework_build_warning(
     )
 
 
+def run_manual_switch(switcher, call) -> None:
+    """Run a menu switch and record it in the engine state if it switched (S3c).
+
+    ``call`` takes ``json_output=True`` so the payload says whether the account
+    changed. A refused switch raises before the record. Never records a no-op.
+    """
+    payload = call(json_output=True)
+    if isinstance(payload, dict) and payload.get("switched") is True:
+        from claude_swap.autoswitch import record_manual_switch
+
+        record_manual_switch(switcher.backup_dir)
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -905,14 +918,20 @@ def run(switcher) -> int:
 
         def _make_switch_to(self, num):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch_to(str(num))):
+                if self._guard(lambda: run_manual_switch(
+                    self.switcher,
+                    lambda **kw: self.switcher.switch_to(str(num), **kw),
+                )):
                     self._notify_switched()
                     self.refresh_async()
             return cb
 
         def _switch(self, strategy):
             def cb(_sender):
-                if self._guard(lambda: self.switcher.switch(strategy=strategy)):
+                if self._guard(lambda: run_manual_switch(
+                    self.switcher,
+                    lambda **kw: self.switcher.switch(strategy=strategy, **kw),
+                )):
                     self._notify_switched()
                     self.refresh_async()
             return cb

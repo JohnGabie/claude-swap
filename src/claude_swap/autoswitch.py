@@ -37,6 +37,7 @@ read-modify-write under a dedicated file lock.
 from __future__ import annotations
 
 import enum
+import hashlib
 import json
 import logging
 import math
@@ -49,7 +50,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import oauth, poll_policy
+from claude_swap import balance, oauth, pace_feed, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
@@ -61,10 +62,30 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import (
+    STALE_OK_S,
+    UsageEntry,
+    due_candidate,
+    plan_oversleeps_interval,
+)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
+
+# F2: after the engine switches, the account it left is not a target of an
+# `at-limit` or `failover` switch for this long, unless it is clearly recovered
+# or it is the only exit (see `_forced_no_return_account`). Ends the ping-pong
+# between two accounts that each look healthy only while they are not active.
+FORCED_NO_RETURN_S = 900
+_FORCED_TRIGGERS = ("at-limit", "failover")
+# F6: while every account stays exhausted, the engine repeats its
+# `all-exhausted` event at most once in this many seconds. The first tick of
+# the state always reports. In memory only: a new engine (a `--once` run)
+# reports on its first tick.
+ALL_EXHAUSTED_REPEAT_S = 900
+# E3b: an account left by one of these can be "recovered" inside the bar once
+# its window reset. An account left by `failover` (or an unknown trigger) never.
+_RECOVERABLE_LEFT_TRIGGERS = ("at-limit", "proactive", "consume-first", "balanced")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -110,6 +131,36 @@ NO_RESET_FALLBACK_S = 300.0
 # active user would look identical forever, so after this long the engine
 # falls back to normal unhealthy counting.
 IDLE_HOLD_MAX_S = 30 * 60.0
+
+# F4: how long the last good reading of the ACTIVE account stays trusted while
+# the usage endpoint is in trouble (HTTP 403, 429, any 5xx, a timeout or a
+# network error). The official page https://code.claude.com/docs/en/costs says
+# that a "rate limited until ..." message of /usage "means Claude Code can't
+# fetch your plan limits again until then, not that your work with Claude is
+# limited", and Claude Code itself shows the last known usage for 60 minutes.
+# A refused credential (HTTP 401, failed refresh) is never endpoint trouble.
+ENDPOINT_TROUBLE_TRUST_S = 3600
+
+# Errors that say "the usage endpoint is in trouble" (see oauth.py
+# `_classify_usage_error`: "http-<code>", "timeout", "network"). Any "http-5xx"
+# counts too (see `_is_endpoint_trouble`).
+_ENDPOINT_TROUBLE_ERRORS = frozenset({"http-403", "http-429", "timeout", "network"})
+
+# Errors that say "the credential of this account is refused or dead".
+_CREDENTIAL_ERRORS = frozenset({
+    "http-401", "refresh-failed", "invalid_grant", "no_refresh_token",
+    "no-access-token", "store-unmirrored", "invalid_client", "consume-busy",
+    "stash-unreadable",
+})
+
+
+def _is_endpoint_trouble(error: str | None) -> bool:
+    if error is None:
+        return False
+    if error in _ENDPOINT_TROUBLE_ERRORS:
+        return True
+    return len(error) == 8 and error.startswith("http-5") and error[5:].isdigit()
+
 
 # Anti-flap margin for the every-account-above-threshold escape, measured on
 # the axis that escape ranks by: a target must come back at least this much
@@ -404,7 +455,9 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    # "proactive" | "at-limit" | "failover" | "consume-first" | "balanced".
+    # "balanced" is a proactive switch of the balanced strategy (additive).
+    trigger: str
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -479,11 +532,33 @@ class UnquarantineEvent(AutoSwitchEvent):
 
 @dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
+    """Every usable account is at its limit (F6). ``reason`` and ``detail``
+    are the fields of a no-switch event; ``freesAccount`` is the NUMBER of the
+    account that ``earliestResetAt`` frees. No email (P1). All additive (P3)."""
+
     kind: ClassVar[str] = "all-exhausted"
+    reason: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
+    frees_account: int | None = None
+
+    @property
+    def detail(self) -> str:
+        if not self.earliest_reset_at:
+            return "earliest reset unknown"
+        if self.frees_account is None:
+            return f"earliest reset {self.earliest_reset_at}"
+        return (
+            f"earliest reset {self.earliest_reset_at}; "
+            f"frees account {self.frees_account}"
+        )
 
     def _fields(self) -> dict:
-        return {"earliestResetAt": self.earliest_reset_at}
+        return {
+            "earliestResetAt": self.earliest_reset_at,
+            "reason": self.reason,
+            "detail": self.detail,
+            "freesAccount": self.frees_account,
+        }
 
     def human(self) -> str:
         if self.earliest_reset_at:
@@ -597,6 +672,176 @@ def _seven_day_reset_ts(usage: dict | str | None, now: float) -> float | None:
             if ts is not None and ts > now:
                 return ts
     return None
+
+
+def _balance_windows(
+    value: dict | str | None, models: Sequence[str]
+) -> tuple[balance.Window | None, balance.Window | None]:
+    """``(five_hour, seven_day)`` for the balanced strategy, from one usage row.
+
+    ``five_hour`` is the "5h" window. ``seven_day`` is the weekly window
+    (``7d`` or a per-model scoped window chosen by ``models``) with the highest
+    pct, carrying that window's own ``resets_at``. A sentinel, ``None`` or a
+    missing window gives ``None`` (unmeasured). Pure.
+    """
+    wins = oauth.relevant_windows(value if isinstance(value, dict) else None, models)
+    five: balance.Window | None = None
+    seven: balance.Window | None = None
+    for label, pct, resets_at in wins:
+        window = balance.Window(pct, _parse_reset_ts(resets_at))
+        if label == oauth.FIVE_HOUR_LABEL:
+            five = window
+        elif seven is None or pct > seven.pct:
+            seven = window
+    return five, seven
+
+
+def _balance_accounts(
+    current: str,
+    candidates: Sequence[str],
+    usage: Mapping[str, dict | str | None],
+    thresholds: Mapping[str, float],
+    weekly_threshold: float | None,
+    models: Sequence[str],
+    plan_of: Callable[[str], str],
+) -> list[balance.Account]:
+    """Build the ``balance.Account`` list: the active account first, then
+    ``candidates`` in the order given. Pure: no I/O, no clock, no state.
+
+    The caller passes only the candidates the census keeps (no quarantined or
+    API-key account). ``resets_at`` is converted to epoch seconds with
+    ``poll_policy.parse_reset_ts``. A candidate is ``blocked`` when its binding
+    window is at or over its own per-account line (``thresholds[num]``, and
+    ``weekly_threshold`` for weekly windows), the test of ``_binding``. For a
+    plan in ``balance.NO_FIVE_HOUR_LIMIT_PLANS`` (Ultra) the "5h" line does
+    not count. The active account is never marked blocked here: use
+    ``_balance_active_at_threshold``. An account with no entry in
+    ``thresholds`` is never blocked. ``plan_of`` is called once per account.
+
+    What is lost: only one weekly window reaches ``balance`` (the highest pct),
+    so which weekly window binds is not visible to it; ``balance`` measures
+    its margin from the global line, not from the per-account line.
+    """
+    accounts: list[balance.Account] = []
+    for num in [current, *candidates]:
+        value = usage.get(num)
+        plan = plan_of(num)
+        five, seven = _balance_windows(value, models)
+        blocked = False
+        if num != current and num in thresholds:
+            windows = oauth.relevant_windows(
+                value if isinstance(value, dict) else None, models
+            )
+            if plan in balance.NO_FIVE_HOUR_LIMIT_PLANS:
+                windows = [w for w in windows if w[0] != oauth.FIVE_HOUR_LABEL]
+            binding = binding_window(windows, thresholds[num], weekly_threshold)
+            blocked = binding is not None and binding.over
+        accounts.append(balance.Account(int(num), plan, five, seven, blocked))
+    return accounts
+
+
+def _balance_active_at_threshold(
+    current: str,
+    value: dict | str | None,
+    thresholds: Mapping[str, float],
+    weekly_threshold: float | None,
+    models: Sequence[str],
+    plan_of: Callable[[str], str],
+) -> bool:
+    """True when any window of the active account is at or over its line.
+
+    Uses the engine's lines (``lines.window_line``) on ``thresholds[current]``
+    and ``weekly_threshold``. The "5h" window is skipped when the plan is
+    "ultra" (no 5-hour limit). A sentinel or ``None`` row gives False. Pure.
+    """
+    ultra = plan_of(current) == "ultra"
+    line_base = thresholds[current]
+    for label, pct, _ in oauth.relevant_windows(
+        value if isinstance(value, dict) else None, models
+    ):
+        if ultra and label == oauth.FIVE_HOUR_LABEL:
+            continue
+        if pct >= window_line(label, line_base, weekly_threshold):
+            return True
+    return False
+
+
+def _forced_trigger(active_headroom: float | None) -> str:
+    """The engine's trigger for a switch over the line: at-limit reads the
+    raw headroom (exhaustion is physical), else proactive."""
+    if active_headroom is not None and active_headroom <= 0:
+        return "at-limit"
+    return "proactive"
+
+
+def _state_ts(state: dict, key: str) -> float | None:
+    """A finite, non-negative epoch number from the state file, or None.
+
+    Never raises: the state file can be hand-edited, and an int too large
+    for a float (``10**400``) must read as no timestamp, not stop the tick.
+    """
+    value = state.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        ts = float(value)
+    except (OverflowError, ValueError, TypeError):
+        return None
+    if not math.isfinite(ts) or ts < 0:
+        return None
+    return ts
+
+
+# A manual switch must never wait long on the engine's state lock: the user's
+# switch already succeeded, and a late record only delays the shell prompt.
+MANUAL_RECORD_LOCK_TIMEOUT_S = 2.0
+
+
+def record_manual_switch(
+    backup_root: Path, *, clock: Callable[[], float] = time.time
+) -> None:
+    """Record a switch the user made by hand (S3c).
+
+    Sets ``lastManualSwitchAt`` in the state file under the same lock as the
+    engine's read-modify-write, and keeps every other key. The ``balanced``
+    strategy holds a proactive switch for ``balancedCooldownSeconds`` after it.
+    The engine's own switch must never call this function.
+
+    Never raises and never prints: a failure to record must not fail the
+    user's switch. Writes no email and no account name (rule P1).
+    """
+    try:
+        now = clock()
+        if isinstance(now, bool) or not isinstance(now, (int, float)):
+            return
+        stamp = float(now)
+        if not math.isfinite(stamp):
+            return
+        if not isinstance(backup_root, (str, Path)):
+            return  # e.g. a test double: Path() would accept any __fspath__
+        root = Path(backup_root)
+        with FileLock(
+            root / ".autoswitch_state.lock", timeout=MANUAL_RECORD_LOCK_TIMEOUT_S
+        ):
+            path = root / STATE_FILENAME
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                raw = {}
+            state = raw if isinstance(raw, dict) else {}
+            state["lastManualSwitchAt"] = stamp
+            atomic_write_json(path, state)
+    except Exception:  # noqa: BLE001 - recording is best effort by contract
+        return
+
+
+@dataclass(frozen=True)
+class _BalancedChoice:
+    """One ``balance.decide`` result as the tick applies it."""
+
+    decision: balance.Decision
+    ordered: list[str]
+    at_threshold: bool
 
 
 def _binding_recovery_ts(
@@ -713,6 +958,95 @@ def _headroom_by_account(
     }
 
 
+class _PlanCache:
+    """The plan word of each account ("pro", "max", "ultra" or "unknown"),
+    held in memory only.
+
+    ``plan_of`` calls ``pace_feed.read_plan_for`` only when the account is new
+    to the cache, when its stored email changed, or after ``invalidate`` /
+    ``invalidate_all``. A credential read costs a Keychain subprocess on macOS
+    for the active account, so it must not run every tick. A failure gives
+    "unknown", cached until the account is invalidated. A failed email or
+    active-flag lookup gives "unknown" and is not cached.
+
+    The cache never writes a file, and this class does not log. Known limit
+    (separate hardening ticket): the credential readers that
+    ``pace_feed.read_plan_for`` calls log read errors to the log file.
+
+    The cache keeps no email: only a SHA-256 digest of it, to see a change. No method returns the email.
+    The email goes only to the switcher's own backup reader, as its key.
+    """
+
+    __slots__ = ("_switcher", "_reader", "_email_of", "_active_of", "_entries")
+
+    def __init__(
+        self,
+        switcher: ClaudeAccountSwitcher,
+        *,
+        reader: Callable[[ClaudeAccountSwitcher, str, str, bool], str] | None = None,
+        email_of: Callable[[str], str] | None = None,
+        active_of: Callable[[], str | None] | None = None,
+    ) -> None:
+        # The defaults resolve at call time: tests replace
+        # ``pace_feed.read_plan_for``, and a stub switcher may lack a reader.
+        self._switcher = switcher
+        self._reader = reader
+        self._email_of = email_of
+        self._active_of = active_of
+        # number -> (digest of the email, plan word)
+        self._entries: dict[str, tuple[bytes, str]] = {}
+
+    def __repr__(self) -> str:
+        return f"<_PlanCache accounts={len(self._entries)}>"
+
+    __str__ = __repr__
+
+    @staticmethod
+    def _digest(email: str) -> bytes:
+        return hashlib.sha256(email.encode("utf-8", "replace")).digest()
+
+    def plan_of(self, num: str | int) -> str:
+        """The plan word of account ``num``. Never raises."""
+        num = str(num)
+        try:
+            email_of = self._email_of or self._switcher.account_email
+            email = email_of(num)
+            if not isinstance(email, str):
+                email = ""
+        except Exception:
+            # No key to read the backup with; read nothing, cache nothing.
+            return pace_feed.PLAN_UNKNOWN
+        digest = self._digest(email)
+        entry = self._entries.get(num)
+        if entry is not None and entry[0] == digest:
+            return entry[1]
+        try:
+            active_of = self._active_of or self._switcher.current_account_number
+            is_active = active_of() == num
+        except Exception:
+            # No active flag, so no right way to read; cache nothing, so one
+            # temporary failure does not stay until the next invalidate.
+            return pace_feed.PLAN_UNKNOWN
+        try:
+            reader = self._reader or pace_feed.read_plan_for
+            plan = reader(self._switcher, num, email, is_active)
+        except Exception:
+            plan = pace_feed.PLAN_UNKNOWN
+        if plan not in pace_feed.KNOWN_PLANS:
+            plan = pace_feed.PLAN_UNKNOWN
+        self._entries[num] = (digest, plan)
+        return plan
+
+    def invalidate(self, num: str | int | None) -> None:
+        """Read account ``num`` again on its next ``plan_of``."""
+        if num is not None:
+            self._entries.pop(str(num), None)
+
+    def invalidate_all(self) -> None:
+        """Read every account again on its next ``plan_of``."""
+        self._entries.clear()
+
+
 class AutoSwitchEngine:
     """Threshold-policy auto-switcher over a :class:`ClaudeAccountSwitcher`.
 
@@ -774,6 +1108,19 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # The plan word of each account (S3d), in memory only. A new engine
+        # starts with an empty cache; ``_perform`` invalidates both ends of a
+        # performed switch.
+        self._plan_cache = _PlanCache(switcher)
+        # The active account number the engine saw last (S3b-2), in memory
+        # only. A balanced tick that sees another active account, which the
+        # engine did not switch to, invalidates the plan of both accounts.
+        self._last_seen_active: str | None = None
+        # F6: when the engine last emitted `all-exhausted` in the current
+        # all-exhausted state (None outside the state), and whether this tick
+        # is in the state. In memory only.
+        self._all_exhausted_reported_at: float | None = None
+        self._all_exhausted_tick = False
 
     # -- state file ---------------------------------------------------------
 
@@ -969,7 +1316,12 @@ class AutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         try:
-            return self._tick_inner()
+            outcome = self._tick_inner()
+            if not self._all_exhausted_tick:
+                # F6: the all-exhausted state ended. A new one reports on its
+                # first tick.
+                self._all_exhausted_reported_at = None
+            return outcome
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
             return TickOutcome.ERROR
@@ -1059,6 +1411,7 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
+        self._all_exhausted_tick = False
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -1098,6 +1451,9 @@ class AutoSwitchEngine:
                     )
                 )
             return TickOutcome.NO_ACTION
+
+        if settings.strategy == "balanced":
+            self._note_active_account(current)
 
         current_email = self.switcher.account_email(current)
         active_ref = _ref(current, current_email) if current_email else {
@@ -1174,7 +1530,26 @@ class AutoSwitchEngine:
                 if active_binding is not None
                 else (100.0 - active_headroom) < thresholds[current]
             )
-            if below:
+            if settings.strategy == "balanced":
+                # balanced: `balance.decide` below says whether to move. The
+                # trigger is provisional: "balanced" while the active account
+                # is under its lines (the 5h line does not count for Ultra),
+                # else the engine's own over-the-line trigger.
+                plan_of = self._tick_plan_reader()
+                balanced_at_threshold = _balance_active_at_threshold(
+                    current,
+                    usage.get(current),
+                    thresholds,
+                    settings.weekly_threshold,
+                    self._models,
+                    plan_of,
+                )
+                trigger = (
+                    _forced_trigger(active_headroom)
+                    if balanced_at_threshold
+                    else "balanced"
+                )
+            elif below:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -1231,6 +1606,26 @@ class AutoSwitchEngine:
                 )
             else:
                 self._idle_hold_since = None
+                if (
+                    self._endpoint_trouble_verdict(
+                        entries.get(current),
+                        thresholds[current],
+                        settings.weekly_threshold,
+                    )
+                    == "hold"
+                ):
+                    # F4: the usage endpoint is in trouble, the account is
+                    # not dead. Hold: the counter neither grows nor resets.
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="usage-endpoint-trouble",
+                            detail=(
+                                f"{entries[current].last_error}; last good "
+                                "reading is recent and below the line"
+                            ),
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
             self._unhealthy_ticks += 1
             if self._unhealthy_ticks < settings.unhealthy_ticks:
                 self._emit(
@@ -1268,7 +1663,7 @@ class AutoSwitchEngine:
             else []
         )
         if (
-            trigger == "consume-first"
+            trigger in ("consume-first", "balanced")
             and not oauth_candidates
             and active_headroom is not None
         ):
@@ -1280,14 +1675,10 @@ class AutoSwitchEngine:
             # the exit-code contract identical across strategies: cron
             # wrappers keying on BLOCKED must not see false "blocked" from
             # the flag alone.
-            self._emit(
-                NoSwitchEvent(
-                    reason="below-threshold",
-                    detail=_below_line_detail(
-                        active_binding, active_headroom, thresholds[current]
-                    ),
-                )
-            )
+            self._emit(self._below_threshold_event(
+                usage.get(current), active_binding, active_headroom,
+                settings, thresholds[current],
+            ))
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
             # Won't change until the user adds/recovers an account — no point
@@ -1374,19 +1765,133 @@ class AutoSwitchEngine:
                     return unbarred
             return ranked
 
+        # F2: the bar of the forced triggers, with its own releases.
+        forced_hold = [False]
+
+        def _rank_forced(**kw):
+            forced_hold[0] = False
+            barred = self._forced_no_return_account(
+                trigger, state, entries, kw["usage"], kw["settings"],
+                kw["thresholds"], kw["current"], kw["now"],
+            )
+            if barred is None:
+                return self._rank_candidates(no_return=None, **kw)
+            ranked = self._rank_candidates(no_return=barred, **kw)
+            if ranked[0]:
+                return ranked           # another account is usable: bar holds
+            unbarred = self._rank_candidates(no_return=None, **kw)
+            if not unbarred[0]:
+                return ranked           # the bar blocks nothing
+            exit_open = (
+                trigger == "at-limit"
+                and kw["active_headroom"] is not None
+                and kw["active_headroom"] <= 0
+            ) or (
+                trigger == "failover"
+                and self._active_is_dead(entries.get(kw["current"]))
+            )
+            if exit_open:
+                return unbarred
+            forced_hold[0] = True
+            return ranked
+
+        if trigger in _FORCED_TRIGGERS:
+            _rank_for_trigger = _rank_forced
+        else:
+            _rank_for_trigger = _rank
+
         decided_now = self.clock()
-        ordered, any_known, active_reset_ts = _rank(
-            trigger=trigger,
-            consume_first=consume_first,
-            oauth_candidates=oauth_candidates,
-            usage=usage,
-            headroom=headroom,
-            current=current,
-            active_headroom=active_headroom,
-            settings=settings,
-            now=decided_now,
-            thresholds=thresholds,
-        )
+        if settings.strategy == "balanced" and active_headroom is not None:
+            # balanced: `balance.decide` replaces `_rank`. The census above
+            # (no quarantined account; API-key accounts only as the engine's
+            # last resort) gives the candidates.
+            choice = self._balanced_choice(
+                state=state,
+                current=current,
+                candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                active_headroom=active_headroom,
+                settings=settings,
+                thresholds=thresholds,
+                now=decided_now,
+                plan_of=plan_of,
+            )
+            first_hold = self._below_threshold_event(
+                usage.get(current), active_binding, active_headroom,
+                settings, thresholds[current],
+            )
+            if trigger == "balanced" and isinstance(
+                choice.decision, balance.SwitchTo
+            ):
+                # Two-phase commit, as for consume-first: below the lines the
+                # snapshot can be stale, so refetch every candidate and decide
+                # again on fresh data before a switch.
+                entries = self.switcher.usage_entries_by_account(
+                    fetch={current, *candidates}
+                )
+                usage = {
+                    num: entry.decision_value() for num, entry in entries.items()
+                }
+                headroom = _headroom_by_account(usage, self._models)
+                active_headroom = headroom.get(current)
+                active_binding = self._binding(
+                    usage.get(current), settings, thresholds[current]
+                )
+                decided_now = self.clock()
+                choice = self._balanced_choice(
+                    state=state,
+                    current=current,
+                    candidates=oauth_candidates,
+                    usage=usage,
+                    headroom=headroom,
+                    active_headroom=active_headroom,
+                    settings=settings,
+                    thresholds=thresholds,
+                    now=decided_now,
+                    plan_of=plan_of,
+                )
+            decision = choice.decision
+            if isinstance(decision, balance.Hold):
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
+            if isinstance(decision, balance.Stay) and not choice.at_threshold:
+                # After the refetch the active row can be unreadable (no
+                # measurement: balance stays); quote the first snapshot then.
+                self._emit(
+                    self._below_threshold_event(
+                        usage.get(current), active_binding, active_headroom,
+                        settings, thresholds[current],
+                    )
+                    if active_headroom is not None
+                    else first_hold
+                )
+                return TickOutcome.NO_ACTION
+            if isinstance(decision, balance.SwitchTo):
+                if decision.reason == "proactive":
+                    trigger = "balanced"
+                elif trigger == "balanced":
+                    # A forced switch takes the engine's own trigger.
+                    trigger = _forced_trigger(active_headroom)
+            # Stay at the threshold: `ordered` is empty, and the engine's own
+            # reasons below (API-key last resort, no-comparison,
+            # no-qualifying-candidate, all-exhausted) apply.
+            ordered = choice.ordered
+            any_known = any(headroom.get(n) is not None for n in oauth_candidates)
+            active_reset_ts = None
+        else:
+            ordered, any_known, active_reset_ts = _rank_for_trigger(
+                trigger=trigger,
+                consume_first=consume_first,
+                oauth_candidates=oauth_candidates,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=decided_now,
+                thresholds=thresholds,
+            )
 
         if trigger == "consume-first" and ordered:
             # Two-phase commit: the provisional pick may have ridden a
@@ -1427,6 +1932,19 @@ class AutoSwitchEngine:
             ordered = api_key_candidates
 
         if not ordered:
+            if forced_hold[0]:
+                # F2: the only candidate is the account we just left, it is
+                # not recovered, and the active account is not dead: hold.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-return",
+                        detail=(
+                            "the only candidate is the account just left and "
+                            "it has not recovered; holding"
+                        ),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
                 # and must not be dressed up as a consume-first hold.
@@ -1490,18 +2008,33 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.BLOCKED
             self._blocked_wait_long = True
-            earliest = self._earliest_recovery(usage)
+            # Only accounts the engine can use: a disabled or quarantined
+            # account that resets first frees nothing.
+            earliest, frees = self._earliest_recovery(
+                usage, {current, *oauth_candidates}
+            )
             if earliest is not None:
                 self._sleep_until_ts = earliest.timestamp() + RESET_SLACK_S
-            self._emit(
-                AllExhaustedEvent(
-                    earliest_reset_at=(
-                        earliest.isoformat().replace("+00:00", "Z")
-                        if earliest
-                        else None
+            # F6: report on the first tick of the state, then at most once in
+            # ALL_EXHAUSTED_REPEAT_S. A quiet tick emits only its poll event
+            # and keeps the BLOCKED outcome (the long sleep depends on it).
+            self._all_exhausted_tick = True
+            reported_at = self._all_exhausted_reported_at
+            if (
+                reported_at is None
+                or not 0 <= decided_now - reported_at < ALL_EXHAUSTED_REPEAT_S
+            ):
+                self._all_exhausted_reported_at = decided_now
+                self._emit(
+                    AllExhaustedEvent(
+                        earliest_reset_at=(
+                            earliest.isoformat().replace("+00:00", "Z")
+                            if earliest
+                            else None
+                        ),
+                        frees_account=frees,
                     )
                 )
-            )
             return TickOutcome.BLOCKED
 
         # -- freshen + switch ----------------------------------------------
@@ -1523,12 +2056,13 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in ("consume-first", "balanced"):
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
-                # is opportunistic, not an escape — never act on stale data
-                # or slide to a worse-ranked target; hold and retry next tick.
+                # and a balanced switch are opportunistic, not an escape —
+                # never act on stale data or slide to a worse-ranked target;
+                # hold and retry next tick.
                 entry = entries.get(num)
                 if entry is None or not entry.fresh(self.clock()):
                     self._emit(
@@ -1686,7 +2220,10 @@ class AutoSwitchEngine:
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
-        if trigger not in ("proactive", "consume-first") or came_from is None:
+        if (
+            trigger not in ("proactive", "consume-first", "balanced")
+            or came_from is None
+        ):
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -1720,6 +2257,92 @@ class AutoSwitchEngine:
                 if left is not None and not left.over:
                     return None
         return barred
+
+    def _forced_no_return_account(
+        self,
+        trigger: str,
+        state: dict,
+        entries: Mapping[str, UsageEntry],
+        usage: dict[str, dict | str | None],
+        settings: AutoSwitchSettings,
+        thresholds: Mapping[str, float],
+        current: str,
+        now: float,
+    ) -> str | None:
+        """F2: the account the engine just left, barred for an `at-limit` or
+        `failover` switch. None when no bar applies or the account recovered.
+
+        The bar applies only while ALL of these hold: the trigger is forced,
+        the state names the account we left, the engine itself made the last
+        switch and put us here (`lastSwitchTo` equals the active account; a
+        manual switch or a record without it means no bar), and that switch is
+        younger than ``FORCED_NO_RETURN_S``.
+
+        RECOVERED releases the bar, and a reading alone is not enough (E3b).
+        An account left by `failover` is never recovered inside the bar: only
+        the only-exit release applies. An account left by any other trigger is
+        recovered only when `leftRecoveryAt` is a finite number that has
+        passed, AND it has a fresh reading (age within ``STALE_OK_S``) with no
+        last error, under its own lines and with headroom above 0 in every
+        window. A missing or invalid `leftRecoveryAt`, or a missing or
+        unknown `leftTrigger`, means not recovered. An optimistic row, one
+        that is old or came with an error, never counts.
+        """
+        if trigger not in _FORCED_TRIGGERS:
+            return None
+        came_from = state.get("lastSwitchFrom")
+        landed_on = state.get("lastSwitchTo")
+        switched_at = _state_ts(state, "lastSwitchAt")
+        if came_from is None or landed_on is None or switched_at is None:
+            return None
+        if str(landed_on) != str(current) or str(came_from) == str(current):
+            return None
+        age = now - switched_at
+        if age < 0 or age >= FORCED_NO_RETURN_S:
+            return None
+        barred = str(came_from)
+        left_by = state.get("leftTrigger")
+        recovery_at = _state_ts(state, "leftRecoveryAt")
+        window_reset = (
+            left_by in _RECOVERABLE_LEFT_TRIGGERS
+            and recovery_at is not None
+            and now >= recovery_at
+        )
+        if window_reset and self._left_account_fresh_and_healthy(
+            entries.get(barred), settings, thresholds.get(barred, settings.threshold)
+        ):
+            return None
+        return barred
+
+    def _left_account_fresh_and_healthy(
+        self,
+        entry: UsageEntry | None,
+        settings: AutoSwitchSettings,
+        line: float,
+    ) -> bool:
+        if (
+            entry is None
+            or entry.sentinel is not None
+            or entry.last_error
+            or entry.last_good is None
+            or entry.age_s is None
+            or entry.age_s > STALE_OK_S
+        ):
+            return False
+        windows = list(oauth.relevant_windows(entry.last_good, self._models))
+        if not windows or any(pct >= 100.0 for _, pct, _ in windows):
+            return False
+        binding = self._binding(entry.last_good, settings, line)
+        return binding is not None and not binding.over
+
+    @staticmethod
+    def _active_is_dead(entry: UsageEntry | None) -> bool:
+        """A failover for a credential reason: a sentinel (re-login needed,
+        expired token) or a refused credential. An endpoint error, or no
+        information at all, is not dead."""
+        if entry is None:
+            return False
+        return entry.sentinel is not None or entry.last_error in _CREDENTIAL_ERRORS
 
     def _left_account_recovered(
         self,
@@ -1832,7 +2455,8 @@ class AutoSwitchEngine:
         and of the two failure modes the permanent proactive lockout is the
         worse one, because it is persisted and survives a restart and a week of
         wall clock. Absence of evidence releases. This only gates the
-        proactive/consume-first return; `_no_return_account` scopes at-limit
+        proactive, consume-first and balanced return; `_no_return_account`
+        scopes at-limit
         and failover out of the bar by design, so either trigger still
         escapes the account untouched, and the next successful switch
         overwrites the snapshot outright.
@@ -2259,6 +2883,42 @@ class AutoSwitchEngine:
 
     # -- adaptive usage scheduling ---------------------------------------------
 
+    def _endpoint_trouble_verdict(
+        self,
+        entry: UsageEntry | None,
+        threshold: float,
+        weekly_threshold: float | None,
+    ) -> str:
+        """F4: how to read the ACTIVE account when its last fetch failed.
+
+        Returns ``"distrust"`` (the stored reading must not be used: the
+        credential is refused, or the endpoint trouble outlasted
+        ``ENDPOINT_TROUBLE_TRUST_S``), ``"hold"`` (endpoint trouble, the last
+        good reading is recent and below its line in every window) or
+        ``"ok"`` (no change: the store's own decision stands).
+        """
+        if entry is None or entry.sentinel is not None or not entry.last_error:
+            return "ok"
+        error = entry.last_error
+        if error in _CREDENTIAL_ERRORS:
+            return "distrust"
+        if not _is_endpoint_trouble(error):
+            return "ok"
+        age = entry.age_s
+        if (
+            entry.last_good is None
+            or age is None
+            or age >= ENDPOINT_TROUBLE_TRUST_S
+        ):
+            return "distrust"
+        windows = list(oauth.relevant_windows(entry.last_good, self._models))
+        if windows and all(
+            pct < window_line(label, threshold, weekly_threshold)
+            for label, pct, _ in windows
+        ):
+            return "hold"
+        return "ok"
+
     def _collect_scheduled_usage(
         self,
         current: str,
@@ -2359,6 +3019,15 @@ class AutoSwitchEngine:
             scheduled=not stale_candidate_plan,
         )
         usage = {num: entry.decision_value() for num, entry in entries.items()}
+        # F4 needs the tick's lines before the first read of `usage[current]`.
+        if threshold is None:
+            threshold = self.settings.threshold
+            weekly_threshold = self.settings.weekly_threshold
+        verdict = self._endpoint_trouble_verdict(
+            entries.get(current), threshold, weekly_threshold
+        )
+        if verdict == "distrust":
+            usage[current] = None
 
         active_value = usage.get(current)
         active_headroom = oauth.account_headroom(
@@ -2382,7 +3051,11 @@ class AutoSwitchEngine:
             )
         )
         escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+            (
+                active_headroom is None
+                and active_value != USAGE_TOKEN_EXPIRED
+                and verdict != "hold"
+            )
             or (active_headroom is not None and near_a_line)
         )
         if escalate:
@@ -2411,6 +3084,13 @@ class AutoSwitchEngine:
                 fetch=escalation_fetch
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
+            if (
+                self._endpoint_trouble_verdict(
+                    entries.get(current), threshold, weekly_threshold
+                )
+                == "distrust"
+            ):
+                usage[current] = None
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
@@ -2446,6 +3126,11 @@ class AutoSwitchEngine:
             if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
+            if trigger == "balanced" and self._in_balanced_cooldown(state):
+                # A balanced switch counts only balanced switches: the
+                # `lastBalancedSwitchAt` stamp and its own setting.
+                self._emit(NoSwitchEvent(reason="cooldown"))
+                return TickOutcome.NO_ACTION
 
             result = self.switcher.switch_to(number, json_output=True)
             if not result or not result.get("switched"):
@@ -2478,7 +3163,21 @@ class AutoSwitchEngine:
             # nulls then runs the wrong legs. Record it directly so the
             # reader never has to guess.
             state["leftTrigger"] = trigger
+            if trigger == "balanced":
+                # Additive key: only a balanced (proactive) switch starts the
+                # balanced cooldown; a forced switch does not.
+                state["lastBalancedSwitchAt"] = state["lastSwitchAt"]
             atomic_write_json(self.state_path, state)
+        # The engine made this switch: the next tick must not read it as a
+        # switch from outside the engine.
+        self._last_seen_active = number
+        # F1: the new active account starts with no unreadable ticks.
+        self._unhealthy_ticks = 0
+
+        # A switch changes which account reads the live store: read the plan
+        # of both ends again on their next use.
+        self._plan_cache.invalidate(state["lastSwitchFrom"])
+        self._plan_cache.invalidate(number)
 
         self._emit(
             SwitchEvent(
@@ -2515,6 +3214,166 @@ class AutoSwitchEngine:
         if not isinstance(last, (int, float)):
             return False
         return (self.clock() - last) < self.settings.cooldown_seconds
+
+    def _in_balanced_cooldown(self, state: dict) -> bool:
+        """The cooldown of the balanced strategy: ``lastBalancedSwitchAt``
+        against ``balanced_cooldown_seconds``."""
+        last = _state_ts(state, "lastBalancedSwitchAt")
+        if last is None:
+            return False
+        return (self.clock() - last) < self.settings.balanced_cooldown_seconds
+
+    # -- balanced strategy ----------------------------------------------------
+
+    def _note_active_account(self, current: str) -> None:
+        """Invalidate the plan of both accounts when the active account
+        changed without a switch of this engine (a manual switch, or a login
+        outside the engine). Memory only."""
+        last = self._last_seen_active
+        if last is not None and last != current:
+            self._plan_cache.invalidate(last)
+            self._plan_cache.invalidate(current)
+        self._last_seen_active = current
+
+    def _tick_plan_reader(self) -> Callable[[str], str]:
+        """``plan_of`` for one tick: each account is read at most once.
+
+        Dry-run reads through a throwaway cache, so that a dry run leaves no
+        entry in the engine's plan cache."""
+        cache = _PlanCache(self.switcher) if self.dry_run else self._plan_cache
+        plans: dict[str, str] = {}
+
+        def plan_of(num: str) -> str:
+            key = str(num)
+            if key not in plans:
+                plans[key] = cache.plan_of(key)
+            return plans[key]
+
+        return plan_of
+
+    def _balanced_choice(
+        self,
+        *,
+        state: dict,
+        current: str,
+        candidates: Sequence[str],
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        active_headroom: float,
+        settings: AutoSwitchSettings,
+        thresholds: Mapping[str, float],
+        now: float,
+        plan_of: Callable[[str], str],
+    ) -> _BalancedChoice:
+        """Run ``balance.decide`` on one snapshot. Pure apart from the plan
+        reads: no emits, no state writes, so the two-phase commit runs it
+        twice.
+
+        The no-return bar of the engine applies: the barred account goes to
+        ``decide`` as ``blocked=True``. The release is the one of ``_rank``:
+        when the barred decision is ``Stay`` and the account we left has
+        recovered, decide again without the bar.
+
+        ``ordered`` is ``[target]`` for a proactive switch, and ``[target]``
+        plus the rest of ``balance.rank`` for a forced switch (the freshen
+        loop tries them in turn). It is empty for ``Stay`` and ``Hold``.
+        """
+        # Every account of the tick in the map: the builder never blocks an
+        # account that is missing from it.
+        lines = {num: thresholds[num] for num in (current, *candidates)}
+        accounts = _balance_accounts(
+            current, candidates, usage, lines, settings.weekly_threshold,
+            self._models, plan_of,
+        )
+        at_threshold = _balance_active_at_threshold(
+            current, usage.get(current), lines, settings.weekly_threshold,
+            self._models, plan_of,
+        )
+        recovered = self._left_account_recovered(
+            state, usage, headroom, active_headroom, settings, now, current,
+            thresholds=thresholds,
+        )
+        # The bar has the scope of the trigger this decision would switch
+        # with: the engine's own one at the threshold, else "balanced".
+        barred = self._no_return_account(
+            _forced_trigger(active_headroom) if at_threshold else "balanced",
+            state, headroom, active_headroom, recovered, settings, current,
+            thresholds=thresholds, usage=usage,
+        )
+        lines_kw = {
+            "threshold": settings.threshold,
+            "weekly_threshold": settings.weekly_threshold,
+        }
+
+        def run(accs: list[balance.Account]) -> balance.Decision:
+            return balance.decide(
+                accs,
+                int(current),
+                now,
+                _state_ts(state, "lastBalancedSwitchAt"),
+                _state_ts(state, "lastManualSwitchAt"),
+                at_threshold,
+                settings.balanced_cooldown_seconds,
+                candidate_margin=settings.balanced_margin,
+                **lines_kw,
+            )
+
+        used = accounts
+        if barred is not None:
+            used = [
+                replace(a, blocked=True) if str(a.id) == barred else a
+                for a in accounts
+            ]
+        decision = run(used)
+        if barred is not None and isinstance(decision, balance.Stay) and recovered:
+            used = accounts
+            decision = run(used)
+
+        ordered: list[str] = []
+        if isinstance(decision, balance.SwitchTo):
+            target = str(decision.account_id)
+            ordered = [target]
+            if decision.reason == "threshold":
+                ranked = balance.rank(
+                    used, now, candidate_margin=settings.balanced_margin,
+                    **lines_kw,
+                )
+                if decision.account_id not in ranked:
+                    # The forced fallback of `decide` ranked at margin 0.
+                    ranked = balance.rank(
+                        used, now, candidate_margin=0.0, **lines_kw
+                    )
+                ordered += [
+                    str(n) for n in ranked if str(n) not in (target, current)
+                ]
+        return _BalancedChoice(decision, ordered, at_threshold)
+
+    def _below_threshold_event(
+        self,
+        value: dict | str | None,
+        binding: BindingWindow | None,
+        active_headroom: float,
+        settings: AutoSwitchSettings,
+        line: float,
+    ) -> NoSwitchEvent:
+        """The below-threshold hold. An Ultra active account can be over its
+        5h line and still below for the balanced strategy: the detail then
+        quotes the binding window without the 5h one."""
+        if binding is not None and binding.over:
+            windows = [
+                w
+                for w in oauth.relevant_windows(
+                    value if isinstance(value, dict) else None, self._models
+                )
+                if w[0] != oauth.FIVE_HOUR_LABEL
+            ]
+            binding = binding_window(
+                windows, line, settings.weekly_threshold, scale=settings.threshold
+            )
+        return NoSwitchEvent(
+            reason="below-threshold",
+            detail=_below_line_detail(binding, active_headroom, line),
+        )
 
     def _check_model_names(
         self, quarantined: set[str], usage: dict[str, dict | str | None]
@@ -2561,10 +3420,11 @@ class AutoSwitchEngine:
             )
 
     def _earliest_recovery(
-        self, usage: dict[str, dict | str | None]
-    ) -> datetime | None:
-        """Earliest moment any account becomes usable again (UTC), or None
-        when that moment can't be proven.
+        self, usage: dict[str, dict | str | None], eligible: set[str]
+    ) -> tuple[datetime | None, int | None]:
+        """Earliest moment any account of ``eligible`` becomes usable again
+        (UTC) and the number of that account, or ``(None, None)`` when that
+        moment can't be proven.
 
         Per account that's the *latest* reset among its ≥100% relevant
         windows — an account blocked on both 5h and a scoped weekly limit
@@ -2576,9 +3436,10 @@ class AutoSwitchEngine:
         fallback re-check, rather than sleeping toward another account's
         later known reset."""
         earliest: float | None = None
+        frees: str | None = None
         now = self.clock()
-        for value in usage.values():
-            if not isinstance(value, dict):
+        for num, value in usage.items():
+            if num not in eligible or not isinstance(value, dict):
                 continue
             blocked = [
                 resets_at
@@ -2589,12 +3450,13 @@ class AutoSwitchEngine:
                 continue  # not exhausted — doesn't gate the blocked state
             usable_at = _limiting_reset_ts(value, self._models)
             if usable_at is None or usable_at <= now:
-                return None  # blocked with unprovable recovery — don't oversleep
+                # blocked with unprovable recovery — don't oversleep
+                return None, None
             if earliest is None or usable_at < earliest:
-                earliest = usable_at
-        if earliest is None:
-            return None
-        return datetime.fromtimestamp(earliest, tz=timezone.utc)
+                earliest, frees = usable_at, num
+        if earliest is None or frees is None:
+            return None, None
+        return datetime.fromtimestamp(earliest, tz=timezone.utc), int(frees)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)

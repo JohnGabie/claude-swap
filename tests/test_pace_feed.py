@@ -643,6 +643,147 @@ class TestPlanType:
         assert all(isinstance(r, str) for r in results)
         _assert_no_canary(caplog.text, fleet.home)
 
+    def test_ultra_is_a_known_plan(self):
+        assert pace_feed.KNOWN_PLANS == frozenset({"pro", "max", "ultra"})
+        assert pace_feed.plan_from_credential(_oauth_creds("1", "ultra")) == "ultra"
+        assert pace_feed.plan_from_credential(_oauth_creds("1", "ULTRA")) == "unknown"
+
+
+class _PlanSwitcher:
+    """A fake switcher with only the two credential readers ``read_plan_for``
+    may call. Records each call (number, email, active)."""
+
+    def __init__(self, active: object = "", backups: dict | None = None, exc=None):
+        self.active = active
+        self.backups = backups or {}
+        self.exc = exc
+        self.calls: list[tuple] = []
+
+    def _read_active_credentials(self):
+        self.calls.append(("active",))
+        if self.exc is not None:
+            raise self.exc
+        return type("Active", (), {"value": self.active})()
+
+    def _read_account_credentials(self, number, email):
+        self.calls.append(("backup", number, email))
+        if self.exc is not None:
+            raise self.exc
+        return self.backups.get(number, "")
+
+
+class TestReadPlanFor:
+    @pytest.mark.parametrize(
+        ("blob", "expected"),
+        [
+            (_oauth_creds("2", "pro"), "pro"),
+            (_oauth_creds("2", "max"), "max"),
+            (_oauth_creds("2", "ultra"), "ultra"),
+            (_oauth_creds("2", None), "unknown"),
+            ("not json {{{", "unknown"),
+            ("", "unknown"),
+            (_oauth_creds("2", _access("2")), "unknown"),
+            (_oauth_creds("2", "MAX"), "unknown"),
+            (API_KEY, "unknown"),
+        ],
+        ids=[
+            "pro", "max", "ultra", "no-field", "bad-json", "empty",
+            "token-in-plan", "upper-MAX", "api-key",
+        ],
+    )
+    @pytest.mark.parametrize("is_active", [False, True], ids=["backup", "active"])
+    def test_returns_only_a_plan_word(self, blob, expected, is_active):
+        sw = _PlanSwitcher(active=blob, backups={"2": blob})
+
+        plan = pace_feed.read_plan_for(sw, "2", EMAILS["2"], is_active)
+
+        assert plan == expected
+        assert plan in pace_feed.KNOWN_PLANS | {"unknown"}
+        assert _access("2") not in plan and EMAILS["2"] not in plan
+
+    def test_active_reads_the_live_store_and_others_the_backup(self):
+        sw = _PlanSwitcher(
+            active=_oauth_creds("1", "max"), backups={"1": _oauth_creds("1", "pro")}
+        )
+
+        assert pace_feed.read_plan_for(sw, "1", EMAILS["1"], True) == "max"
+        assert pace_feed.read_plan_for(sw, "1", EMAILS["1"], False) == "pro"
+        assert sw.calls == [("active",), ("backup", "1", EMAILS["1"])]
+
+    def test_a_none_active_value_is_unknown(self):
+        sw = _PlanSwitcher(active=None)
+        assert pace_feed.read_plan_for(sw, "1", EMAILS["1"], True) == "unknown"
+
+    @pytest.mark.parametrize("is_active", [False, True], ids=["backup", "active"])
+    @pytest.mark.parametrize("exc_type", [OSError, RuntimeError, ValueError, KeyError])
+    def test_reader_failure_is_unknown_and_leaks_nothing(
+        self, exc_type, is_active, capsys, caplog, tmp_path
+    ):
+        caplog.set_level("DEBUG")
+        canary = (
+            f"cannot read {tmp_path}/.creds-2-{EMAILS['2']}.enc "
+            f"token={_access('2')} refresh={_refresh('2')}"
+        )
+        sw = _PlanSwitcher(exc=exc_type(canary))
+
+        plan = pace_feed.read_plan_for(sw, "2", EMAILS["2"], is_active)
+
+        assert plan == "unknown"
+        captured = capsys.readouterr()
+        for text in (plan, captured.out, captured.err, caplog.text):
+            for value in (EMAILS["2"], _access("2"), _refresh("2"), str(tmp_path)):
+                assert value not in text
+        assert caplog.records == []
+
+    def test_a_switcher_without_readers_is_unknown(self):
+        assert pace_feed.read_plan_for(object(), "1", EMAILS["1"], True) == "unknown"
+        assert pace_feed.read_plan_for(object(), "1", EMAILS["1"], False) == "unknown"
+
+    def test_read_plan_and_read_plan_for_agree_on_a_real_fleet(self, fleet: Fleet):
+        fleet.seed(plans={"1": "ultra", "2": "pro", "3": None})
+        snapshot = fleet.switcher.accounts_snapshot(fetch=set(), read_only=True)
+        before = fleet.hashes()
+
+        old = [pace_feed.read_plan(fleet.switcher, acc) for acc in snapshot.accounts]
+        new = [
+            pace_feed.read_plan_for(fleet.switcher, acc.number, acc.email, acc.is_active)
+            for acc in snapshot.accounts
+        ]
+
+        assert old == new == ["ultra", "pro", "unknown"]
+        assert fleet.hashes() == before
+
+    def test_read_plan_for_imports_no_token_accessor_and_logs_nothing(self):
+        """The AST check of the whole module, narrowed to read_plan_for: it
+        calls only the two non-mutating readers and plan_from_credential."""
+        tree = ast.parse(inspect.getsource(pace_feed.read_plan_for))
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                names.add(node.attr)
+            elif isinstance(node, ast.Name):
+                names.add(node.id)
+            assert not isinstance(node, (ast.Import, ast.ImportFrom))
+        forbidden = {
+            "oauth", "extract_oauth_data", "extract_access_token",
+            "extract_refresh_token", "logging", "_logger", "logger", "print",
+            "repr", "format", "format_exc", "traceback", "write_text",
+            "write_bytes", "_write_json", "_write_account_credentials",
+            "atomic_write_json", "open",
+        }
+        assert not names & forbidden, names & forbidden
+        # `str` is allowed as a type annotation, never called (exception text).
+        called = {
+            n.func.id
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        assert called == {"plan_from_credential"}, called
+        attrs = {
+            n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)
+        }
+        assert attrs == {"_read_active_credentials", "value", "_read_account_credentials"}
+
 
 # ---------------------------------------------------------------------------
 # Scenario 5 — No network, no writes

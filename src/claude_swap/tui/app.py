@@ -286,16 +286,37 @@ class CswapApp(App):
 
     # -- account operations ----------------------------------------------------
 
+    def _recording_manual_switch(self, fn):
+        """Wrap a switch call: record it in the engine state after it switched.
+
+        Runs in the action worker thread. A refused switch raises before the
+        record, and a no-op payload has ``switched`` false (S3c).
+        """
+
+        def run() -> dict | None:
+            payload = fn()
+            if isinstance(payload, dict) and payload.get("switched") is True:
+                from claude_swap.autoswitch import record_manual_switch
+
+                record_manual_switch(self.switcher.backup_dir)
+            return payload
+
+        return run
+
     def do_switch(self, number: str) -> None:
         self._start_action(
             f"Switch to account {number}",
-            partial(self.switcher.switch_to, number, json_output=True),
+            self._recording_manual_switch(
+                partial(self.switcher.switch_to, number, json_output=True)
+            ),
         )
 
     def action_switch_best(self) -> None:
         self._start_action(
             "Switch (best)",
-            partial(self.switcher.switch, strategy="best", json_output=True),
+            self._recording_manual_switch(
+                partial(self.switcher.switch, strategy="best", json_output=True)
+            ),
         )
 
     def do_toggle_disabled(self, number: str) -> None:

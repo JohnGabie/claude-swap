@@ -57,7 +57,14 @@ class AutoSwitchSettings:
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
-    strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
+    # "best" (most headroom), "consume-first" (soonest weekly reset) or
+    # "balanced" (spread load across accounts).
+    strategy: str = "best"
+    # Balanced strategy only: wait between two proactive switches (a switch at
+    # the threshold ignores it), and how many points below the threshold a
+    # candidate must sit.
+    balanced_cooldown_seconds: float = 900.0
+    balanced_margin: float = 5.0
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
@@ -134,8 +141,20 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "balanced"),
             help="How auto-switch picks the target account",
+        ),
+        SettingSpec(
+            "autoswitch", "balancedCooldownSeconds", "balanced_cooldown_seconds",
+            "float", 0.0, 86400.0,
+            help=(
+                "Wait between two proactive switches of the balanced strategy; "
+                "a switch at the threshold ignores it"
+            ),
+        ),
+        SettingSpec(
+            "autoswitch", "balancedMargin", "balanced_margin", "float", 0.0, 50.0,
+            help="Balanced strategy: a candidate must sit this many points below the threshold",
         ),
         SettingSpec(
             "autoswitch", "includeApiKeyAccounts", "include_api_key_accounts", "bool",

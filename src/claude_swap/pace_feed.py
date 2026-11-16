@@ -46,10 +46,12 @@ EXIT_OK = 0
 EXIT_PARTIAL = 3
 EXIT_UNAVAILABLE = 4
 
-#: Plan words. Only these two stored values are recognized; anything else
-#: (missing, ``None``, another tier name) reads as ``PLAN_UNKNOWN``.
+#: Plan words. Only these stored values are recognized, case sensitive;
+#: anything else (missing, ``None``, another tier name) reads as
+#: ``PLAN_UNKNOWN``. The stored value of an Ultra credential is not verified
+#: (spec S3d): until it is, a different string reads as ``PLAN_UNKNOWN``.
 PLAN_UNKNOWN = "unknown"
-KNOWN_PLANS = frozenset({"pro", "max"})
+KNOWN_PLANS = frozenset({"pro", "max", "ultra"})
 
 #: Status words.
 STATUS_OK = "ok"
@@ -100,8 +102,8 @@ def unavailable_payload() -> dict:
 def plan_from_credential(blob: object) -> str:
     """Return the plan word of one stored credential blob, and nothing else.
 
-    Reads ``claudeAiOauth.subscriptionType``. Returns ``"pro"`` or ``"max"``
-    only for exactly those stored values; anything else, including an
+    Reads ``claudeAiOauth.subscriptionType``. Returns ``"pro"``, ``"max"`` or
+    ``"ultra"`` only for exactly those stored values; anything else, including an
     unparsable blob or an API key, returns ``"unknown"``. Never raises, logs
     nothing, and keeps no reference to the blob.
     """
@@ -122,22 +124,34 @@ def plan_from_credential(blob: object) -> str:
     return PLAN_UNKNOWN
 
 
-def read_plan(switcher: "ClaudeAccountSwitcher", account: "AccountSnapshot") -> str:
+def read_plan_for(
+    switcher: "ClaudeAccountSwitcher", number: str, email: str, is_active: bool
+) -> str:
     """Return the plan word of one account's stored credential.
 
-    The active account reads Claude Code's live store (the credential in
-    use); every other account reads its slot backup. Both reads are the
-    switcher's non-mutating readers. The blob stays local to this function
-    and only the plan word leaves it. Any failure returns ``"unknown"``.
+    The active account (``is_active``) reads Claude Code's live store (the
+    credential in use); every other account reads its slot backup, keyed by
+    ``number`` and ``email``. Both reads are the switcher's non-mutating
+    readers. The blob stays local to this function and only the plan word
+    leaves it: one of ``KNOWN_PLANS`` or ``"unknown"``. Any failure returns
+    ``"unknown"``. Never raises, and keeps no reference to the blob, the
+    email or the exception. This function does not log. Known limit (separate
+    hardening ticket): the credential readers it calls log read errors to the
+    log file.
     """
     try:
-        if account.is_active:
+        if is_active:
             blob = switcher._read_active_credentials().value
         else:
-            blob = switcher._read_account_credentials(account.number, account.email)
+            blob = switcher._read_account_credentials(number, email)
+        return plan_from_credential(blob)
     except Exception:
         return PLAN_UNKNOWN
-    return plan_from_credential(blob)
+
+
+def read_plan(switcher: "ClaudeAccountSwitcher", account: "AccountSnapshot") -> str:
+    """Return the plan word of one snapshot account (see :func:`read_plan_for`)."""
+    return read_plan_for(switcher, account.number, account.email, account.is_active)
 
 
 def _iso_utc(epoch_s: object) -> str | None:

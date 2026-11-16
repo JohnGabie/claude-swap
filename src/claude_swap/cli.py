@@ -793,12 +793,13 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "balanced"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest) or 'balanced' (use the weekly quota that resets "
+            "soonest, Pro accounts before Max; can switch below the threshold)"
         ),
     )
     parser.add_argument(
@@ -1271,6 +1272,37 @@ def _menubar_service(args) -> int:
     if not result["installed"]:
         print(dimmed("launchd still has it loaded, but the plist is gone."))
     return 0
+
+
+def _active_number(switcher) -> object:
+    """The recorded active account number, or None when it cannot be read."""
+    try:
+        return (switcher._get_sequence_data() or {}).get("activeAccountNumber")
+    except Exception:  # noqa: BLE001 - only used to detect a change
+        return None
+
+
+def _record_if_switched(switcher, payload, active_before) -> None:
+    """Record a manual switch in the engine state after it succeeded (S3c).
+
+    With ``--json`` the payload says whether the account changed. Without it
+    ``switch`` and ``switch_to`` return None for a switch and for a no-op, so
+    the recorded active account before and after decides. Never raises.
+    """
+    try:
+        if isinstance(payload, dict):
+            switched = payload.get("switched") is True
+        elif payload is None:
+            after = _active_number(switcher)
+            switched = after is not None and after != active_before
+        else:
+            switched = False
+        if switched:
+            from claude_swap.autoswitch import record_manual_switch
+
+            record_manual_switch(switcher.backup_dir)
+    except Exception:  # noqa: BLE001 - recording never fails the switch
+        pass
 
 
 def main() -> None:
@@ -1750,19 +1782,23 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             else:
                 models = parse_model_names(load_settings(switcher.backup_dir).model)
                 model_source = "autoswitch.model" if models else None
+            active_before = _active_number(switcher)
             payload = switcher.switch(
                 strategy=args.strategy,
                 json_output=args.json,
                 models=models,
                 model_source=model_source,
             )
+            _record_if_switched(switcher, payload, active_before)
             if payload is not None and models:
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
+            active_before = _active_number(switcher)
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
+            _record_if_switched(switcher, payload, active_before)
         elif args.status:
             payload = switcher.status(json_output=args.json)
         elif args.purge:
