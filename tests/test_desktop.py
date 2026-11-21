@@ -359,6 +359,18 @@ def test_with_ranks_marks_the_first_three():
     assert {c["num"]: c["rank"] for c in out} == {"1": 0, "2": 2, "3": 0, "4": 1, "5": 3}
 
 
+def test_account_alert_only_for_a_current_problem():
+    from types import SimpleNamespace as NS
+
+    from claude_swap.desktop import account_alert
+
+    assert account_alert(NS(last_error=None, age_s=999_999)) is None
+    lapsed = account_alert(NS(last_error="oauth_not_allowed_for_organization", age_s=4 * 86400))
+    assert lapsed.startswith("Plan lapsed or blocked") and "4d" in lapsed
+    assert account_alert(NS(last_error="http-429", age_s=600)) is None  # a short hiccup
+    assert account_alert(NS(last_error="http-429", age_s=3 * 3600)).startswith("Usage not read for 3h (last error: http-429).")
+
+
 def test_with_ranks_without_a_ranking():
     from claude_swap.desktop import with_ranks
 

@@ -187,6 +187,19 @@ def test_rank_of_accepts_only_one_to_three():
     assert pill.rank_of({}) == 0
 
 
+def test_payload_carries_the_alert_text_only():
+    lay = pill.window_layout("top", 1, (0, 0, 1000, 800))
+    cards = [{"num": "2", "rows": [], "alert": "Plan lapsed or blocked by the organization: usage cannot be read."},
+             {"num": "3", "rows": [], "alert": 5}]
+    items = pill.pill_payload(cards, "top", "black", lay)["items"]
+    assert items[0]["alert"].startswith("Plan lapsed") and items[1]["alert"] is None
+
+
+def test_page_draws_the_alert_asterisk_and_its_text():
+    assert "it.alert?'<span class=alert" in pill.PILL_PAGE
+    assert "<div class=alert-msg>* ${esc(it.alert)}</div>" in pill.PILL_PAGE
+
+
 def test_page_draws_the_sparkle_in_three_sizes_and_colors():
     for token in ("#e0a800", "#9aa3b0", "#b8692a", "function spark(rank)"):
         assert token in pill.PILL_PAGE

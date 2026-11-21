@@ -88,6 +88,7 @@ PAGE = r"""<!doctype html>
   .pct { text-align: right; font-variant-numeric: tabular-nums; font-weight: 500; }
   .meta { color: var(--muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .msg { margin: 12px 0 0 20px; color: var(--muted); }
+  .alert-msg { color: #e0a800; margin: 8px 0 0 20px; }
   .empty { text-align: center; color: var(--muted); padding: 60px 0; }
   .empty b { display: block; font: 400 20px Georgia, serif; color: var(--fg); margin-bottom: 6px; }
 
@@ -250,7 +251,7 @@ PAGE = r"""<!doctype html>
           <div class="top"><span class="dot"></span>
             <div class="who"><div class="name">${esc(a.title)}</div><div class="tag">${esc(a.tag)}</div></div>
             <div class="acts">${right}</div></div>
-          ${bars}${a.message ? `<div class="msg">${esc(a.message)}</div>` : ""}</article>`;
+          ${a.alert ? `<div class="msg alert-msg">* ${esc(a.alert)}</div>` : ""}${bars}${a.message ? `<div class="msg">${esc(a.message)}</div>` : ""}</article>`;
     }).join("");
     requestAnimationFrame(() => requestAnimationFrame(() => {
       for (const f of document.querySelectorAll(".fill")) {

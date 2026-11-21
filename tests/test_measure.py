@@ -187,7 +187,7 @@ def test_estimate_gives_median_and_range(env):
     assert out["confidence"] == "low" and out["matchedOn"] == "role+tier+model"
     assert out["weightedTokens"] == {"n": 5, "median": 300_000, "mean": 400_000,
                                      "p25": 200_000, "p75": 400_000}
-    assert out["percentOfWeek"] == {"pro": 1.0, "max": 0.2}
+    assert out["percentOfWeek"] == {"pro": 1.2, "max": 0.24}
     assert out["durationSeconds"]["median"] == 500
 
 

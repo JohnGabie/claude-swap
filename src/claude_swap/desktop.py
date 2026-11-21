@@ -27,12 +27,37 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.data import (
     clock_stamp,
     format_age,
+    format_duration,
     sentinel_label,
     window_pct,
     window_reset_text,
 )
 
 _TITLE_MAX = 32
+# A failing account whose last reading is older than this gets an alert.
+ALERT_READING_AGE_S = 2 * 3600.0
+
+
+def account_alert(usage) -> str | None:
+    """Short text of a current problem of one account, or None.
+
+    The stored error clears on the next good reading, so the alert lasts as
+    long as the problem. A lapsed plan or an organization block alerts at
+    once; any other error only once the last reading is old.
+    """
+    error = getattr(usage, "last_error", None)
+    if not error:
+        return None
+    age_s = getattr(usage, "age_s", None)
+    since = f" Last reading {format_duration(age_s)} ago." if age_s else ""
+    if error == "oauth_not_allowed_for_organization":
+        return "Plan lapsed or blocked by the organization: usage cannot be read." + since
+    if age_s is not None and age_s >= ALERT_READING_AGE_S:
+        return (
+            f"Usage not read for {format_duration(age_s)} (last error: {error}). "
+            "If this lasts, check the plan of this account."
+        )
+    return None
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
 
@@ -58,6 +83,9 @@ class CardView:
     switchable: bool
     rows: tuple[WindowRow, ...]
     message: str | None
+    # A problem worth a discreet mark (the pill draws an asterisk), with the
+    # text the card shows. None when all is well.
+    alert: str | None = None
 
 
 def card_lines(acc: AccountSnapshot, now: float) -> CardView:
@@ -91,6 +119,7 @@ def card_lines(acc: AccountSnapshot, now: float) -> CardView:
         switchable=acc.switchable,
         rows=rows,
         message=message,
+        alert=account_alert(usage),
     )
 
 

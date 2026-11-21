@@ -37,7 +37,9 @@ MODEL_WEIGHTS = (
 DEFAULT_MODEL_WEIGHT = 1.0
 
 # Weighted tokens for 1% of a Pro account. Other plans scale by capacity.
-PRIOR_PER_PERCENT_PRO = {"week": 300_000.0, "five": 30_000.0}
+# Weekly: 250k, the median of the user's own five Pro accounts after one week
+# (188k-297k per point, 2026-11-21); the community estimate was 300k.
+PRIOR_PER_PERCENT_PRO = {"week": 250_000.0, "five": 30_000.0}
 # The prior counts as this many percent points of the account's own data.
 PRIOR_POINTS = {"week": 10.0, "five": 30.0}
 

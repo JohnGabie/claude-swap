@@ -181,7 +181,7 @@ def test_current_budget_uses_the_settings_lines(monkeypatch, tmp_path):
     assert b["accounts"][0]["usableNow"] is True
     # With no data of its own the account gets the prior of its plan.
     assert b["tokens"]["confidence"] == "prior"
-    assert b["accounts"][0]["sevenDay"]["tokensPerPercent"] == 300_000
+    assert b["accounts"][0]["sevenDay"]["tokensPerPercent"] == 250_000
 
 
 def test_current_budget_never_raises(monkeypatch, tmp_path):
@@ -359,10 +359,10 @@ def test_weighted_tokens_use_type_and_model_weights():
 def test_the_rate_moves_from_the_prior_to_the_account_data():
     from claude_swap import token_model as tm
 
-    assert tm.prior_rate("pro", "week") == 300_000 and tm.prior_rate("max", "week") == 1_500_000
-    assert tm.blended_rate("pro", "week", 0, 0) == 300_000
-    # 10 prior points at 300k and 10 own points at 100k give 200k.
-    assert tm.blended_rate("pro", "week", 10, 1_000_000) == 200_000
+    assert tm.prior_rate("pro", "week") == 250_000 and tm.prior_rate("max", "week") == 1_250_000
+    assert tm.blended_rate("pro", "week", 0, 0) == 250_000
+    # 10 prior points at 250k and 10 own points at 100k give 175k.
+    assert tm.blended_rate("pro", "week", 10, 1_000_000) == 175_000
     assert abs(tm.blended_rate("pro", "week", 1000, 100_000_000) - 100_000) < 2_100
     assert [tm.confidence(v) for v in (0, 10, 30, 100)] == ["prior", "low", "medium", "high"]
 
@@ -426,9 +426,9 @@ def test_rates_blend_own_data_with_the_prior():
     store["accounts"]["1"] = {"week": {"points": 10.0, "tokens": 1_000_000.0},
                               "five": {"points": 30.0, "tokens": 600_000.0}}
     out = cal.rates(store, {"1": "pro", "2": "max"})
-    assert out["1"]["weekPerPct"] == 200_000 and out["1"]["confidence"] == "low"
+    assert out["1"]["weekPerPct"] == 175_000 and out["1"]["confidence"] == "low"
     assert out["1"]["fivePerPct"] == 25_000  # (30 * 30k + 600k) / 60
-    assert out["2"] == {"weekPerPct": 1_500_000.0, "fivePerPct": 150_000.0, "confidence": "prior",
+    assert out["2"] == {"weekPerPct": 1_250_000.0, "fivePerPct": 150_000.0, "confidence": "prior",
                         "ownWeekPoints": 0.0, "ownFivePoints": 0.0}
     assert cal.rates({"schemaVersion": 1, "tokensPerPercentPro": 5}, {"1": "pro"})["1"]["confidence"] == "prior"
 
@@ -472,10 +472,10 @@ def test_current_budget_uses_the_calibration_store(monkeypatch, tmp_path):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     src = _fake_source(monkeypatch, tmp_path, {"accounts": [acc(1, week=30.0)]})
     b = src.current_budget(NOW)
-    # 10 prior points at 300k and 10 own points at 100k give 200k per point.
-    assert b["accounts"][0]["sevenDay"]["tokensPerPercent"] == 200_000
+    # 10 prior points at 250k and 10 own points at 100k give 175k per point.
+    assert b["accounts"][0]["sevenDay"]["tokensPerPercent"] == 175_000
     assert b["accounts"][0]["tokenConfidence"] == "low"
-    assert b["tokens"]["remainingTokens"] == 14_000_000
+    assert b["tokens"]["remainingTokens"] == 12_250_000
     assert "weighted" in b["tokens"]["unit"]
 
 

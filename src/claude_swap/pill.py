@@ -198,6 +198,7 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
                 "five": _pct(_row(c, "5h")),
                 "week": _pct(_row(c, "7d")),
                 "rank": rank_of(c),
+                "alert": c.get("alert") if isinstance(c.get("alert"), str) else None,
                 "title": c.get("title", ""),
                 "tag": c.get("tag", ""),
                 "message": c.get("message"),
@@ -291,6 +292,8 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 .bar i{display:block;height:100%;border-radius:3px;background:var(--c);transition:width .5s var(--ease)}
 .used{margin-top:4px;font-size:12px}
 .msg{color:var(--dim);font-size:12px;padding:6px 0}
+.alert{color:#e0a800;font-weight:700;margin-left:1px}
+.alert-msg{color:#e0a800;font-size:11.5px;line-height:1.35;margin:0 0 8px}
 @media (prefers-reduced-motion: reduce){
  #pill,body.folded #pill,#rest,.item,.add,body.folded .item,body.folded .add,.item .ring,.ring .arc,.ring .disc,#card,#card.show,#card.show.glide,.arrow,.bar i{transition:none}
  .add.busy{animation:none}
@@ -361,7 +364,7 @@ function renderCard(){
   <div class=bar><i style="width:${Math.min(r.pct||0,100)}%"></i></div>
   <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% used'}${r.age?' <span class=tag>'+esc(r.age)+'</span>':''}</div></div>`).join('');
  card.innerHTML=`<div class=head><div class=title>${esc(it.title)}</div><div class=tag>${esc(it.tag)}${it.disabled?' \\u00b7 paused':''}</div></div>`+
-  rows+(it.message&&!it.rows.length?`<div class=msg>${esc(it.message)}</div>`:'')+'<div class=arrow></div>';
+  (it.alert?`<div class=alert-msg>* ${esc(it.alert)}</div>`:'')+rows+(it.message&&!it.rows.length?`<div class=msg>${esc(it.message)}</div>`:'')+'<div class=arrow></div>';
  placeCard();
 }
 // Show first, then place: the card's height is only known once it has content (Codenotch's placeCard).
@@ -461,7 +464,7 @@ function applyItem(d,it){
  for(const [k,p,c] of [['five',it.five,C5],['week',it.week,C7]]){
   const el=d.querySelector('.arc.'+k); if(el) el.setAttribute('stroke-dasharray',dash(c,p));
  }
- d.querySelector('.pct').innerHTML=spark(it.rank)+(it.five==null?'\\u2013':Math.round(it.five)+'%');
+ d.querySelector('.pct').innerHTML=spark(it.rank)+(it.five==null?'\\u2013':Math.round(it.five)+'%')+(it.alert?'<span class=alert title="'+esc(it.alert)+'">*</span>':'');
 }
 // The structure is rebuilt only when it changes, so a refresh animates the arcs rather than replaying the entrance
 function build(p){
