@@ -17,8 +17,8 @@ def iso(ts: float) -> str:
 
 
 def acc(num, plan="pro", five=0.0, week=0.0, week_reset_h=84.0, five_reset_h=2.0, status="ok"):
-    """An account whose weekly reset is ``week_reset_h`` hours from NOW."""
-    out = {"id": num, "plan": plan, "status": status}
+    """An account whose weekly reset is ``week_reset_h`` hours from NOW, read a minute ago."""
+    out = {"id": num, "plan": plan, "status": status, "fetchedAt": iso(NOW - 60)}
     if status in ("ok", "stale"):
         out["fiveHour"] = {"pct": five, "resetsAt": iso(NOW + five_reset_h * H)}
         out["sevenDay"] = {"pct": week, "resetsAt": iso(NOW + week_reset_h * H)}
@@ -106,7 +106,7 @@ def test_resets_are_sorted_with_what_expires():
 def test_an_unread_account_is_listed_and_not_counted():
     b = build(acc(1, week=50.0), acc(2, status="token_expired"))
     assert b["accounts"][1] == {
-        "id": 2, "plan": "pro", "capacityUnits": 1.0, "status": "token_expired", "fetchedAt": None,
+        "id": 2, "plan": "pro", "capacityUnits": 1.0, "status": "token_expired", "fetchedAt": iso(NOW - 60),
         "measured": False, "usableNow": False,
     }
     assert b["fleet"]["accounts"] == 2 and b["fleet"]["measuredAccounts"] == 1
@@ -232,9 +232,11 @@ def test_cli_budget_hook_reads_the_session_and_never_fails(monkeypatch, tmp_path
 
     import pytest
 
-    from claude_swap import cli
+    from claude_swap import budget_source, cli
 
     _fake_source(monkeypatch, tmp_path, {"accounts": [acc(1, week=100.0, week_reset_h=30.0)]})
+    # The CLI reads the wall clock: pin it, or the account's reset passes as days go by.
+    monkeypatch.setattr(budget_source.time, "time", lambda: NOW)
     for stdin, expect_line in (('{"session_id": "abc"}', True), ('{"session_id": "abc"}', False), ("not json", True)):
         monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
         with pytest.raises(SystemExit) as e:
@@ -516,3 +518,15 @@ def test_cli_json_is_one_line_read_only_with_exit_codes(monkeypatch, tmp_path, c
     assert code == 3 and json.loads(out.out)["status"] == "unavailable"
     code, out = _run_budget(monkeypatch, tmp_path, capsys, {"accounts": []}, ["--nope"])
     assert code == 4 and out.out == ""
+
+
+def test_an_account_with_no_recent_reading_is_not_fuel():
+    old, fresh = acc(2, week=10.0), acc(1, week=50.0)
+    old["status"], old["fetchedAt"] = "stale", iso(NOW - 4 * 24 * H)
+    fresh["fetchedAt"] = iso(NOW - 60)
+    b = build(fresh, old)
+    two = b["accounts"][1]
+    assert two["measured"] is False and two["usableNow"] is False and two["noRecentReading"] is True
+    assert b["fleet"]["usableNow"] == 1 and b["fleet"]["capacityUnits"] == 1.0
+    assert b["fetchedAt"] == iso(NOW - 60)  # the old reading does not age the whole budget
+    assert "1 of 2 accounts usable" in b["reason"]

@@ -95,7 +95,6 @@ BURN_MIN_GAP_S = 60.0          # the shortest time assumed until the next readin
 BURN_MAX_GAP_S = 600.0         # a longer gap between readings counts as this
 BURN_STALE_S = 900.0           # a rate from a reading older than this is dropped
 BURN_LOOKAHEAD_MAX_PTS = 40.0  # the line is never lowered by more than this
-BURN_LINE_FLOOR = 50.0         # and never below this percent
 ALL_EXHAUSTED_REPEAT_S = 900
 # E3b: an account left by one of these can be "recovered" inside the bar once
 # its window reset. An account left by `failover` (or an unknown trigger) never.
@@ -340,6 +339,10 @@ class PollEvent(AutoSwitchEvent):
     # only when set. Every pct above stays RAW: the lines are applied where
     # the engine compares, never to the numbers it logs.
     weekly_threshold: float | None = None
+    # Points added to the active account's 5-hour percent for the decision
+    # (burn lookahead). Additive field, emitted only when set; ``windows``
+    # stays raw.
+    five_hour_lookahead: float | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -353,6 +356,8 @@ class PollEvent(AutoSwitchEvent):
             fields["windowsPct"] = self.windows
         if self.weekly_threshold is not None:
             fields["weeklyThreshold"] = self.weekly_threshold
+        if self.five_hour_lookahead is not None:
+            fields["fiveHourLookaheadPct"] = self.five_hour_lookahead
         return fields
 
     def _describe(self, num: str) -> str:
@@ -578,6 +583,23 @@ class TickOutcome(enum.Enum):
 # full-content hash — those release once on first recheck and re-quarantine on
 # the next dead freshen (one harmless extra cycle, migration only).
 _refresh_fingerprint = oauth.credential_fingerprint
+
+
+def _project_five_hour(
+    usage: Mapping[str, dict | str | None], current: str, points: float
+) -> dict[str, dict | str | None]:
+    """``usage`` with the active account's 5-hour percent raised by
+    ``points`` (capped at 100). Other accounts and windows are unchanged and
+    nothing is mutated. No 5-hour window, or ``points`` <= 0: a plain copy."""
+    out = dict(usage)
+    value = out.get(current)
+    if points <= 0.0 or not isinstance(value, dict):
+        return out
+    five = value.get("five_hour")
+    if not isinstance(five, dict) or not isinstance(five.get("pct"), (int, float)):
+        return out
+    out[current] = {**value, "five_hour": {**five, "pct": min(100.0, float(five["pct"]) + points)}}
+    return out
 
 
 def _window_pcts(
@@ -1085,7 +1107,9 @@ class AutoSwitchEngine:
         # between the last two (percent points per second). Memory only.
         self._burn_reading: tuple[str, float, float] | None = None
         self._burn_rate = 0.0
+        self._burn_last_rate = 0.0
         self._burn_gap = BURN_MIN_GAP_S
+        self._burn_next: float | None = None
         # The active account number the engine saw last (S3b-2), in memory
         # only. A balanced tick that sees another active account, which the
         # engine did not switch to, invalidates the plan of both accounts.
@@ -1523,17 +1547,14 @@ class AutoSwitchEngine:
             weekly_threshold=settings.weekly_threshold,
         )
         # Readings are 1 to 4 minutes apart and a heavy load fills a small
-        # account between two of them. The active account's 5-hour line is
-        # lowered by the points it is expected to use before the next reading.
+        # account between two of them. The decision reads the active
+        # account's 5-hour percent raised by the points it is expected to use
+        # before the next reading. Only the 5-hour window: the burn is
+        # measured on it, and the weekly window moves about 10 times slower
+        # (week of 2026-11-16: lowering the whole line forced 8 switches out
+        # of accounts with a weekly percent near the line and 14-54% used in
+        # the 5-hour window). The logged percents stay raw.
         lookahead = self._burn_lookahead(current, entries.get(current), usage.get(current))
-        if lookahead > 0.0:
-            thresholds = ThresholdMap(
-                {
-                    **thresholds,
-                    current: max(BURN_LINE_FLOOR, thresholds[current] - lookahead),
-                },
-                thresholds.default,
-            )
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1555,8 +1576,11 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
+                five_hour_lookahead=round(lookahead, 2) if lookahead > 0.0 else None,
             )
         )
+        raw_usage = usage
+        usage = _project_five_hour(usage, current, lookahead)
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -1885,6 +1909,7 @@ class AutoSwitchEngine:
                 current=current,
                 candidates=oauth_candidates,
                 usage=usage,
+                raw_usage=raw_usage,
                 headroom=headroom,
                 active_headroom=active_headroom,
                 settings=settings,
@@ -1909,6 +1934,8 @@ class AutoSwitchEngine:
                     num: entry.decision_value() for num, entry in entries.items()
                 }
                 headroom = _headroom_by_account(usage, self._models)
+                raw_usage = usage
+                usage = _project_five_hour(usage, current, lookahead)
                 active_headroom = headroom.get(current)
                 active_binding = self._binding(
                     usage.get(current), settings, thresholds[current]
@@ -1919,6 +1946,7 @@ class AutoSwitchEngine:
                     current=current,
                     candidates=oauth_candidates,
                     usage=usage,
+                    raw_usage=raw_usage,
                     headroom=headroom,
                     active_headroom=active_headroom,
                     settings=settings,
@@ -1986,6 +2014,8 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
+            raw_usage = usage
+            usage = _project_five_hour(usage, current, lookahead)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
@@ -3417,6 +3447,7 @@ class AutoSwitchEngine:
         thresholds: Mapping[str, float],
         now: float,
         plan_of: Callable[[str], str],
+        raw_usage: dict[str, dict | str | None] | None = None,
     ) -> _BalancedChoice:
         """Run ``balance.decide`` on one snapshot. Pure apart from the plan
         reads: no emits, no state writes, so the two-phase commit runs it
@@ -3434,9 +3465,12 @@ class AutoSwitchEngine:
         # Every account of the tick in the map: the builder never blocks an
         # account that is missing from it.
         lines = {num: thresholds[num] for num in (current, *candidates)}
+        # The accounts as read: the burn lookahead only decides whether the
+        # active account must leave (``at_threshold`` below), it does not
+        # shrink the active account's room in the comparison with the others.
         accounts = _balance_accounts(
-            current, candidates, usage, lines, settings.weekly_threshold,
-            self._models, plan_of,
+            current, candidates, raw_usage if raw_usage is not None else usage,
+            lines, settings.weekly_threshold, self._models, plan_of,
         )
         at_threshold = _balance_active_at_threshold(
             current, usage.get(current), lines, settings.weekly_threshold,
@@ -3622,24 +3656,32 @@ class AutoSwitchEngine:
         The rate comes from two readings of the same account with different
         fetch times. A percent that fell (the window reset), a change of
         account or a rate older than ``BURN_STALE_S`` clears it. The points
-        are ``rate * (age of the reading + gap between readings)``, capped at
-        ``BURN_LOOKAHEAD_MAX_PTS``.
+        are ``rate * (time from the reading to the next one)``, capped at
+        ``BURN_LOOKAHEAD_MAX_PTS``. The next reading is the entry's
+        ``next_poll_at`` when known, else the last gap between readings.
         """
         pct = _window_pcts(value if isinstance(value, dict) else None, self._models).get(
             oauth.FIVE_HOUR_LABEL
         )
         fetched = getattr(entry, "fetched_at", None)
+        planned = getattr(entry, "next_poll_at", None)
+        self._burn_next = planned if isinstance(planned, (int, float)) else None
         if pct is None or not isinstance(fetched, (int, float)):
             return 0.0 if self._burn_reading is None or self._burn_reading[0] != current else (
                 self._lookahead_points(None)
             )
         previous = self._burn_reading
         if previous is None or previous[0] != current:
-            self._burn_rate, self._burn_gap = 0.0, BURN_MIN_GAP_S
+            self._burn_rate, self._burn_gap, self._burn_last_rate = 0.0, BURN_MIN_GAP_S, 0.0
             self._burn_reading = (current, float(fetched), float(pct))
         elif fetched > previous[1]:
             gap = fetched - previous[1]
-            self._burn_rate = max(0.0, (pct - previous[2]) / gap) if pct >= previous[2] else 0.0
+            rate = max(0.0, (pct - previous[2]) / gap) if pct >= previous[2] else 0.0
+            # The larger of the last two rates: a burst followed by one slow
+            # interval is still a burst (2026-11-17 04:37-04:42: 13 points in
+            # a minute, then 2, then the window was full).
+            self._burn_rate = 0.0 if pct < previous[2] else max(rate, self._burn_last_rate)
+            self._burn_last_rate = rate
             self._burn_gap = gap
             self._burn_reading = (current, float(fetched), float(pct))
         return self._lookahead_points(float(fetched))
@@ -3648,11 +3690,17 @@ class AutoSwitchEngine:
         reading = self._burn_reading
         if reading is None or self._burn_rate <= 0.0:
             return 0.0
-        age = max(0.0, self.clock() - (fetched if fetched is not None else reading[1]))
+        base = fetched if fetched is not None else reading[1]
+        age = max(0.0, self.clock() - base)
         if age > BURN_STALE_S:
             self._burn_rate = 0.0
             return 0.0
-        horizon = age + min(max(self._burn_gap, BURN_MIN_GAP_S), BURN_MAX_GAP_S)
+        nxt = self._burn_next
+        # From the reading to the next one: the poll plan when it is ahead,
+        # else the last gap; never less than a minute ahead of now, never
+        # more than BURN_MAX_GAP_S ahead.
+        ahead = (nxt - base) if nxt is not None and nxt > base else age + self._burn_gap
+        horizon = min(max(ahead, age + BURN_MIN_GAP_S), age + BURN_MAX_GAP_S)
         return min(BURN_LOOKAHEAD_MAX_PTS, self._burn_rate * horizon)
 
     def _emit(self, event: AutoSwitchEvent) -> None:

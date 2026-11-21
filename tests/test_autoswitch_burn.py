@@ -130,3 +130,93 @@ class TestUrgentPollingByRate:
 
     def test_the_band_is_still_urgent(self):
         assert self._plan(88, 90) == 60.0
+
+
+# ---- week of 2026-11-16: findings of the data review ------------------------
+
+from claude_swap import balance  # noqa: E402
+from tests.test_autoswitch import _usage7  # noqa: E402
+
+
+class TestLookaheadIsFiveHourOnly:
+    def test_a_weekly_percent_near_the_line_does_not_force_a_switch(self, temp_home):
+        # 2026-11-18 06:30: 5h at 16%, 7d at 87%, the lowered line was 83%.
+        h = _fleet(temp_home, "best")
+        h.tick_with_usage({"1": _usage7(10, 87), "2": _usage7(0, 10)})
+        h.clock.advance(60)
+        h.events.clear()
+        assert h.tick_with_usage({"1": _usage7(30, 87), "2": _usage7(0, 10)}) is TickOutcome.NO_ACTION
+        assert _switches(h) == []
+
+    def test_the_poll_event_logs_the_lookahead_and_raw_percents(self, temp_home):
+        h = _fleet(temp_home, "best")
+        h.tick_with_usage({"1": _usage(10), "2": _usage(0)})
+        h.clock.advance(60)
+        h.events.clear()
+        h.tick_with_usage({"1": _usage(30), "2": _usage(0)})
+        poll = next(e for e in h.events if e.kind == "poll").to_json()
+        assert poll["threshold"] == 99.0
+        assert poll["windowsPct"]["1"]["5h"] == 30.0
+        assert poll["fiveHourLookaheadPct"] == 20.0
+
+    def test_project_five_hour_copies_and_caps(self):
+        usage = {"1": {"five_hour": {"pct": 90.0, "resets_at": "x"}, "seven_day": {"pct": 50.0}}, "2": None}
+        out = autoswitch._project_five_hour(usage, "1", 25.0)
+        assert out["1"]["five_hour"] == {"pct": 100.0, "resets_at": "x"}
+        assert out["1"]["seven_day"] == {"pct": 50.0}
+        assert usage["1"]["five_hour"]["pct"] == 90.0  # not mutated
+        assert autoswitch._project_five_hour(usage, "1", 0.0) == usage
+        assert autoswitch._project_five_hour(usage, "2", 10.0) == usage
+
+
+class TestBurstAndPollPlan:
+    def _entries(self, pct, at, next_at=None):
+        return {
+            "1": autoswitch.UsageEntry(last_good=_usage(pct), fetched_at=at, age_s=0.0, next_poll_at=next_at),
+            "2": autoswitch.UsageEntry(last_good=_usage(0), fetched_at=at, age_s=0.0),
+        }
+
+    def test_a_burst_then_a_slow_interval_keeps_the_burst_rate(self, temp_home):
+        # 2026-11-17 04:36-04:42: 64% -> 77% -> 79%, next reading 3 minutes later, then 100%.
+        h = _fleet(temp_home, "best")
+        t0 = h.clock.now
+        h.tick_with_entries(self._entries(64, t0))
+        h.clock.advance(60)
+        h.tick_with_entries(self._entries(77, t0 + 60))
+        h.clock.advance(60)
+        h.events.clear()
+        out = h.tick_with_entries(self._entries(79, t0 + 120, next_at=t0 + 300))
+        assert out is TickOutcome.SWITCHED and h.active_number() == 2
+
+
+class TestForcedSwitchLastFallback:
+    NOW = 1_000_000.0
+    WEEK_END = NOW + 84 * 3600.0
+
+    def _acc(self, num, plan, five, week):
+        return balance.Account(num, plan, balance.Window(five, self.NOW + 3600.0),
+                               balance.Window(week, self.WEEK_END))
+
+    def test_the_2026_11_16_stop_moves_to_the_max_at_91(self):
+        accounts = [self._acc(3, "pro", 100.0, 65.0), self._acc(4, "pro", 100.0, 36.0),
+                    self._acc(5, "max", 91.0, 19.0), self._acc(1, "pro", 0.0, 100.0)]
+        out = balance.decide(accounts, 3, self.NOW, None, None, True, threshold=99.0,
+                             candidate_margin=5.0)
+        assert isinstance(out, balance.SwitchTo) and out.account_id == 5 and out.reason == "threshold"
+
+    def test_an_account_at_or_over_the_line_is_still_refused(self):
+        accounts = [self._acc(3, "pro", 100.0, 65.0), self._acc(5, "max", 99.0, 19.0)]
+        out = balance.decide(accounts, 3, self.NOW, None, None, True, threshold=99.0)
+        assert isinstance(out, balance.Stay)
+
+    def test_a_proactive_move_keeps_the_headroom_gate(self):
+        accounts = [self._acc(3, "pro", 50.0, 90.0), self._acc(5, "max", 92.0, 0.0)]
+        out = balance.decide(accounts, 3, self.NOW, None, None, False, threshold=99.0)
+        assert not (isinstance(out, balance.SwitchTo) and out.account_id == 5)
+
+    def test_the_engine_moves_instead_of_staying_at_the_limit(self, temp_home):
+        h = _fleet(temp_home, "balanced")
+        with patch.object(pace_feed, "read_plan_for", lambda _sw, num, _e, _a: {"1": "pro", "2": "max"}[num]):
+            h.events.clear()
+            out = h.tick_with_usage({"1": _usage7(100, 65), "2": _usage7(91, 19)})
+        assert out is TickOutcome.SWITCHED and h.active_number() == 2

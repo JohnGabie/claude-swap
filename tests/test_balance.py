@@ -1272,3 +1272,17 @@ class TestRunwayRule:
         accounts = [self._acc(5, "max", 99.0, 18.0), self._acc(4, "pro", 29.0, 27.0)]
         out = self._decide(accounts, 5, at_threshold=True)
         assert isinstance(out, balance.SwitchTo) and out.account_id == 4 and out.reason == "threshold"
+
+
+def test_the_active_account_is_not_forced_out_below_the_user_line():
+    # Week of 2026-11-16: with a 99% line the balanced strategy left the
+    # active account at 91% because of the 10-point headroom gate.
+    now = 1_000_000.0
+    end = now + 84 * 3600.0
+    accounts = [balance.Account(1, "pro", balance.Window(91.0, now + 3600.0), balance.Window(30.0, end)),
+                balance.Account(2, "pro", balance.Window(0.0, now + 3600.0), balance.Window(30.0, end))]
+    out = balance.decide(accounts, 1, now, None, None, False, threshold=99.0)
+    assert isinstance(out, balance.Stay)
+    accounts[0] = balance.Account(1, "pro", balance.Window(99.0, now + 3600.0), balance.Window(30.0, end))
+    out = balance.decide(accounts, 1, now, None, None, False, threshold=99.0)
+    assert isinstance(out, balance.SwitchTo) and out.reason == "threshold"

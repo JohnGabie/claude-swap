@@ -317,6 +317,7 @@ def score_account(
     weekly_threshold: float | None = None,
     candidate_margin: float = DEFAULT_CANDIDATE_MARGIN,
     f: float = 1.0,
+    min_headroom: bool = True,
 ) -> Score:
     """Score one account. ``usable`` is False at or over a switch line.
 
@@ -327,6 +328,10 @@ def score_account(
 
     ``f`` is the height of the line of the fleet (``line_height``); the
     default 1.0 is the full line. ``score`` is the deficit at that ``f``.
+
+    ``min_headroom=False`` drops the ``MIN_HEADROOM_5H`` / ``MIN_HEADROOM_7D``
+    gates: the account then only needs to be below its lines. The forced
+    switch uses it as its last fallback.
     """
     margin = clamp_margin(candidate_margin)
     line7 = (weekly_threshold if weekly_threshold is not None else threshold) - margin
@@ -340,7 +345,7 @@ def score_account(
         return Score(account.id, False, 0.0, "unmeasured")
 
     head7 = 100.0 - pct7
-    if head7 < MIN_HEADROOM_7D:
+    if min_headroom and head7 < MIN_HEADROOM_7D:
         return Score(account.id, False, 0.0, "weekly spent", headroom_7d=head7,
                      blocked_until=reset7)
     if not pct7 < line7:
@@ -348,7 +353,7 @@ def score_account(
                      headroom_7d=head7, blocked_until=reset7)
     if has_5h_limit and pct5 is not None:
         head5 = 100.0 - pct5
-        if head5 < MIN_HEADROOM_5H:
+        if min_headroom and head5 < MIN_HEADROOM_5H:
             return Score(account.id, False, 0.0, "5h spent", headroom_7d=head7,
                          blocked_until=reset5)
         if not pct5 < line5:
@@ -377,14 +382,16 @@ def _rank_key(s: Score) -> tuple:
 
 def _ranked(accounts: Sequence[Account], now: float, *, threshold: float,
             weekly_threshold: float | None,
-            candidate_margin: float, f: float | None = None) -> list[Score]:
+            candidate_margin: float, f: float | None = None,
+            min_headroom: bool = True) -> list[Score]:
     """Usable accounts, best first (see ``_rank_key``)."""
     if f is None:
         f = line_height(accounts, now)
     scores = (
         score_account(a, now, threshold=threshold,
                       weekly_threshold=weekly_threshold,
-                      candidate_margin=candidate_margin, f=f)
+                      candidate_margin=candidate_margin, f=f,
+                      min_headroom=min_headroom)
         for a in accounts
     )
     return sorted((s for s in scores if s.usable), key=_rank_key)
@@ -422,10 +429,15 @@ def _active_score(accounts: Sequence[Account], active_id: int | None,
                   now: float, *, threshold: float,
                   weekly_threshold: float | None, f: float) -> Score | None:
     """Score of the active account, or ``None`` when it is not in the list."""
+    # The active account is judged against the user's lines only: the
+    # MIN_HEADROOM gates keep a move from landing on an almost full account,
+    # they are not a reason to leave one (week of 2026-11-16: with a 99% line
+    # the active account was forced out at 90-92% eight times).
     for a in accounts:
         if a.id == active_id:
             return score_account(a, now, threshold=threshold,
-                                 weekly_threshold=weekly_threshold, f=f)
+                                 weekly_threshold=weekly_threshold, f=f,
+                                 min_headroom=False)
     return None
 
 
@@ -514,6 +526,17 @@ def decide(
         if not targets:
             targets = [s for s in _ranked(accounts, now, **lines,
                                           candidate_margin=0.0, f=f)
+                       if s.id != active_id]
+        if not targets:
+            # Last fallback: any account below the user's own lines, even
+            # with less than MIN_HEADROOM_5H points of room. Staying on an
+            # account at its limit stops the work (2026-11-16 17:50-18:51
+            # and 2026-11-18 05:55-06:20: a Max account at 91% of a 99% line
+            # was refused for its 9 points of room while the active account
+            # sat at 100%).
+            targets = [s for s in _ranked(accounts, now, **lines,
+                                          candidate_margin=0.0, f=f,
+                                          min_headroom=False)
                        if s.id != active_id]
         if targets:
             return SwitchTo(targets[0].id, "threshold")

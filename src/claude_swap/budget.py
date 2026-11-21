@@ -31,12 +31,16 @@ SPEED_UP_RATIO = 0.75
 # Below this elapsed share a projection divides by almost nothing.
 MIN_ELAPSED_FOR_PROJECTION = 0.05
 DATA_STATUSES = frozenset({"ok", "stale"})
+# A reading older than this does not count: the account is listed, not measured.
+MAX_READING_AGE_S = 2 * 3600.0
 # Planning horizons: one day, three days, one week.
 HORIZON_HOURS = (24, 72, 168)
 
 NOTES = (
     "status: ok, no-accounts (nothing is set up) or unavailable (the usage source cannot be read).",
     "fetchedAt is the oldest provider read among the measured accounts; each account has its own.",
+    "An account with no reading in the last 2 hours is listed with measured false and "
+    "noRecentReading true: it is not counted as fuel.",
     "Per account: fiveHour and sevenDay carry usedPercent (0-100, the same number as pct) and "
     "resetsAt (ISO 8601). An account with no open 5-hour window has usedPercent 0 and no resetsAt.",
     "1 capacity unit = the weekly quota of one Pro account (pro 1, max 5, ultra 10).",
@@ -94,6 +98,13 @@ def _account(raw: dict, now: float, threshold: float, weekly_threshold: float) -
         "usableNow": False,
     }
     if raw.get("status") not in DATA_STATUSES:
+        return out
+    fetched = _ts(out["fetchedAt"])
+    if fetched is None or now - fetched > MAX_READING_AGE_S:
+        # An account the provider has not answered for hours is not fuel:
+        # its old reading can even look like a full new week (account 2,
+        # 2026-11-17 to 2026-11-21: no reading for 4 days, counted usable).
+        out["noRecentReading"] = True
         return out
     account = balance.Account(0, plan, _window(raw.get("fiveHour")), _window(raw.get("sevenDay")))
     weekly = balance._weekly(account, now)

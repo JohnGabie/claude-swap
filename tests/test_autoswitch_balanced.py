@@ -442,11 +442,13 @@ class TestBalancedForcedSwitch:
         assert [s.trigger for s in _switches(h)] == ["proactive"]
         assert h.state()["lastBalancedSwitchAt"] == T0
 
-    def test_gated_active_below_the_line_ignores_the_balanced_cooldown(
+    def test_active_below_the_line_is_not_forced_by_the_headroom_gate(
         self, temp_home
     ):
-        """Threshold 95: the active 5h window at 92 is below the engine line
-        but under the 10-point 5h gate of balance, so the switch is forced."""
+        """Threshold 95: the active 5h window at 92 is below the user's line.
+        The 10-point headroom gate of balance is for candidates only, so the
+        active account stays (week of 2026-11-16: with a 99% line it was
+        forced out at 90-92%)."""
         h = _balanced(temp_home, threshold=95.0)
         assert h.tick_with_usage(PRO_BETTER) is TickOutcome.SWITCHED
         h.events.clear()
@@ -456,9 +458,8 @@ class TestBalancedForcedSwitch:
             "4": _u(10, 50, 150), "5": _u(0, 0, 100),
         }
         outcome = h.tick_with_usage(usage)
-        assert outcome is TickOutcome.SWITCHED
-        assert [s.trigger for s in _switches(h)] == ["proactive"]
-        assert h.state()["lastBalancedSwitchAt"] == T0
+        assert outcome is TickOutcome.NO_ACTION
+        assert _switches(h) == [] and h.active_number() == 2
 
     def test_forced_with_nothing_usable_keeps_the_engine_reasons(self, temp_home):
         h = _balanced(temp_home)
