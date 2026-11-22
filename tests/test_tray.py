@@ -520,6 +520,26 @@ class _Thread:
         _Thread.started.append(self)
 
 
+class _Event(threading.Event):
+    """An Event that counts its set() and wait() calls: the refresh loop waits on ``wake`` only."""
+
+    def __init__(self):
+        super().__init__()
+        self.sets = self.waits = 0
+        _Event.made.append(self)
+
+    def set(self):
+        self.sets += 1
+        super().set()
+
+    def wait(self, timeout=None):
+        self.waits += 1
+        return super().wait(timeout)
+
+
+BUDGET = {"accounts": [{"id": 1, "plan": "max", "fetchedAt": "2020-01-01T00:00:00Z"}]}
+
+
 class TrayRun:
     def __init__(self, temp_home, tmp_path, monkeypatch):
         for name in ("run", "cfg"):
@@ -570,15 +590,20 @@ class TrayRun:
                              "pystray": pystray, "PIL": pil}.items():
             monkeypatch.setitem(sys.modules, name, module)
 
-        _Thread.started = []
-        monkeypatch.setattr(tray, "threading", types.SimpleNamespace(Event=threading.Event, Thread=_Thread))
+        _Thread.started, _Event.made = [], []
+        monkeypatch.setattr(tray, "threading", types.SimpleNamespace(Event=_Event, Thread=_Thread))
         monkeypatch.setattr(tray, "REFRESH_INTERVAL_S", 0)
         monkeypatch.setattr(pill, "work_area", lambda: AREA)
-        monkeypatch.setattr(budget_source, "current_budget", lambda *_a, **_k: {"accounts": []})
+        self.budget_calls = []
+        monkeypatch.setattr(budget_source, "current_budget",
+                            lambda *a, **_k: run.budget_calls.append(a) or json.loads(json.dumps(BUDGET)))
 
-        # The store has accounts 1-3 with an own weekly line on 2; the pill shows accounts 1 and 2 only.
+        # The store has accounts 1-3 with an own weekly line on 2 and an alias on 1; the pill shows 1 and 2 only.
         self.switcher = store(temp_home, 3)
         assert self.switcher.write_account_line("2", "weeklyThreshold", 92)["ok"]
+        data = self.switcher._get_sequence_data()
+        data["accounts"]["1"]["alias"] = "work"
+        self.switcher._write_json(self.switcher.sequence_file, data)
         set_setting(Path(self.switcher.backup_dir), "autoswitch.weeklyThreshold", "97")
         self.cards = pill_cards((1, 2))
         snaps = iter([{"accounts": self.cards}])
@@ -597,6 +622,9 @@ class TrayRun:
         refresh = next(t.target for t in _Thread.started if t.target.__name__ == "refresh_loop")
         with pytest.raises(_Stop):
             refresh()  # one pass, then the second snapshot ends the loop
+        waited = [e for e in _Event.made if e.waits]
+        assert len(waited) == 1
+        self.wake = waited[0]  # the Event the refresh loop waits on
         self.ctl = self.windows["cswap pill"].kw["js_api"]._c
         self.bridge = self.windows["cswap pill"].kw["js_api"]
         self.lines = self.windows["cswap lines"]
@@ -644,11 +672,16 @@ def test_run_gear_toggles_the_lines_window(tray_run):
 def test_run_on_lines_checks_the_num_against_the_pill(tray_run):
     s = tray_run.switcher
     before = Path(s.sequence_file).read_bytes()
+    wake = tray_run.wake
+    sets = wake.sets
     assert tray_run.bridge.set_account_line("3", "five", 80) == refused()  # in the store, not in the pill
-    assert Path(s.sequence_file).read_bytes() == before
+    assert Path(s.sequence_file).read_bytes() == before and wake.sets == sets
     assert tray_run.bridge.set_account_line("1", "five", 80) == OK
     assert s.account_policies()["1"].threshold == 80.0
+    assert wake.sets == sets + 1  # a written account line asks the refresh loop for new cards
     assert tray_run.bridge.set_card_open(True) == OK and tray_run.ctl.settings.pill_card_limits_open is True
+    saved = tray.TraySettings.load(Path(s.backup_dir) / "tray_settings.json")
+    assert saved.pill_card_limits_open is True and wake.sets == sets + 1
 
 
 def test_run_lines_window_api_order_of_args(tray_run):
@@ -660,9 +693,12 @@ def test_run_lines_window_api_order_of_args(tray_run):
         {"num": "2", "five": 90.0, "week": 92.0, "own5": False, "ownWeek": True, "use5": 20.0, "useWeek": 10.0}]
     tray_run.ctl.settings.auto_switch = True
     assert api.get()["autoSwitch"] is True
+    sets = tray_run.wake.sets
     assert api.set("five", 85) == OK and tray_run.view.log == []  # save_settings writes; nothing hides
     assert load_settings(Path(tray_run.switcher.backup_dir)).threshold == 85.0
+    assert tray_run.wake.sets == sets + 1  # a saved general line asks the refresh loop for new lines
     assert api.close() == OK and tray_run.view.log[-1] == ("hide",)  # close() hides the window
+    assert tray_run.wake.sets == sets + 1
 
 
 def test_run_lines_window_closing_hides_and_quit_destroys_it(tray_run):
@@ -674,3 +710,29 @@ def test_run_lines_window_closing_hides_and_quit_destroys_it(tray_run):
     assert ("destroy", "cswap lines") in tray_run.log
     tray_run.view.log.clear()
     assert closing[0]() is None and tray_run.view.log == []  # while quitting, the window may close
+
+
+def test_run_refresh_passes_budget_aliases_time_and_latest(tray_run):
+    # refresh_pill gets current_budget, the switcher's aliases, the clock and the panel's shared `latest`
+    one = tray_run.ctl.cards[0]["budget"]
+    assert one["plan"] == "max" and one["alias"] == "work"
+    assert one["readAgeS"] > 365 * 86400  # the clock is now, not 0: the reading is from 2020
+    assert tray_run.ctl.fleet_data["sparkline24h"] == [0.0] * 24
+    assert len(tray_run.budget_calls) == 1
+    panel_api = tray_run.windows["cswap fleet"].kw["js_api"]
+    assert panel_api._budget() == BUDGET and len(tray_run.budget_calls) == 1  # the panel reuses the loop's budget
+
+
+def test_run_pill_controller_callbacks(tray_run, monkeypatch):
+    # on_change wakes the refresh loop, notify reaches say(), on_fleet toggles the panel
+    monkeypatch.setattr(desktop.DesktopApi, "switch", lambda _api, num: {"ok": False, "output": "boom " + num})
+    sets = tray_run.wake.sets
+    assert tray_run.bridge.switch("2") == {"ok": False}
+    assert tray_run.wake.sets == sets + 1
+    said = [t.args for t in _Thread.started if getattr(t.target, "__name__", "") == "send_notification"]
+    assert said == [("cswap", "boom 2")]
+    panel = tray_run.views.setdefault(tray_run.windows["cswap fleet"].uid, FakeView())
+    assert tray_run.bridge.fleet() == {"ok": True}
+    assert panel.log[:3] == [("show_all",), ("deiconify",), ("present",)]
+    assert panel.log[-1] == ("js", "window.fleetOpen&&window.fleetOpen()")
+    assert tray_run.view.log == []  # the lines window stays as it was
