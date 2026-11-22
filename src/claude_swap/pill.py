@@ -227,8 +227,9 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
 # ---- page ----------------------------------------------------------------------
 
 _THEME_CSS = """
-/* Ocean Sunset (FP2). spent: outer ring, 5-hour bars; avail: inner ring, weekly bars; warn and crit: status only. */
-:root{--bg:#000;--fg:#F4EEDB;--ink2:#CFC6A8;--dim:#8F8873;--track:#1E2426;--line:transparent;--grid:rgba(233,216,166,.08);
+/* Ocean Sunset (FP2). spent: outer ring, 5-hour bars; avail: inner ring, weekly bars; warn and crit: status only.
+   The account card is black in both themes (FP10), so it takes the dark values itself. */
+:root,#card{--bg:#000;--fg:#F4EEDB;--ink2:#CFC6A8;--dim:#8F8873;--track:#1E2426;--line:transparent;--grid:rgba(233,216,166,.08);
  --raised:#121A1C;--spent:#0A9396;--spent-track:#05282A;--avail:#94D2BD;--avail-track:#1D3A31;--warn:#EE9B00;--crit:#CF4332;
  --hover:#ffffff14}
 :root[data-theme=white]{--bg:#f6f5f1;--fg:#16161a;--ink2:#46464c;--dim:#6d6d74;--track:#dedcd5;--line:#cfcdc5;--grid:#cfcdc5;
@@ -299,7 +300,7 @@ body.folded .item,body.folded .add,body.folded .pill-square{transition:opacity .
 .add:hover{background:var(--hover);color:var(--fg)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .add.busy{animation:spin 1.2s steps(12) infinite}
-#card{position:absolute;visibility:hidden;opacity:0;background:var(--bg);border:1px solid var(--grid);border-radius:16px;
+#card{color:var(--fg);position:absolute;visibility:hidden;opacity:0;background:var(--bg);border:1px solid var(--grid);border-radius:16px;
  padding:16px 18px 18px;box-sizing:border-box;transform:translate(var(--cx,0),var(--cy,0)) scale(.97);transform-origin:var(--origin,center);
  transition:opacity .16s ease,transform .3s var(--ease),visibility 0s linear .3s}
 body.edge-right{--cx:8px;--origin:right center}body.edge-left{--cx:-8px;--origin:left center}
@@ -330,6 +331,7 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 .row{margin-bottom:12px}.row:last-child{margin-bottom:0}
 .top{display:flex;justify-content:space-between;color:var(--dim);font-size:11.5px;margin-bottom:5px}
 .bar{height:6px;border-radius:3px;background:var(--spent-track);overflow:hidden}
+.row.wk .bar{background:var(--avail-track)}.row.wk .bar i{background:var(--avail)}
 .bar i{display:block;height:100%;border-radius:3px;background:var(--c);transition:width .5s var(--ease)}
 .used{margin-top:4px;font-size:12px}
 .msg{color:var(--dim);font-size:12px;padding:6px 0}
@@ -345,8 +347,9 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const R5=17,R7=11.5,C5=2*Math.PI*R5,C7=2*Math.PI*R7;
 const lvl=p=>p==null?0:p<70?0:p<90?1:2; // FP2 level rule: spent below 70, warning 70-89, critical from 90
-const NAMES={'5h':'Current session','7d':'Weekly (all models)'};
-const resetText=t=>!t?'':/^resets/i.test(t)?t[0].toUpperCase()+t.slice(1):'Resets '+t;
+const NAMES={'5h':'Sess\\u00e3o de 5 h','7d':'Semana'}, VERB={'5h':'volta','7d':'renova'};
+// The tray's reset text is English ("in 1h", "resets Sun 05:59"): keep its time, say the verb in pt-BR
+const resetText=(t,l)=>!t?'':(VERB[l]||'volta')+' '+String(t).replace(/^resets\\s*/i,'').replace(/^in\\s+/i,'em ');
 // Both arcs always exist (an empty one has no length), so a reading arriving or changing animates rather than appearing.
 const dash=(c,p)=>`${p==null?0:c*Math.min(p,100)/100} ${c}`;
 const arc=(r,c,p,w,k)=>`<circle class=track cx=21 cy=21 r=${r} fill=none stroke-width=${w}></circle>`+
@@ -425,12 +428,12 @@ function cardHtml(it){
  const b=it.budget;
  const head=b
   ?`<div class=head><div class=t1>#${esc(it.num)}${b.alias?' '+esc(b.alias):''}${it.active?' \\u00b7 conta ativa':''}${it.disabled?' \\u00b7 pausada':''}</div><div class=t2>${esc([cap(b.plan),readAge(b.readAgeS)].filter(Boolean).join(' \\u00b7 '))}</div></div>`
-  :`<div class=head><div class=title>${esc(it.title)}</div><div class=tag>${esc(it.tag)}${it.disabled?' \\u00b7 paused':''}</div></div>`;
+  :`<div class=head><div class=t1>#${esc(it.num)}${it.disabled?' \\u00b7 pausada':''}</div><div class=t2>${esc(it.tag)}</div></div>`; // never the email (FP-D4)
  const alert=it.alert?`<div class=alert-msg>* ${esc(it.alert)}</div>`:'';
  if(!it.rows.length) return head+alert+(it.message?`<div class=msg>${esc(it.message)}</div>`:'');
- if(!b) return head+alert+it.rows.map(r=>`<div class="row l${lvl(r.pct)}"><div class=top><span>${esc(NAMES[r.label]||r.label)}</span><span>${esc(resetText(r.reset))}</span></div>
+ if(!b) return head+alert+it.rows.map(r=>`<div class="row ${r.label==='7d'?'wk':'l'+lvl(r.pct)}"><div class=top><span>${esc(NAMES[r.label]||r.label)}</span><span>${esc(resetText(r.reset,r.label))}</span></div>
   <div class=bar><i style="width:${Math.min(r.pct||0,100)}%"></i></div>
-  <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% used'}${r.age?' <span class=tag>'+esc(r.age)+'</span>':''}</div></div>`).join('');
+  <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% usado'}${r.age?' <span class=tag>'+esc(r.age)+'</span>':''}</div></div>`).join('');
  return head+alert+meters(it,b)+`<div class=foot><div><div class=l>Consumo agora</div><div class=v>${it.active&&typeof b.nowPerMin==='number'?tok(b.nowPerMin)+'/min':DASH}</div></div>
   <div><div class=l>1% desta conta \\u2248</div><div class=v>${typeof b.tokensPerPercent==='number'?tok(b.tokensPerPercent)+' tokens':DASH}</div></div></div>`;
 }

@@ -240,20 +240,22 @@ def test_page_script_passes_node_check(tmp_path):
 _DRIVER = textwrap.dedent("""
     // Loads the page script in a context where every DOM access is a no-op, then calls its pure functions.
     const vm = require('vm'), fs = require('fs');
+    const pre = process.argv[4] || '';
     const stub = () => new Proxy(function () {}, {
       get: (t, k) => k === Symbol.toPrimitive ? () => 0 : stub(), apply: () => stub(), set: () => true });
     const ctx = vm.createContext({ document: stub(), window: { addEventListener() {} }, requestAnimationFrame() {},
       setTimeout() {}, clearTimeout() {}, Date, Math, JSON });
+    if (pre) vm.runInContext(pre, ctx);
     vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
     const out = vm.runInContext(process.argv[3], ctx);
     process.stdout.write(JSON.stringify(out));
 """)
 
 
-def run_page(tmp_path, expr: str):
+def run_page(tmp_path, expr: str, pre: str = ""):
     (tmp_path / "page.js").write_text(page_script(), encoding="utf-8")
     (tmp_path / "driver.js").write_text(_DRIVER, encoding="utf-8")
-    run = subprocess.run(["node", str(tmp_path / "driver.js"), str(tmp_path / "page.js"), expr],
+    run = subprocess.run(["node", str(tmp_path / "driver.js"), str(tmp_path / "page.js"), expr, pre],
                          capture_output=True, text=True, timeout=30, env={**os.environ, "TZ": "UTC"})
     assert run.returncode == 0, run.stderr
     return json.loads(run.stdout)
@@ -320,18 +322,41 @@ def test_card_read_age_words(tmp_path):
 
 
 @needs_node
-def test_card_without_budget_keeps_todays_rows_in_the_new_style(tmp_path):
+def test_card_without_budget_keeps_the_rows_in_the_new_style_and_pt_br(tmp_path):
     html = card_html(tmp_path, item_for(nobudget=True))
-    assert "Current session" in html and "33% used" in html and "Sessão de 5 h" not in html
+    text = card_text(tmp_path, item_for(nobudget=True))
+    assert "Sess\u00e3o de 5 h" in text and "Semana" in text and "33% usado" in text and "95% usado" in text
+    assert "Current session" not in html and "Weekly" not in html and "used" not in text.replace("usado", "")
     assert "class=bar" in html and "Consumo agora" not in html
+    assert "#4" in text and "@" not in html  # never the email (FP-D4)
+    assert "volta em 1h" in text
+
+
+@needs_node
+def test_card_without_budget_paused_word_is_pt_br(tmp_path):
+    it = item_for(nobudget=True)
+    it["disabled"] = True
+    text = card_text(tmp_path, it)
+    assert "pausada" in text and "paused" not in text
+
+
+@needs_node
+def test_fallback_week_row_is_always_the_available_color(tmp_path):
+    html = card_html(tmp_path, item_for(five=95.0, week=95.0, nobudget=True))
+    five, week = html.split('<div class="row ')[1:]
+    assert five.startswith("l2") and week.startswith("wk") and "l2" not in week
+    css = pill.PILL_PAGE
+    assert ".row.wk .bar{background:var(--avail-track)}" in css and ".row.wk .bar i{background:var(--avail)}" in css
 
 
 @needs_node
 def test_card_of_an_account_with_no_reading_shows_its_message_and_no_bars(tmp_path):
-    it = item_for()
-    it.update(rows=[], message="Not signed in")
-    html = card_html(tmp_path, it)
-    assert "Not signed in" in html and "class=bar" not in html and "class=mb" not in html
+    for nobudget in (False, True):
+        it = item_for(nobudget=nobudget)
+        it.update(rows=[], message="Not signed in")
+        html = card_html(tmp_path, it)
+        assert "Not signed in" in html and "class=bar" not in html and "class=mb" not in html
+        assert "@" not in html and "#4" in html
 
 
 @needs_node
@@ -341,13 +366,39 @@ def test_card_bar_follows_the_level_rule_and_week_is_always_available(tmp_path):
     html = card_html(tmp_path, item_for(five=95.0, week=10.0, b={"projectedEndPct": 20.0}))
     five, week = html.split("Semana")
     assert "l2" in five and "l2" not in week
+    assert 'class="mb g"' in five and 'class="mb g"' not in week
+
+
+def _vars(selector: str) -> dict:
+    m = re.search(re.escape(selector) + r"\{(.*?)\}", pill._THEME_CSS, re.S)
+    assert m, selector
+    return dict(re.findall(r"--([\w-]+):\s*([^;]+?)\s*(?=;|--|$)", m.group(1).replace("\n", "").replace(";", ";")))
+
+
+DARK = {"bg": "#000", "fg": "#F4EEDB", "ink2": "#CFC6A8", "dim": "#8F8873", "track": "#1E2426",
+        "grid": "rgba(233,216,166,.08)", "raised": "#121A1C", "spent": "#0A9396", "spent-track": "#05282A",
+        "avail": "#94D2BD", "avail-track": "#1D3A31", "warn": "#EE9B00", "crit": "#CF4332"}
+WHITE = {"fg": "#16161a", "dim": "#6d6d74", "ink2": "#46464c", "track": "#dedcd5", "grid": "#cfcdc5", "raised": "#ebe9e2",
+         "spent": "#087A7D", "avail": "#2F8A6F", "warn": "#B87700", "crit": "#C0341F",
+         "spent-track": "#dedcd5", "avail-track": "#dedcd5"}
+
+
+def test_theme_css_holds_every_fp2_value_dark_and_white():
+    dark, white = _vars(":root,#card"), _vars(":root[data-theme=white]")
+    for k, v in DARK.items():
+        assert dark.get(k) == v, (k, dark.get(k))
+    for k, v in WHITE.items():
+        assert white.get(k) == v, (k, white.get(k))
+
+
+def test_account_card_is_black_in_both_themes():
+    # the dark values are set on #card itself, so the white theme on :root cannot reach it
+    assert ":root,#card{" in pill._THEME_CSS and "#card{" in pill.PILL_PAGE.replace(pill._THEME_CSS, "")
+    assert "color:var(--fg)" in re.search(r"#card\{[^}]*\}", pill.PILL_PAGE.replace(pill._THEME_CSS, "")).group(0)
 
 
 def test_page_ring_colors_come_from_the_palette_by_level():
     css = pill._THEME_CSS
-    for token in ("--spent:#0A9396", "--avail:#94D2BD", "--warn:#EE9B00", "--crit:#CF4332", "--track:#1E2426",
-                  "--spent:#087A7D", "--avail:#2F8A6F", "--warn:#B87700", "--crit:#C0341F", "--track:#dedcd5"):
-        assert token in css, token
     assert ".l0{--c:var(--spent)}" in css and ".l1{--c:var(--warn)}" in css and ".l2{--c:var(--crit)}" in css
     # the outer arc follows its level, the inner one is always the available color
     assert ".ring .arc.five{stroke:var(--c)}" in pill.PILL_PAGE
@@ -363,7 +414,6 @@ def test_page_keeps_sparkle_and_alert_colors():
 def test_page_draws_the_square_and_keeps_it_out_of_the_account_cells():
     page = pill.PILL_PAGE
     assert "pill-square" in page and "pywebview.api.fleet()" in page
-    assert "querySelectorAll('.item')" in page  # cellAt counts accounts only
     assert "class=item" not in re.search(r"function buildSquare.*?\n}", page, re.S).group(0)
     assert "P.square" in re.search(r"function placeCard.*?\n}", page, re.S).group(0)
 
@@ -382,7 +432,7 @@ def test_square_is_inside_the_pill_length_and_the_payload():
 
 def test_card_is_300_wide_and_the_window_has_room_for_it():
     assert pill.CARD_W == 300
-    assert pill.CARD_MAX_H >= 330
+    assert pill.CARD_MAX_H == 372  # measured: the tallest card is 329 px in Chrome, plus slack
 
 
 def test_payload_passes_the_card_budget_through():
@@ -409,24 +459,48 @@ def test_bridge_fleet_calls_on_fleet():
     pill.PillBridge(make_controller()).fleet()  # no handler: nothing happens
 
 
+def expected_square(edge, lay):
+    wx, wy = lay["win"][:2]
+    px, py, pw, ph = lay["pill"]
+    along = pill.FLARE + pill.PAD
+    if pill.is_vertical(edge):
+        return [wx + px + (pw - 46) // 2, wy + py + along, 46, 46]
+    return [wx + px + along, wy + py + (ph - 46) // 2, 46, 46]
+
+
 @pytest.mark.parametrize("edge", pill.EDGES)
 def test_panel_anchor_is_the_square_in_screen_pixels(edge, monkeypatch):
     monkeypatch.setattr(pill, "work_area", lambda: AREA)
     ctl = make_controller(edge)
     ctl.cards = [card(1), card(2)]
     a = ctl.panel_anchor()
-    lay = pill.window_layout(edge, 2, AREA)
-    wx, wy = lay["win"][:2]
-    px, py, pw, ph = lay["pill"]
-    sx, sy, sw, sh = a["square"]
-    assert a["edge"] == edge and a["area"] == list(AREA) and (sw, sh) == (46, 46)
-    along = pill.FLARE + pill.PAD
-    if pill.is_vertical(edge):
-        assert (sx, sy) == (wx + px + (pw - 46) // 2, wy + py + along)
-    else:
-        assert (sx, sy) == (wx + px + along, wy + py + (ph - 46) // 2)
-    ctl._placed = lay  # the placed layout wins when there is one
-    assert ctl.panel_anchor()["square"] == a["square"]
+    assert a["edge"] == edge and a["area"] == list(AREA)
+    assert a["square"] == expected_square(edge, pill.window_layout(edge, 2, AREA))
+
+
+@pytest.mark.parametrize("edge", pill.EDGES)
+def test_panel_anchor_follows_the_placed_layout(edge, monkeypatch):
+    monkeypatch.setattr(pill, "work_area", lambda: AREA)
+    ctl = make_controller(edge)
+    ctl.cards = [card(1), card(2)]
+    placed = pill.window_layout(edge, 2, (40, 70, 1400, 700))  # not what _layout() computes now
+    assert placed != pill.window_layout(edge, 2, AREA)
+    ctl._placed = placed
+    assert ctl.panel_anchor()["square"] == expected_square(edge, placed)
+
+
+def test_push_sends_the_fleet_to_the_page(monkeypatch):
+    monkeypatch.setattr(pill, "work_area", lambda: AREA)
+    ctl = make_controller()
+    sent = []
+    ctl._run_js = sent.append
+    ctl._loaded.set()
+    fleet = {"sparkline24h": [2.0] * 24, "pace": 91, "level": "warning"}
+    ctl.cards = [card(1)]
+    ctl.fleet_data = fleet
+    ctl._push()
+    assert len(sent) == 1 and sent[0].startswith("render(") and sent[0].endswith(")")
+    assert json.loads(sent[0][len("render("):-1])["fleet"] == fleet
 
 
 def test_controller_update_keeps_the_fleet_for_the_payload():
@@ -434,3 +508,47 @@ def test_controller_update_keeps_the_fleet_for_the_payload():
     fleet = {"sparkline24h": [1.0] * 24, "pace": 70, "level": "warning"}
     ctl.update([card(1)], fleet)
     assert ctl.fleet_data == fleet
+
+
+_PRE_CELLS = """
+  const rect = (l, t, w, h) => ({ getBoundingClientRect: () => ({ left: l, top: t, right: l + w, bottom: t + h }) });
+  const sq = rect(10, 8, 46, 46), cells = [rect(0, 66, 66, 66), rect(0, 132, 66, 66)];
+  const fakePill = { querySelectorAll: sel => [...(sel.includes('.pill-square') ? [sq] : []), ...(sel.includes('.item') ? cells : [])] };
+  document = { getElementById: id => id === 'pill' ? fakePill : { addEventListener() {} }, addEventListener() {}, documentElement: {}, body: {} };
+"""
+
+
+@needs_node
+def test_cell_at_skips_the_square_and_counts_accounts_only(tmp_path):
+    assert run_page(tmp_path, "[cellAt(30, 30), cellAt(30, 90), cellAt(30, 150), cellAt(500, 500)]", _PRE_CELLS) == [None, 0, 1, None]
+
+
+_PRE_SQUARE = """
+  const poly = { a: {}, setAttribute(k, v) { this.a[k] = v; } }, span = { textContent: '' };
+  const fakeSquare = { className: '', querySelector: s => s === 'polyline' ? poly : span };
+"""
+
+
+def square_view(tmp_path, fleet):
+    return run_page(tmp_path, "(applySquare(fakeSquare, %s), {cls: fakeSquare.className, text: span.textContent, pts: poly.a.points})"
+                    % json.dumps(fleet), _PRE_SQUARE)
+
+
+@needs_node
+def test_apply_square_shows_the_pace_and_the_level_class(tmp_path):
+    spark = [float(i) for i in range(24)]
+    assert square_view(tmp_path, {"sparkline24h": spark, "pace": 86, "level": "neutral"})["text"] == "86%"
+    assert square_view(tmp_path, {"sparkline24h": spark, "pace": 86, "level": "neutral"})["cls"] == "pill-square"
+    assert square_view(tmp_path, {"sparkline24h": spark, "pace": 70, "level": "warning"})["cls"] == "pill-square warning"
+    assert square_view(tmp_path, {"sparkline24h": spark, "pace": 120, "level": "critical"})["cls"] == "pill-square critical"
+    assert square_view(tmp_path, {"sparkline24h": spark, "pace": None, "level": "neutral"})["text"] == "\u2013"
+
+
+@needs_node
+def test_apply_square_draws_a_flat_line_with_no_history_and_the_data_otherwise(tmp_path):
+    for fleet in (None, {"sparkline24h": [0.0] * 24, "pace": None, "level": "neutral"}):
+        view = square_view(tmp_path, fleet)
+        ys = {pt.split(",")[1] for pt in view["pts"].split(" ")}
+        assert len(view["pts"].split(" ")) == 24 and ys == {"27.0"} and view["text"] == "\u2013"
+    pts = square_view(tmp_path, {"sparkline24h": [float(i) for i in range(24)], "pace": 1, "level": "neutral"})["pts"].split(" ")
+    assert pts[0].split(",")[1] == "27.0" and pts[-1].split(",")[1] == "7.0"  # the peak is the top of the line
