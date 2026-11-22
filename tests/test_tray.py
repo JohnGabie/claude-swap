@@ -2,10 +2,15 @@
 
 import json
 import logging
+import sys
+import threading
+import types
 from pathlib import Path
 
-from claude_swap import fleet_page, lines_page, pill, tray
-from claude_swap.settings import AutoSwitchSettings
+import pytest
+
+from claude_swap import budget_source, desktop, fleet_page, lines_page, pill, tray
+from claude_swap.settings import AutoSwitchSettings, load_settings, set_setting
 
 from tests.test_account_policy_store import PolicyStoreBase
 
@@ -466,3 +471,206 @@ def test_lines_payloads_have_no_identity(temp_home, tmp_path, monkeypatch):
     assert out[1]["accounts"][1]["week"] == 92.0  # the window did read the store
     for o in out:
         assert "@" not in json.dumps(o), o
+
+
+def test_on_lines_refuses_a_kind_of_the_wrong_type_without_a_warning(temp_home, tmp_path, caplog):
+    s = store(temp_home)
+    lines = Lines(s, tmp_path)
+    before = Path(s.sequence_file).read_bytes()
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        for kind in (["five"], {"five": 1}, 5):
+            assert lines.bridge.set_account_line("2", kind, 80) == refused(), kind
+    assert caplog.records == []  # a refusal, not a failure
+    assert Path(s.sequence_file).read_bytes() == before and lines.changes == []
+
+
+# ---- tray.run() wiring of the lines window and on_lines (SL3, SL6) --------------------------------
+# run() with fake webview, pystray, gi and PIL modules, in a temp home: no GUI starts and no real store is used.
+
+
+class _Hook:
+    def __init__(self):
+        self.fns = []
+
+    def __iadd__(self, fn):
+        self.fns.append(fn)
+        return self
+
+
+class _Win:
+    def __init__(self, title, kw, log):
+        self.title, self.kw, self.uid, self._log = title, kw, "uid-" + title, log
+        self.events = types.SimpleNamespace(closing=_Hook(), loaded=_Hook())
+
+    def destroy(self):
+        self._log.append(("destroy", self.title))
+
+
+class _Stop(Exception):
+    """Ends the refresh loop after one pass."""
+
+
+class _Thread:
+    """Records the threads run() starts; the test runs their targets itself."""
+
+    def __init__(self, target=None, args=(), daemon=None, **_kw):
+        self.target, self.args = target, args
+
+    def start(self):
+        _Thread.started.append(self)
+
+
+class TrayRun:
+    def __init__(self, temp_home, tmp_path, monkeypatch):
+        for name in ("run", "cfg"):
+            (tmp_path / name).mkdir()
+        monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / "run"))  # the single-instance lock
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "cfg"))  # the autostart entry
+        monkeypatch.setenv("GDK_BACKEND", "x11")  # run() sets these two with setdefault
+        monkeypatch.setenv("WEBKIT_DMABUF_RENDERER_FORCE_SHM", "1")
+        self.windows, self.log, self.views, self.icons, self.ready = {}, [], {}, [], []
+        run = self
+
+        webview = types.ModuleType("webview")
+        webview.create_window = lambda title, **kw: run.windows.setdefault(title, _Win(title, kw, run.log))
+        webview.start = lambda on_ready, icon=None: run.ready.append(on_ready)
+        webview.screens = [types.SimpleNamespace(x=0, y=0, width=1920, height=1080)]
+        webview.FileDialog = types.SimpleNamespace(SAVE=1, OPEN=0)
+        wgtk = types.ModuleType("webview.platforms.gtk")
+        wgtk.BrowserView = types.SimpleNamespace(instances=self.views)
+        gir = types.ModuleType("gi.repository")
+        gir.GLib = types.SimpleNamespace(idle_add=lambda fn: fn())
+
+        class Icon:
+            def __init__(self, name, image, title, menu):
+                self.menu, self.title = menu, title
+                run.icons.append(self)
+
+            def update_menu(self):
+                pass
+
+            def run_detached(self):
+                pass
+
+            def notify(self, *_a):
+                pass
+
+            def stop(self):
+                run.log.append(("stop", "icon"))
+
+        pystray = types.ModuleType("pystray")
+        pystray.Icon = Icon
+        pystray.Menu = type("Menu", (), {"SEPARATOR": None, "__init__": lambda self, *items: setattr(self, "items", items)})
+        pystray.MenuItem = lambda label, action=None, **_kw: (label, action)
+        image = types.SimpleNamespace(save=lambda *_a: None)
+        pil = types.ModuleType("PIL")
+        pil.Image = types.SimpleNamespace(open=lambda _p: image, new=lambda *_a: image)
+        for name, module in {"webview": webview, "webview.platforms": types.ModuleType("webview.platforms"),
+                             "webview.platforms.gtk": wgtk, "gi": types.ModuleType("gi"), "gi.repository": gir,
+                             "pystray": pystray, "PIL": pil}.items():
+            monkeypatch.setitem(sys.modules, name, module)
+
+        _Thread.started = []
+        monkeypatch.setattr(tray, "threading", types.SimpleNamespace(Event=threading.Event, Thread=_Thread))
+        monkeypatch.setattr(tray, "REFRESH_INTERVAL_S", 0)
+        monkeypatch.setattr(pill, "work_area", lambda: AREA)
+        monkeypatch.setattr(budget_source, "current_budget", lambda *_a, **_k: {"accounts": []})
+
+        # The store has accounts 1-3 with an own weekly line on 2; the pill shows accounts 1 and 2 only.
+        self.switcher = store(temp_home, 3)
+        assert self.switcher.write_account_line("2", "weeklyThreshold", 92)["ok"]
+        set_setting(Path(self.switcher.backup_dir), "autoswitch.weeklyThreshold", "97")
+        self.cards = pill_cards((1, 2))
+        snaps = iter([{"accounts": self.cards}])
+
+        def snapshot(_api):
+            try:
+                return next(snaps)
+            except StopIteration:
+                raise _Stop from None
+
+        monkeypatch.setattr(desktop.DesktopApi, "snapshot", snapshot)
+
+    def start(self):
+        assert tray.run(self.switcher) == 0
+        self.ready[0]()  # the webview ready callback: it starts the threads
+        refresh = next(t.target for t in _Thread.started if t.target.__name__ == "refresh_loop")
+        with pytest.raises(_Stop):
+            refresh()  # one pass, then the second snapshot ends the loop
+        self.ctl = self.windows["cswap pill"].kw["js_api"]._c
+        self.bridge = self.windows["cswap pill"].kw["js_api"]
+        self.lines = self.windows["cswap lines"]
+        self.view = self.views.setdefault(self.lines.uid, FakeView())
+        return self
+
+    def menu_action(self, label):
+        items = [i for i in self.icons[0].menu.items[0]() if i is not None]  # None: a separator
+        return next(action for text, action in items if text == label)
+
+
+@pytest.fixture
+def tray_run(temp_home, tmp_path, monkeypatch):
+    if sys.platform != "linux":
+        pytest.skip("the pill and the lines window are Linux only")
+    return TrayRun(temp_home, tmp_path, monkeypatch).start()
+
+
+def test_run_gives_the_pill_the_card_lines_and_the_general_lines(tray_run):
+    ctl = tray_run.ctl
+    assert [c["num"] for c in ctl.cards] == ["1", "2"]
+    assert [c["lines"] for c in ctl.cards] == [
+        {"five": 90.0, "week": 97.0, "own5": False, "ownWeek": False},
+        {"five": 90.0, "week": 92.0, "own5": False, "ownWeek": True}]
+    assert ctl.general_lines == {"five": 90.0, "week": 97.0}
+
+
+def test_run_creates_the_lines_window(tray_run):
+    kw = tray_run.lines.kw
+    assert {k: v for k, v in kw.items() if k not in ("html", "js_api")} == {
+        "width": 320, "height": 520, "resizable": False, "background_color": "#000000", "hidden": True}
+    assert kw["html"] == lines_page.LINES_PAGE and isinstance(kw["js_api"], lines_page.LinesWindowApi)
+
+
+def test_run_gear_toggles_the_lines_window(tray_run):
+    assert tray_run.bridge.lines_window() == OK  # the pill got on_lines: the first gear click opens
+    x, y = fleet_page.panel_position(tray_run.ctl.gear_anchor(), size=(320, 520))
+    assert tray_run.view.log == [("show_all",), ("deiconify",), ("present",), ("move", x, y),
+                                 ("js", "window.linesOpen&&window.linesOpen()")]
+    tray_run.view.log.clear()
+    assert tray_run.bridge.lines_window() == OK  # the second closes
+    assert tray_run.view.log == [("js", "window.linesClosed&&window.linesClosed()"), ("hide",)]
+
+
+def test_run_on_lines_checks_the_num_against_the_pill(tray_run):
+    s = tray_run.switcher
+    before = Path(s.sequence_file).read_bytes()
+    assert tray_run.bridge.set_account_line("3", "five", 80) == refused()  # in the store, not in the pill
+    assert Path(s.sequence_file).read_bytes() == before
+    assert tray_run.bridge.set_account_line("1", "five", 80) == OK
+    assert s.account_policies()["1"].threshold == 80.0
+    assert tray_run.bridge.set_card_open(True) == OK and tray_run.ctl.settings.pill_card_limits_open is True
+
+
+def test_run_lines_window_api_order_of_args(tray_run):
+    api = tray_run.lines.kw["js_api"]
+    got = api.get()  # core settings, policies, the tray's cards and the auto-switch state, each in its place
+    assert {k: got[k] for k in ("five", "week", "autoSwitch")} == {"five": 90.0, "week": 97.0, "autoSwitch": False}
+    assert got["accounts"] == [
+        {"num": "1", "five": 90.0, "week": 97.0, "own5": False, "ownWeek": False, "use5": 10.0, "useWeek": 5.0},
+        {"num": "2", "five": 90.0, "week": 92.0, "own5": False, "ownWeek": True, "use5": 20.0, "useWeek": 10.0}]
+    tray_run.ctl.settings.auto_switch = True
+    assert api.get()["autoSwitch"] is True
+    assert api.set("five", 85) == OK and tray_run.view.log == []  # save_settings writes; nothing hides
+    assert load_settings(Path(tray_run.switcher.backup_dir)).threshold == 85.0
+    assert api.close() == OK and tray_run.view.log[-1] == ("hide",)  # close() hides the window
+
+
+def test_run_lines_window_closing_hides_and_quit_destroys_it(tray_run):
+    closing = tray_run.lines.events.closing.fns
+    assert len(closing) == 1
+    assert closing[0]() is False  # the ✕ of the window manager hides it; the close is cancelled
+    assert tray_run.view.log == [("js", "window.linesClosed&&window.linesClosed()"), ("hide",)]
+    tray_run.menu_action("Quit")()
+    assert ("destroy", "cswap lines") in tray_run.log
+    tray_run.view.log.clear()
+    assert closing[0]() is None and tray_run.view.log == []  # while quitting, the window may close

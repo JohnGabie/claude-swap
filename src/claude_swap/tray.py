@@ -309,7 +309,7 @@ class LinesActions:
         num, kind = args.get("num"), args.get("kind")
         if not (isinstance(num, str) and num.isascii() and num.isdigit() and num in self._pill_nums()):
             return {"ok": False, "error": LINES_REFUSED}
-        if kind not in LINE_KINDS or "value" not in args or not _line_value_ok(args["value"]):
+        if not isinstance(kind, str) or kind not in LINE_KINDS or "value" not in args or not _line_value_ok(args["value"]):
             return {"ok": False, "error": LINES_REFUSED}
         res = self._write_line(num, LINE_KINDS[kind], args["value"])
         if res.get("ok") is True:
