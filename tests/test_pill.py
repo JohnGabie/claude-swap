@@ -936,6 +936,9 @@ def test_gear_in_layout(tmp_path):
                              " return {kinds, calls}; })(%s)" % json.dumps(p), _PRE_DOM + _PRE_LINES + _PRE_MADE)
     assert out["kinds"][-2:] == ["add", "gear"] and out["calls"] == [["window"]]
     assert "width:30px;height:30px;border-radius:8px" in re.search(r"\.gear\{[^}]*\}", pill.PILL_PAGE).group(0)
+    # vertical: 6 px above the gear; horizontal: 6 px left of it (gear_anchor counts on this)
+    assert "margin-top:6px}" in re.search(r"\.gear\{[^}]*\}", pill.PILL_PAGE).group(0)
+    assert ".horizontal .gear{margin:0 0 0 6px}" in pill.PILL_PAGE
 
 
 @pytest.mark.parametrize("edge", pill.EDGES)
@@ -1259,6 +1262,38 @@ def test_push_redraws_the_ticks_and_the_dot_of_a_kept_item(tmp_path):
     assert out["rebuilt"] == 0
     assert TICK.findall(out["ticks"]) == [("#16161a", "288.0"), ("#16161a", "342.0")]
     assert "own" not in out["before"].split() and "own" in out["cls"].split()
+
+
+@needs_node
+def test_error_line_follows_the_last_write_result(tmp_path):
+    # SL4: an ok write shows no error line; after a failed write, the next ok write removes it
+    out = run_live(tmp_path, "const answers = [true, false, true];"
+                             " pywebview.api.set_account_line = (n, k, v) => (calls.push([n, k, v]), sync({ok: answers.shift()}));"
+                             " render(p); showCard(0); fire(__cardL, 'click', {target: actEl('own')}); calls.length = 0;"
+                             " const drawn = []; for (const v of [80, 81, 82]) {"
+                             " fire(__cardL, 'change', {target: __range('five', v)}); drawn.push(__card.innerHTML); }"
+                             " return {calls, drawn};", lines_payload(open_=True))
+    assert out["calls"] == [["5", "five", 80], ["5", "five", 81], ["5", "five", 82]]
+    assert [ERR_LINE in html for html in out["drawn"]] == [False, True, False]
+
+
+@needs_node
+def test_push_without_an_account_line_drops_the_dot_class(tmp_path):
+    own = lines_payload(lines_card(lines={**LINES, "five": 80.0, "own5": True}))
+    out = run_live(tmp_path, "render(p); const before = __item().className;"
+                             " const q = JSON.parse(JSON.stringify(p)); q.items[0].lines = {five: 90, week: 95, own5: false, ownWeek: false};"
+                             " render(q); return [before, __item().className];", own)
+    assert "own" in out[0].split() and "own" not in out[1].split()
+
+
+@needs_node
+def test_back_to_general_shows_the_general_values(tmp_path):
+    # SL4: after "Voltar ao geral" the sliders and their labels show the general lines (90 and 95)
+    own = lines_card(lines={"five": 80.0, "week": 90.0, "own5": True, "ownWeek": True})
+    html = run_live(tmp_path, "render(p); showCard(0); fire(__cardL, 'click', {target: actEl('back')}); return __card.innerHTML;",
+                    lines_payload(own, open_=True))
+    assert re.findall(r'<input type=range [^>]*value="(\d+)" data-kind=(\w+)', html) == [("90", "five"), ("95", "week")]
+    assert '<span class="lv" data-v=five>90%</span>' in html and '<span class="lv" data-v=week>95%</span>' in html
 
 
 @pytest.mark.parametrize("answer", [None, ["ok"], "ok", True])
