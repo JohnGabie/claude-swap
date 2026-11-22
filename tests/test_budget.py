@@ -530,3 +530,86 @@ def test_an_account_with_no_recent_reading_is_not_fuel():
     assert b["fleet"]["usableNow"] == 1 and b["fleet"]["capacityUnits"] == 1.0
     assert b["fetchedAt"] == iso(NOW - 60)  # the old reading does not age the whole budget
     assert "1 of 2 accounts usable" in b["reason"]
+
+
+# ---- account lines (pill-switch-lines L2) ------------------------------------
+def test_budget_uses_account_weekly_line():
+    # S5. General lines 90 / 95: account 2 has its own 90 / 92, account 3 none.
+    b = build(acc(2, five=10.0, week=93.0), acc(3, five=10.0, week=93.0),
+              threshold=90.0, weekly_threshold=95.0,
+              account_lines={"2": (90.0, 92.0)})
+    two, three = b["accounts"]
+    assert two["usableNow"] is False and two["blockedBy"] == "sevenDay"
+    assert two["lines"] == {"fivePct": 90.0, "weeklyPct": 92.0, "own": True}
+    assert three["usableNow"] is True
+    assert three["lines"] == {"fivePct": 90.0, "weeklyPct": 95.0, "own": False}
+    assert b["schemaVersion"] == 1
+    assert b["fleet"]["thresholdPct"] == 90.0 and b["fleet"]["weeklyThresholdPct"] == 95.0
+    assert b["fleet"]["usableNow"] == 1
+
+
+def test_budget_account_five_hour_line_sets_headroom_and_block():
+    b = build(acc(1, five=70.0, week=10.0), acc(2, five=70.0, week=10.0),
+              threshold=90.0, weekly_threshold=95.0,
+              account_lines={"1": (60.0, None)})
+    one, two = b["accounts"]
+    assert one["usableNow"] is False and one["blockedBy"] == "fiveHour"
+    assert one["lines"] == {"fivePct": 60.0, "weeklyPct": 60.0, "own": True}
+    assert one["fiveHour"]["headroomPct"] == 0.0
+    assert two["usableNow"] is True and two["fiveHour"]["headroomPct"] == 20.0
+    c = build(acc(1, five=50.0, week=10.0), threshold=90.0,
+              account_lines={"1": (80.0, 99.0)})
+    assert c["accounts"][0]["fiveHour"]["headroomPct"] == 30.0
+
+
+def test_budget_without_account_lines_is_unchanged():
+    plain = build(acc(1, five=95.0, week=50.0), acc(2, week=93.0), acc(3, status="error"),
+                  threshold=90.0, weekly_threshold=95.0)
+    # Same numbers as before the lines: the usable flags and the headroom.
+    assert [a["usableNow"] for a in plain["accounts"]] == [False, True, False]
+    assert plain["accounts"][0]["fiveHour"]["headroomPct"] == 0.0
+    empty = build(acc(1, five=95.0, week=50.0), acc(2, week=93.0), acc(3, status="error"),
+                  threshold=90.0, weekly_threshold=95.0, account_lines={})
+    assert empty == plain
+    # No account line anywhere: no account claims one.
+    assert all(a["lines"]["own"] is False for a in plain["accounts"] if a["measured"])
+
+
+def test_budget_unmeasured_account_has_no_lines():
+    b = build(acc(1, status="error"), account_lines={"1": (60.0, 70.0)})
+    assert "lines" not in b["accounts"][0]
+
+
+def test_budget_source_reads_account_lines(monkeypatch, tmp_path):
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"autoswitch": {"threshold": 90.0, "weeklyThreshold": 95.0}}))
+    (tmp_path / "sequence.json").write_text(json.dumps({"accounts": {
+        "1": {"email": "x@example.com", "threshold": 60.0},
+        "2": {"email": "y@example.com", "weeklyThreshold": 92.0},
+        "3": {"email": "z@example.com"},
+    }}))
+    src = _fake_source(monkeypatch, tmp_path, {"accounts": [
+        acc(1, five=70.0, week=10.0), acc(2, five=10.0, week=93.0), acc(3, five=10.0, week=93.0)]})
+    b = src.current_budget(NOW, refresh_calibration=False)
+    one, two, three = b["accounts"]
+    assert one["lines"] == {"fivePct": 60.0, "weeklyPct": 95.0, "own": True}
+    assert one["usableNow"] is False
+    assert two["lines"] == {"fivePct": 90.0, "weeklyPct": 92.0, "own": True}
+    assert two["usableNow"] is False
+    assert three["lines"] == {"fivePct": 90.0, "weeklyPct": 95.0, "own": False}
+    assert three["usableNow"] is True
+    assert "example.com" not in json.dumps(b)
+
+
+def test_budget_source_store_error_falls_back(monkeypatch, tmp_path):
+    (tmp_path / "settings.json").write_text(json.dumps({"autoswitch": {"threshold": 90.0}}))
+    (tmp_path / "sequence.json").write_text("{ torn")
+    src = _fake_source(monkeypatch, tmp_path, {"accounts": [acc(1, five=10.0, week=50.0)]})
+    b = src.current_budget(NOW, refresh_calibration=False)
+    assert b["status"] == "ok"
+    assert b["accounts"][0]["lines"] == {"fivePct": 90.0, "weeklyPct": 90.0, "own": False}
+    # A missing file is the same: the general lines.
+    (tmp_path / "sequence.json").unlink()
+    b = src.current_budget(NOW, refresh_calibration=False)
+    assert b["accounts"][0]["lines"]["own"] is False
+    assert b["accounts"][0]["usableNow"] is True
