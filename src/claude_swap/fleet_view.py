@@ -8,7 +8,7 @@ Spec: fleet-panel-design FP3-FP9, FP12.
 from __future__ import annotations
 
 import math
-from datetime import date, datetime, time, timedelta, timezone, tzinfo
+from datetime import datetime, time, timedelta, timezone, tzinfo
 
 from . import budget as budget_mod
 
@@ -344,11 +344,13 @@ def _switches(decisions: list[dict], start: float, now: float, col: int, tz, log
     bars = [0] * len(starts)
     count = today = 0
     for t, d in _event_times(decisions, "switch"):
-        if d.get("dryRun") is True or not start <= t <= now:
+        if d.get("dryRun") is True or t > now:
             continue
-        count += 1
         if t >= midnight:
             today += 1
+        if t < start:
+            continue
+        count += 1
         i = _column_index(starts, t)
         if i is not None:
             bars[i] += 1
@@ -381,7 +383,8 @@ def _unused(budget: dict, decisions: list[dict], start: float, now: float, log_s
             for t, d in polls:
                 if t >= reset:
                     break
-                win = (d.get("windowsPct") or {}).get(str(num))
+                wins = d.get("windowsPct")
+                win = wins.get(str(num)) if isinstance(wins, dict) else None
                 pct = _num(win.get("7d")) if isinstance(win, dict) else None
                 if pct is not None:
                     reading = (t, pct)

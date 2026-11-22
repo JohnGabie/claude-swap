@@ -1,14 +1,13 @@
 """Fleet view data: pure functions from budget, usage history and decision log."""
 
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from claude_swap import fleet_view
 from claude_swap.fleet_view import build_fleet, model_label, square
 
-SP = ZoneInfo("America/Sao_Paulo")  # UTC-3, no DST in November
+SP = timezone(timedelta(hours=-3))  # Sao Paulo offset; a fixed zone needs no tzdata on Windows
 H = 3600
 NOW = datetime(2026, 11, 21, 22, 0, tzinfo=timezone.utc).timestamp()  # 19:00 in SP
 
@@ -399,3 +398,25 @@ def test_payload_keys_and_unknown_period():
     assert out["period"] == "7d"
     with pytest.raises(ValueError):
         fleet(period="2d")
+
+
+def test_switches_today_counts_since_local_midnight_in_every_period():
+    # local midnight (-03) of the 21st is 03:00Z; now is 22:00Z, so 10:00Z and 21:30Z are today,
+    # and 10:00Z is before the start of the 1h and 6h periods.
+    dec = [poll("2026-11-16T16:51:44Z", {}), switch("2026-11-21T10:00:00Z"), switch("2026-11-21T21:30:00Z"),
+           switch("2026-11-21T10:30:00Z", dry=True), switch("2026-11-21T02:00:00Z")]
+    for period in ("1h", "6h"):
+        s = fleet(decisions=dec, period=period)["switches"]
+        assert s["today"] == 2, period
+    assert fleet(decisions=dec, period="1h")["switches"]["count"] == 1
+    assert fleet(decisions=dec, period="6h")["switches"]["count"] == 1
+
+
+def test_unused_ignores_malformed_windows():
+    dec = unused_decisions() + [
+        poll("2026-11-21T12:56:00Z", ["not", "a", "dict"]),
+        poll("2026-11-21T12:57:00Z", {"3": "x", "2": None}),
+        {"event": "poll", "ts": "2026-11-21T12:58:00Z", "windowsPct": 7},
+    ]
+    u = fleet(unused_budget(), decisions=dec, period="7d")["unused"]
+    assert [i["account"] for i in u["items"]] == [2, 3] and u["items"][1]["pct"] == 5
