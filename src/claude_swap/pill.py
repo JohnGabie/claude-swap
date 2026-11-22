@@ -14,6 +14,7 @@ bottom is the only part that touches pywebview, imported lazily.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import threading
@@ -30,6 +31,8 @@ CORNER = 18  # radius of the pill's own convex corners
 PAD = 8  # space between the flares and the first/last item
 ITEM = 66  # one account along the edge: ring + percentage
 ADD = 36  # the "+" button
+GEAR_SIZE = 30  # the pill gear (SL3): a 30x30 button after "+"
+GEAR = 36  # what the gear adds to the pill's length, as ADD does
 SQUARE_SIZE, SQUARE_GAP = 46, 10  # the pill square (FP3) and the gap below it
 SQUARE = SQUARE_SIZE + SQUARE_GAP  # what the square adds to the pill's length
 CARD_W, ARROW, GAP = 300, 12, 6  # hover card width, its pointer, gap to the pill
@@ -49,7 +52,7 @@ def is_vertical(edge: str) -> bool:
 
 
 def pill_length(n_accounts: int) -> int:
-    return 2 * (FLARE + PAD) + SQUARE + n_accounts * ITEM + ADD
+    return 2 * (FLARE + PAD) + SQUARE + n_accounts * ITEM + ADD + GEAR
 
 
 def pill_size(edge: str, n_accounts: int) -> tuple[int, int]:
@@ -124,8 +127,8 @@ def pill_position(edge: str, size: tuple[int, int], area: tuple[int, int, int, i
     return ax + (aw - w) // 2, ay + ah - h
 
 
-# The tallest account card (FP10): head, alert line, two meters, the critical line, the footer; plus slack
-CARD_MAX_H = 372
+# The tallest account card: FP10's rows plus the open "Limites desta conta" section (SL4 replaces FP10's 372)
+CARD_MAX_H = 560
 
 
 def window_layout(edge: str, n_accounts: int, area: tuple[int, int, int, int], offset: int = 0) -> dict:
@@ -202,8 +205,52 @@ def _fleet(fleet) -> dict | None:
     return {k: fleet.get(k) for k in _FLEET_KEYS} if isinstance(fleet, dict) else None
 
 
+def _real(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _general_lines(value) -> dict | None:
+    """The effective general lines (SL6), or None when either value is not a number."""
+    if not isinstance(value, dict) or not all(_real(value.get(k)) for k in ("five", "week")):
+        return None
+    return {"five": float(value["five"]), "week": float(value["week"])}
+
+
+def _lines(card: dict) -> dict | None:
+    """An account's effective lines and which are its own (SL6), or None when a value has a bad type."""
+    v = card.get("lines")
+    if not isinstance(v, dict) or not all(_real(v.get(k)) for k in ("five", "week")):
+        return None
+    if not all(isinstance(v.get(k), bool) for k in ("own5", "ownWeek")):
+        return None
+    return {"five": float(v["five"]), "week": float(v["week"]), "own5": v["own5"], "ownWeek": v["ownWeek"]}
+
+
+def _item(c: dict) -> dict:
+    out = {
+        "num": c["num"],
+        "active": bool(c.get("active")),
+        "disabled": bool(c.get("disabled")),
+        "five": _pct(_row(c, "5h")),
+        "week": _pct(_row(c, "7d")),
+        "rank": rank_of(c),
+        "alert": c.get("alert") if isinstance(c.get("alert"), str) else None,
+        "message": c.get("message"),
+        "budget": _budget(c),
+        "rows": [
+            {"label": r["label"], "pct": r.get("pct"), "reset": r.get("reset"), "age": r.get("age")}
+            for r in c.get("rows") or ()
+        ],
+    }
+    lines = _lines(c)
+    if lines is not None:  # a bad value leaves the account without ticks and without the card section
+        out["lines"] = lines
+    return out
+
+
 def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: bool = False,
-                 reveal: bool = False, fleet: dict | None = None) -> dict:
+                 reveal: bool = False, fleet: dict | None = None, general_lines: dict | None = None,
+                 card_limits_open: bool = False) -> dict:
     """Everything the page needs to draw the pill and, on hover, each account's card.
 
     Only named fields reach the page. A card's ``title`` (alias or email) and ``tag`` (the organization
@@ -226,24 +273,10 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
         # The pill square's data (fleet_view.square), or None until the first reading
         "fleet": _fleet(fleet),
         "card": {"w": CARD_W, "arrow": ARROW, "gap": GAP},
-        "items": [
-            {
-                "num": c["num"],
-                "active": bool(c.get("active")),
-                "disabled": bool(c.get("disabled")),
-                "five": _pct(_row(c, "5h")),
-                "week": _pct(_row(c, "7d")),
-                "rank": rank_of(c),
-                "alert": c.get("alert") if isinstance(c.get("alert"), str) else None,
-                "message": c.get("message"),
-                "budget": _budget(c),
-                "rows": [
-                    {"label": r["label"], "pct": r.get("pct"), "reset": r.get("reset"), "age": r.get("age")}
-                    for r in c.get("rows") or ()
-                ],
-            }
-            for c in cards
-        ],
+        # The switch lines (SL6): the effective general lines and the card section's one open state
+        "generalLines": _general_lines(general_lines),
+        "cardLimitsOpen": card_limits_open is True,
+        "items": [_item(c) for c in cards],
     }
 
 
@@ -289,9 +322,9 @@ body.edge-bottom #rest{bottom:0;left:50%;translate:-50% 0;width:79px;height:10px
 #items{position:absolute;display:flex;align-items:center}
 .vertical #items{left:0;right:0;flex-direction:column}
 .horizontal #items{top:0;bottom:0;flex-direction:row}
-.item,.add,.pill-square{transition:opacity .12s ease calc(var(--i,0) * 14ms),translate .2s var(--ease) calc(var(--i,0) * 14ms),background .15s ease,color .15s ease}
-body.folded .item,body.folded .add,body.folded .pill-square{transition:opacity .18s ease calc(var(--i,0) * 28ms),translate .3s var(--ease) calc(var(--i,0) * 28ms)}
-#pill.entering .item,#pill.entering .add,#pill.entering .pill-square,body.folded .item,body.folded .add,body.folded .pill-square{opacity:0;translate:var(--slide)}
+.item,.add,.gear,.pill-square{transition:opacity .12s ease calc(var(--i,0) * 14ms),translate .2s var(--ease) calc(var(--i,0) * 14ms),background .15s ease,color .15s ease}
+body.folded .item,body.folded .add,body.folded .gear,body.folded .pill-square{transition:opacity .18s ease calc(var(--i,0) * 28ms),translate .3s var(--ease) calc(var(--i,0) * 28ms)}
+#pill.entering .item,#pill.entering .add,#pill.entering .gear,#pill.entering .pill-square,body.folded .item,body.folded .add,body.folded .gear,body.folded .pill-square{opacity:0;translate:var(--slide)}
 /* The pill square (FP3): 46 px, raised surface, the last 24 hours and the fleet pace. It is not an account. */
 .pill-square{flex:none;width:46px;height:46px;margin:0 0 10px;border-radius:10px;background:var(--raised);position:relative;
  box-shadow:inset 0 0 0 1px var(--grid);cursor:pointer}
@@ -321,6 +354,15 @@ body.folded .item,body.folded .add,body.folded .pill-square{transition:opacity .
 .add{width:30px;height:30px;border-radius:50%;display:flex;align-items:center;justify-content:center;
  color:var(--dim);font-size:20px;font-weight:400;cursor:pointer}
 .add:hover{background:var(--hover);color:var(--fg)}
+/* The pill gear (SL3): after "+", opens the lines window */
+.gear{flex:none;width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;
+ color:var(--dim);font-size:17px;cursor:pointer;margin-top:6px}
+.horizontal .gear{margin:0 0 0 6px}
+.gear:hover{background:var(--hover);color:var(--fg)}
+/* Account line (SL5): a warning dot at the top right of the ring, ringed in the pill background */
+.item .dot{display:none;position:absolute;top:2px;left:calc(50% + 15px);width:7px;height:7px;border-radius:50%;
+ background:var(--warn);box-shadow:0 0 0 2px var(--bg)}
+.item.own .dot{display:block}
 @keyframes spin{to{transform:rotate(360deg)}}
 .add.busy{animation:spin 1.2s steps(12) infinite}
 #card{color:var(--fg);position:absolute;visibility:hidden;opacity:0;background:var(--bg);border:1px solid var(--grid);border-radius:16px;
@@ -358,8 +400,42 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 .msg{color:var(--dim);font-size:12px;padding:6px 0}
 .alert{color:#e0a800;font-weight:700;margin-left:1px}
 .alert-msg{color:#e0a800;font-size:11.5px;line-height:1.35;margin:0 0 8px}
+/* "Limites desta conta" (SL4): the last row of the card, collapsed by default */
+.chip{margin-left:auto;font:600 11px/1 system-ui,sans-serif;padding:3px 7px;border-radius:6px;white-space:nowrap;
+ background:var(--raised);color:var(--dim)}
+.chip.own{background:rgba(238,155,0,.14);color:var(--warn)}
+.lim{margin:14px -18px -18px;border-top:1px solid var(--grid)}
+.lim-row{display:flex;align-items:center;gap:8px;padding:10px 18px;color:var(--ink2);font-size:12px;cursor:pointer;
+ border-radius:0 0 15px 15px}
+.lim.open .lim-row{border-radius:0}
+.lim-row:hover{background:var(--raised)}
+.lim .chev{color:var(--dim);display:inline-block;transition:transform .2s var(--ease)}
+.lim.open .chev{transform:rotate(90deg)}
+.lim-body{padding:2px 18px 14px}
+.seg{display:inline-flex;background:var(--raised);border-radius:8px;padding:2px;gap:2px;margin:4px 0 12px}
+.seg span{padding:3px 8px;border-radius:6px;color:var(--dim);font-size:11.5px;cursor:pointer}
+.seg span.on{background:var(--track);color:var(--fg);cursor:default}
+.sl-top{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
+.sl-top .k{color:var(--ink2);font-size:12px}
+.lv{font-size:15px;font-weight:650;font-variant-numeric:tabular-nums;color:var(--fg)}
+.lv.own{color:var(--warn)}
+.sl{position:relative;height:18px;margin-bottom:10px}
+.sl.five{--c:var(--spent)}.sl.week{--c:var(--avail)}
+.sl input{-webkit-appearance:none;appearance:none;position:absolute;left:0;top:0;width:100%;height:18px;margin:0;
+ background:transparent;cursor:pointer}
+.sl input::-webkit-slider-runnable-track{height:4px;border-radius:2px;
+ background:linear-gradient(to right,var(--c) 0 calc(8px + (100% - 16px) * var(--x)),var(--track) 0)}
+.sl input::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;margin-top:-6px;border-radius:50%;
+ background:var(--fg);box-shadow:0 0 0 3px rgba(244,238,219,.15)}
+.sl input:disabled{cursor:default;opacity:.4}
+.sl s{position:absolute;top:5px;width:2px;height:8px;margin-left:-1px;background:var(--ink2);opacity:.55;pointer-events:none;
+ left:calc(8px + (100% - 16px) * var(--x))}
+.sl s.gen{top:3px;height:12px;background:var(--fg);opacity:.9}
+.lim-err{color:var(--crit);font-size:11.5px;margin:0 0 8px}
+.lim-foot{display:flex;justify-content:space-between;align-items:center;color:var(--dim);font-size:11.5px}
+.lim-foot .lnk{color:var(--avail);cursor:pointer}
 @media (prefers-reduced-motion: reduce){
- #pill,body.folded #pill,#rest,.item,.add,body.folded .item,body.folded .add,.item .ring,.ring .arc,.ring .disc,#card,#card.show,#card.show.glide,.arrow,.bar i,.mb b,.pill-square,body.folded .pill-square{transition:none}
+ #pill,body.folded #pill,#rest,.item,.add,.gear,body.folded .item,body.folded .add,body.folded .gear,.item .ring,.ring .arc,.ring .disc,#card,#card.show,#card.show.glide,.arrow,.bar i,.mb b,.pill-square,body.folded .pill-square,.lim .chev{transition:none}
  .add.busy{animation:none}
 }
 </style>
@@ -390,12 +466,34 @@ function spark(rank){
  const k=SPARK[rank]; if(!k) return '';
  return `<svg width=${k[0]} height=${k[0]} viewBox="0 0 24 24"><path d="M12 2.6C12.5 8 16 11.5 21.4 12C16 12.5 12.5 16 12 21.4C11.5 16 8 12.5 2.6 12C8 11.5 11.5 8 12 2.6Z" fill="${k[1]}" stroke="${k[1]}" stroke-width="2.2" stroke-linejoin="round"/></svg>`;
 }
-function ring(it){
+// ---- switch lines (SL4, SL5) ----
+const LMIN=50, LMAX=99, INK={black:'#F4EEDB',white:'#16161a'}; // INK: --fg of each pill theme
+// A whole number has no decimal; any other value has one, with a comma ("99,9")
+const lnum=v=>{const r=Math.round(Number(v)*10)/10; return Number.isInteger(r)?String(r):r.toFixed(1).replace('.',',');};
+const hasOwn=l=>!!(l&&(l.own5||l.ownWeek));
+function chipText(l){
+ if(!hasOwn(l)) return 'geral';
+ return [l.own5?'5 h '+lnum(l.five):'',l.ownWeek?'sem '+lnum(l.week):''].filter(Boolean).join(' \\u00b7 ');
+}
+const chipHtml=l=>`<span class="chip${hasOwn(l)?' own':''}">${esc(chipText(l))}</span>`;
+// A line tick crosses the ring stroke and 1 px beyond each side, at line*3.6 degrees clockwise from the top
+function tick(r,w,line,ink){
+ return `<line class=tick x1=21 y1=${21-r-w/2-1} x2=21 y2=${21-r+w/2+1} stroke="${ink}" stroke-width=1.6 stroke-linecap=round transform="rotate(${(Number(line)*3.6).toFixed(1)} 21 21)"></line>`;
+}
+// The outer ring's tick at the effective 5-hour line, the inner ring's at the weekly one; none on a ring with no percent
+function ticks(it,theme){
+ const l=it.lines, ink=INK[theme]||INK.black; if(!l) return '';
+ return (it.five!=null?tick(R5,4,l.five,ink):'')+(it.week!=null?tick(R7,2.5,l.week,ink):'');
+}
+function ring(it,theme){
  return `<svg class=ring width=42 height=42 viewBox="0 0 42 42">`+arc(R5,C5,it.five,4,'five')+arc(R7,C7,it.week,2.5,'week')+
-  `<circle class=disc cx=21 cy=21 r=8.5 fill=none></circle><text class=num x=21 y=25 text-anchor=middle>${esc(it.num)}</text></svg>`;
+  `<g class=ticks>${ticks(it,theme)}</g><circle class=disc cx=21 cy=21 r=8.5 fill=none></circle><text class=num x=21 y=25 text-anchor=middle>${esc(it.num)}</text></svg>`;
 }
 const pill=document.getElementById('pill'), card=document.getElementById('card');
 let P=null, hoverId=null, hideTimer=null, foldTimer=null, busyAdd=false, folded=false, pointerIn=false, builtKey=null;
+// The card section (SL4): its open state, the "Pr\\u00f3prios" picks and write errors until the card hides, the slider drag
+let cardOpen=false, openSeen=null, dragging=false, cardStale=false;
+const ownPick=new Set(), lineErr=new Set();
 
 /* Hover and collapse follow Codenotch (MIT, vinzdg/codenotch, windows/codenotch/ui/notch.html): the card
    stays open while the pointer is over the pill or the card, and collapses after a 250 ms grace.
@@ -420,7 +518,11 @@ function pointerInHot(x,y){
  if(inRect(x,y,c,4))return true;
  return inRect(x,y,{left:Math.min(p.left,c.left),top:Math.min(p.top,c.top),right:Math.max(p.right,c.right),bottom:Math.max(p.bottom,c.bottom)},0);
 }
-function hideCard(){card.classList.remove('show','glide');hoverId=null;reportHot();}
+function hideCard(){
+ card.classList.remove('show','glide');hoverId=null;
+ ownPick.clear();lineErr.clear();dragging=false;cardStale=false;
+ reportHot();
+}
 function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(hideCard,250);}
 function showCard(i){
  clearTimeout(hideTimer);
@@ -465,15 +567,105 @@ function cardHtml(it){
  if(!it.rows.length) return head+alert+(it.message?`<div class=msg>${esc(it.message)}</div>`:'');
  if(!b) return head+alert+it.rows.map(r=>`<div class="row ${r.label==='7d'?'wk':'l'+lvl(r.pct)}"><div class=top><span>${esc(NAMES[r.label]||r.label)}</span><span>${esc(resetText(r.reset,r.label))}</span></div>
   <div class=bar><i style="width:${Math.min(r.pct||0,100)}%"></i></div>
-  <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% usado'}${ageText(r.age)?' <span class=age>'+esc(ageText(r.age))+'</span>':''}</div></div>`).join('');
+  <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% usado'}${ageText(r.age)?' <span class=age>'+esc(ageText(r.age))+'</span>':''}</div></div>`).join('')+limitsHtml(it);
  return head+alert+meters(it,b)+`<div class=foot><div><div class=l>Consumo agora</div><div class=v>${it.active&&typeof b.nowPerMin==='number'?tok(b.nowPerMin)+'/min':DASH}</div></div>
-  <div><div class=l>1% desta conta \\u2248</div><div class=v>${typeof b.tokensPerPercent==='number'?tok(b.tokensPerPercent)+' tokens':DASH}</div></div></div>`;
+  <div><div class=l>1% desta conta \\u2248</div><div class=v>${typeof b.tokensPerPercent==='number'?tok(b.tokensPerPercent)+' tokens':DASH}</div></div></div>`+limitsHtml(it);
+}
+// Slider position 0..1 of a percent on the 50-99 scale; a use below 50 sits at the left end
+const lfrac=v=>Math.max(0,Math.min(1,(Number(v)-LMIN)/(LMAX-LMIN))).toFixed(4);
+function lineSlider(it,kind,on){
+ const l=it.lines, v=l[kind], own=kind==='five'?l.own5:l.ownWeek, g=P&&P.generalLines, use=it[kind];
+ return `<div class=sl-top><span class=k>${NAMES[kind==='five'?'5h':'7d']}</span><span class="lv${own?' own':''}" data-v=${kind}>${lnum(v)}%</span></div>
+  <div class="sl ${kind}"><input type=range min=${LMIN} max=${LMAX} step=1 value="${Math.round(v)}" data-kind=${kind} data-num="${esc(it.num)}" style="--x:${lfrac(v)}"${on?'':' disabled'}>`+
+  (use!=null?`<s class=use style="--x:${lfrac(use)}"></s>`:'')+(g?`<s class=gen style="--x:${lfrac(g[kind])}"></s>`:'')+'</div>';
+}
+// "Limites desta conta" (SL4): the last row of a card with usage rows; open, the selector, two sliders and the foot
+function limitsHtml(it){
+ const l=it.lines; if(!l||!it.rows.length) return '';
+ const num=String(it.num), on=hasOwn(l)||ownPick.has(num), g=P&&P.generalLines;
+ const row=`<div class=lim-row data-act=toggle><span class=chev>\\u203a</span>Limites desta conta${chipHtml(l)}</div>`;
+ if(!cardOpen) return `<div class=lim>${row}</div>`;
+ return `<div class="lim open">${row}<div class=lim-body>
+  <div class=seg><span${on?'':' class=on'} data-act=general>Usar os gerais</span><span${on?' class=on':''} data-act=own>Pr\\u00f3prios</span></div>
+  ${lineSlider(it,'five',on)}${lineSlider(it,'week',on)}
+  ${lineErr.has(num)?'<div class=lim-err>N\\u00e3o foi poss\\u00edvel salvar o limite.</div>':''}
+  <div class=lim-foot><span>Geral: 5 h ${g?lnum(g.five)+'%':'\\u2013'} \\u00b7 sem ${g?lnum(g.week)+'%':'\\u2013'}</span><span class=lnk data-act=back>Voltar ao geral</span></div></div></div>`;
 }
 function renderCard(){
  const it=P.items[hoverId]; if(!it){hideCard();return;}
  card.innerHTML=cardHtml(it)+'<div class=arrow></div>';
  placeCard();
 }
+// A refresh push or a write result redraws the card, but never under a held slider (SL4): that waits for the release
+function refreshCard(){ if(dragging){cardStale=true;return;} renderCard(); }
+function dragStart(){dragging=true;}
+function dragEnd(){
+ if(!dragging) return;
+ dragging=false;
+ if(cardStale){cardStale=false; if(hoverId!==null) renderCard();}
+ reportHot();
+}
+// One write at a time: pywebview runs each bridge call on its own thread, and two writes of the store must not race
+const pendingWrites=[]; let writing=false;
+function nextWrite(){
+ const w=pendingWrites.shift(); if(!w){writing=false;return;}
+ writing=true;
+ const done=res=>{
+  if(!(res&&res.ok)) lineErr.add(w[0]);
+  const it=P&&hoverId!==null?P.items[hoverId]:null;
+  if(it&&String(it.num)===w[0]){refreshCard();reportHot();}
+  nextWrite();
+ };
+ let r=null;
+ try{ r=pywebview.api.set_account_line(w[0],w[1],w[2]); }catch(e){ r=null; }
+ if(r&&typeof r.then==='function') r.then(done,()=>done(null)); else done(null);
+}
+function writeLine(num,kind,value){ pendingWrites.push([num,kind,value]); if(!writing) nextWrite(); }
+// The section's clicks: open or close it, pick "Usar os gerais" or "Pr\\u00f3prios", "Voltar ao geral"
+function cardAct(act){
+ const it=P&&hoverId!==null?P.items[hoverId]:null; if(!it||!it.lines) return;
+ const num=String(it.num);
+ lineErr.delete(num);
+ if(act==='toggle'){
+  cardOpen=!cardOpen;
+  try{ pywebview.api.set_card_open(cardOpen); }catch(e){}
+ }else if(act==='own') ownPick.add(num); // enables the sliders, writes nothing
+ else if(act==='general'||act==='back'){ // both clear the two account lines
+  ownPick.delete(num);
+  if(hasOwn(it.lines)){
+   const g=P.generalLines;
+   it.lines.own5=it.lines.ownWeek=false;
+   if(g){it.lines.five=g.five;it.lines.week=g.week;}
+   writeLine(num,'five',null); writeLine(num,'week',null);
+  }
+ }else return;
+ refreshCard(); reportHot(); // the card's height changed: the input region must cover all of it
+}
+function onCardClick(e){
+ const el=e&&e.target&&e.target.closest?e.target.closest('[data-act]'):null;
+ if(el&&el.dataset.act) cardAct(el.dataset.act);
+}
+// A drag moves the shown value only; the release (change) writes that slider's own key
+function onCardInput(e){
+ const t=e&&e.target, d=t&&t.dataset; if(!d||(d.kind!=='five'&&d.kind!=='week')) return;
+ t.style.setProperty('--x',lfrac(t.value));
+ const lv=card.querySelector('.lv[data-v='+d.kind+']'); if(lv) lv.textContent=lnum(t.value)+'%';
+}
+function onCardChange(e){
+ const t=e&&e.target, d=t&&t.dataset; if(!d||(d.kind!=='five'&&d.kind!=='week')||!d.num) return;
+ const v=Number(t.value), num=String(d.num); if(!Number.isFinite(v)) return;
+ const it=P&&P.items.find(x=>String(x.num)===num);
+ if(it&&it.lines){ it.lines[d.kind]=v; it.lines[d.kind==='five'?'own5':'ownWeek']=true; } // shown now; the next push confirms it
+ lineErr.delete(num);
+ writeLine(num,d.kind,v);
+ dragEnd();
+}
+card.addEventListener('click',onCardClick);
+card.addEventListener('input',onCardInput);
+card.addEventListener('change',onCardChange);
+card.addEventListener('pointerdown',e=>{const d=e.target&&e.target.dataset; if(d&&d.kind) dragStart();});
+// The change event comes after pointerup in the same release, so the redraw waits one turn and cannot drop it
+document.addEventListener('pointerup',()=>{ if(dragging) setTimeout(dragEnd,0); });
 // Show first, then place: the card's height is only known once it has content (Codenotch's placeCard).
 function placeCard(){
  const [lx,ly,lw,lh]=P.layout.pill, [,,W,H]=P.layout.win, {w:cw,arrow:A,gap:G}=P.card;
@@ -552,10 +744,10 @@ document.addEventListener('mousemove',e=>{
   clearTimeout(hideTimer);
   const i=cellAt(e.clientX,e.clientY);
   if(i!==null&&i!==hoverId) showCard(i);
- }else if(card.classList.contains('show')) scheduleHide();
+ }else if(card.classList.contains('show')&&!dragging) scheduleHide(); // a held slider may go past the card's edge
 });
 document.addEventListener('mouseout',e=>{
- if(!e.relatedTarget){ pointerIn=false; scheduleFold(); if(card.classList.contains('show')) scheduleHide(); }
+ if(!e.relatedTarget){ pointerIn=false; scheduleFold(); if(card.classList.contains('show')&&!dragging) scheduleHide(); }
 });
 // Called by the native GTK crossing events (which own their own 250 ms leave grace).
 window.addEventListener('pywebviewready',reportHot); // the first reports can precede the bridge
@@ -567,7 +759,8 @@ window.codenotchPointer=inside=>{
 
 const items=document.getElementById('items');
 function applyItem(d,it){
- d.className=d.className.replace(/\\b(l[0-2]|active|off)\\b/g,'').trim()+' l'+lvl(it.five)+(it.active?' active':'')+(it.disabled?' off':'');
+ d.className=d.className.replace(/\\b(l[0-2]|active|off|own)\\b/g,'').trim()+' l'+lvl(it.five)+(it.active?' active':'')+(it.disabled?' off':'')+(hasOwn(it.lines)?' own':'');
+ const tk=d.querySelector('.ticks'); if(tk) tk.innerHTML=ticks(it,P?P.theme:'black');
  for(const [k,p,c] of [['five',it.five,C5],['week',it.week,C7]]){
   const el=d.querySelector('.arc.'+k); if(el) el.setAttribute('stroke-dasharray',dash(c,p));
  }
@@ -597,7 +790,7 @@ function build(p){
   const d=document.createElement('div');
   d.className='item'; d.style.setProperty('--i',i+1);
   d.style.width=d.style.height=p.item+'px';
-  d.innerHTML=ring(it)+'<span class=pct></span>';
+  d.innerHTML=ring(it,p.theme)+'<i class=dot></i><span class=pct></span>';
   d.onclick=()=>{d.classList.add('pressed');pywebview.api.switch(it.num).then(()=>d.classList.remove('pressed'));};
   applyItem(d,it);
   items.appendChild(d);
@@ -607,6 +800,11 @@ function build(p){
  a.onclick=()=>{if(busyAdd)return;busyAdd=true;a.classList.add('busy');
   pywebview.api.add().then(()=>{busyAdd=false;a.classList.remove('busy');});};
  items.appendChild(a);
+ // The pill gear (SL3): after "+", opens or closes the lines window
+ const gr=document.createElement('div');gr.className='gear';gr.textContent='\\u2699\\ufe0e';gr.title='Limites de troca';
+ gr.style.setProperty('--i',p.items.length+2);
+ gr.onclick=()=>{pywebview.api.lines_window();};
+ items.appendChild(gr);
  pill.classList.add('entering');
  requestAnimationFrame(()=>requestAnimationFrame(()=>pill.classList.remove('entering')));
 }
@@ -628,7 +826,8 @@ function render(p){
  if(key!==builtKey){ build(p); builtKey=key; }
  else [...items.querySelectorAll('.item')].forEach((d,i)=>applyItem(d,p.items[i]));
  applySquare(items.querySelector('.pill-square'),p.fleet);
- if(hoverId!==null){ if(hoverId<p.items.length) renderCard(); else hideCard(); }
+ if(p.cardLimitsOpen!==openSeen){openSeen=p.cardLimitsOpen;cardOpen=p.cardLimitsOpen===true;} // a local toggle waits for the saved value
+ if(hoverId!==null){ if(hoverId<p.items.length) refreshCard(); else hideCard(); }
  if(p.reveal){ unfold(); reportHot(); foldTimer=setTimeout(()=>{if(foldAllowed())setFolded(true);},REVEAL_MS); return; }
  reportHot();
  scheduleFold();
@@ -706,6 +905,16 @@ class PillBridge:
     def fleet(self):
         return self._c.fleet()
 
+    # The switch lines (SL6): the gear and the card section ask the tray through on_lines
+    def lines_window(self):
+        return self._c.lines("toggle_window", {})
+
+    def set_account_line(self, num, kind, value):
+        return self._c.lines("set_account_line", {"num": num, "kind": kind, "value": value})
+
+    def set_card_open(self, open):
+        return self._c.lines("set_card_open", {"open": open})
+
 
 class PillController:
     """Owns the pill window and keeps it in step with the account cards.
@@ -715,14 +924,16 @@ class PillController:
     changed edge/theme only needs ``relayout()``.
     """
 
-    def __init__(self, webview, api, settings, on_change, notify, on_fleet=None):
+    def __init__(self, webview, api, settings, on_change, notify, on_fleet=None, on_lines=None):
         self._wv = webview
         self._api = api
         self.settings = settings
         self._on_change = on_change
         self._notify = notify
         self._on_fleet = on_fleet
+        self._on_lines = on_lines  # on_lines(action, args) -> dict, owned by the tray (SL6)
         self.fleet_data: dict | None = None  # the pill square's data (fleet_view.square)
+        self.general_lines: dict | None = None  # the effective general lines (SL6)
         self.cards: list[dict] = []
         self.window = None
         self._hot: list[list[float]] = []
@@ -754,11 +965,12 @@ class PillController:
         else:
             _gtk_call(self.window, lambda w: w.hide())
 
-    def update(self, cards: list[dict], fleet: dict | None = None) -> None:
+    def update(self, cards: list[dict], fleet: dict | None = None, general_lines: dict | None = None) -> None:
         """New account data from the tray's refresh loop."""
         resized = len(cards) != len(self.cards)
         self.cards = list(cards)
         self.fleet_data = fleet
+        self.general_lines = general_lines
         if not self._visible:
             return
         # Also when the layout moved under us: a bar came up, or a monitor changed.
@@ -791,6 +1003,19 @@ class PillController:
             x, y = wx + px + along, wy + py + (ph - SQUARE_SIZE) // 2
         return {"edge": edge, "square": [x, y, SQUARE_SIZE, SQUARE_SIZE], "area": list(self._area())}
 
+    def gear_anchor(self) -> dict:
+        """Where the lines window goes: as ``panel_anchor``, with the gear's rectangle as ``square`` (SL3)."""
+        lay = self._placed or self._layout()
+        edge = normalize_edge(self.settings.pill_edge)
+        wx, wy = lay["win"][:2]
+        px, py, pw, ph = lay["pill"]
+        along = FLARE + PAD + SQUARE + len(self.cards) * ITEM + ADD  # the gear comes after "+"
+        if is_vertical(edge):
+            x, y = wx + px + (pw - GEAR_SIZE) // 2, wy + py + along
+        else:
+            x, y = wx + px + along, wy + py + (ph - GEAR_SIZE) // 2
+        return {"edge": edge, "square": [x, y, GEAR_SIZE, GEAR_SIZE], "area": list(self._area())}
+
     def _screen_area(self):
         s = self._wv.screens[0]
         return s.x, s.y, s.width, s.height
@@ -801,7 +1026,8 @@ class PillController:
         edge = normalize_edge(self.settings.pill_edge)
         payload = pill_payload(self.cards, edge, normalize_theme(self.settings.pill_theme), self._layout(),
                                fold=bool(getattr(self.settings, "pill_fold", False)), reveal=reveal,
-                               fleet=self.fleet_data)
+                               fleet=self.fleet_data, general_lines=self.general_lines,
+                               card_limits_open=getattr(self.settings, "pill_card_limits_open", False))
         self._run_js("render(%s)" % json.dumps(payload))
 
     def _run_js(self, script: str) -> None:
@@ -843,6 +1069,13 @@ class PillController:
         if self._on_fleet is not None:
             self._on_fleet()
         return {"ok": True}
+
+    def lines(self, action: str, args: dict) -> dict:
+        """The gear or the card section asked for a lines action; the tray checks and runs it."""
+        if self._on_lines is None:
+            return {"ok": False}
+        res = self._on_lines(action, args)
+        return res if isinstance(res, dict) else {"ok": False}
 
     def add_account(self) -> dict:
         self._notify("cswap", "Opening your browser to sign in. Your current account stays active.")

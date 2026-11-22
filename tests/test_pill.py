@@ -435,7 +435,7 @@ def test_page_draws_the_square_and_keeps_it_out_of_the_account_cells():
 
 def test_square_is_inside_the_pill_length_and_the_payload():
     assert pill.SQUARE == 56
-    assert pill.pill_length(0) == 2 * (pill.FLARE + pill.PAD) + pill.SQUARE + pill.ADD
+    assert pill.pill_length(0) == 2 * (pill.FLARE + pill.PAD) + pill.SQUARE + pill.ADD + pill.GEAR
     assert pill.pill_length(3) - pill.pill_length(2) == pill.ITEM
     lay = pill.window_layout("right", 2, AREA)
     fleet = {"sparkline24h": [0.0] * 24, "pace": 86, "level": "neutral"}
@@ -447,7 +447,7 @@ def test_square_is_inside_the_pill_length_and_the_payload():
 
 def test_card_is_300_wide_and_the_window_has_room_for_it():
     assert pill.CARD_W == 300
-    assert pill.CARD_MAX_H == 372  # measured: the tallest card is 329 px in Chrome, plus slack
+    assert pill.CARD_MAX_H == 560  # SL4 replaces FP10's 372: the card has the open "Limites desta conta" section
 
 
 def test_payload_passes_the_card_budget_through():
@@ -747,3 +747,275 @@ def test_fallback_age_is_pt_br_for_each_form_of_format_age(tmp_path, age_s, sour
     good = {"five_hour": window(), "seven_day": window()}
     assert data.format_age(age_s) == source
     assert fallback_texts(tmp_path, UsageEntry(last_good=good, age_s=age_s))[2] == used
+
+
+# ---- switch lines in the pill (SL3 gear, SL4 card section, SL5 chip and ticks, SL6 contract) ----
+
+LINES = {"five": 90.0, "week": 95.0, "own5": False, "ownWeek": False}
+GENERAL = {"five": 90.0, "week": 95.0}
+
+
+def lines_card(num=5, five=48.0, week=81.0, lines=LINES, active=True, b=True):
+    c = card(num, five, week, active=active)
+    if b:
+        c["budget"] = budget()
+    if lines is not None:
+        c["lines"] = dict(lines) if isinstance(lines, dict) else lines
+    return c
+
+
+def lines_payload(*cards, general=GENERAL, open_=False, theme="black"):
+    cards = list(cards) or [lines_card()]
+    lay = pill.window_layout("right", len(cards), AREA)
+    return pill.pill_payload(cards, "right", theme, lay, general_lines=general, card_limits_open=open_)
+
+
+# A bridge whose calls answer at once, so a test sees the whole chain of a click in one run.
+_PRE_LINES = """
+  var calls = [], hot = 0;
+  const sync = v => ({ then(f) { f(v); return this; } });
+  pywebview = { api: {
+    set_account_line(n, k, v) { calls.push([n, k, v]); return sync({ ok: true, error: null }); },
+    set_card_open(o) { calls.push(['open', o]); return sync({ ok: true }); },
+    lines_window() { calls.push(['window']); return sync({ ok: true }); },
+    set_hot() { hot++; }, fleet() {}, add() { return sync({}); }, switch() { return sync({}); } } };
+  window.pywebview = pywebview;
+"""
+
+
+def run_lines(tmp_path, expr, payload):
+    return run_page(tmp_path, "(p => {%s})(%s)" % (expr, json.dumps(payload)), _PRE_DOM + _PRE_LINES)
+
+
+def text_of(html):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+
+
+TICK = re.compile(r'<line class=tick [^>]*stroke="([^"]+)"[^>]*rotate\(([\d.]+) 21 21\)')
+
+
+@needs_node
+def test_ring_tick_angles(tmp_path):
+    # S10: the outer tick at the 5-hour line, the inner tick at the weekly line, line * 3.6 degrees
+    it = lines_payload(lines_card(five=40.0, week=30.0, lines={**LINES, "five": 90.0, "week": 95.0}))["items"][0]
+    assert TICK.findall(run_page(tmp_path, "ring(%s, 'black')" % json.dumps(it))) == [("#F4EEDB", "324.0"), ("#F4EEDB", "342.0")]
+    assert {c for c, _ in TICK.findall(run_page(tmp_path, "ring(%s, 'white')" % json.dumps(it)))} == {"#16161a"}
+    # a ring with no percent has no tick; an item with no lines has none at all
+    no_five = {**it, "five": None}
+    assert TICK.findall(run_page(tmp_path, "ring(%s, 'black')" % json.dumps(no_five))) == [("#F4EEDB", "342.0")]
+    bare = {k: v for k, v in it.items() if k != "lines"}
+    assert TICK.findall(run_page(tmp_path, "ring(%s, 'black')" % json.dumps(bare))) == []
+
+
+@needs_node
+def test_own_line_dot_class(tmp_path):
+    # SL5: an account with any account line gets the warning dot (the item's "own" class)
+    pre = "const fd = { className: 'item', querySelector: () => ({ setAttribute() {}, innerHTML: '' }) };"
+    own = lines_payload(lines_card(lines={**LINES, "ownWeek": True, "week": 85.0}))["items"][0]
+    general = lines_payload(lines_card())["items"][0]
+    assert "own" in run_page(tmp_path, "(applyItem(fd, %s), fd.className)" % json.dumps(own), pre).split()
+    assert "own" not in run_page(tmp_path, "(applyItem(fd, %s), fd.className)" % json.dumps(general), pre).split()
+    assert ".item.own .dot{display:block}" in pill.PILL_PAGE and "box-shadow:0 0 0 2px var(--bg)" in pill.PILL_PAGE
+
+
+@pytest.mark.parametrize("bad", [
+    {**LINES, "five": "80"}, {**LINES, "week": None}, {**LINES, "own5": 1}, {**LINES, "ownWeek": "true"},
+    {**LINES, "five": True}, {**LINES, "five": float("nan")}, {k: v for k, v in LINES.items() if k != "own5"},
+    "five=80", [90, 95], 7,
+])
+def test_pill_payload_drops_bad_lines(bad):
+    payload = lines_payload(lines_card(lines=bad), general={"five": "90", "week": 95.0}, open_="yes")
+    assert "lines" not in payload["items"][0]
+    assert payload["generalLines"] is None and payload["cardLimitsOpen"] is False
+    good = lines_payload(lines_card(lines={**LINES, "five": 80, "own5": True, "extra": "x"}))
+    assert good["items"][0]["lines"] == {"five": 80.0, "week": 95.0, "own5": True, "ownWeek": False}
+    assert good["generalLines"] == GENERAL and good["cardLimitsOpen"] is False
+    assert lines_payload(lines_card(), open_=True)["cardLimitsOpen"] is True
+
+
+@needs_node
+def test_card_limits_section_collapsed(tmp_path):
+    # S14 code side: the card keeps its rows, adds "Limites desta conta" with the chip "geral", no slider
+    p = lines_payload()
+    out = run_lines(tmp_path, "const first = cardHtml(p.items[0]); render(p); return [first, cardHtml(p.items[0])];", p)
+    for html in out:
+        text = text_of(html)
+        for want in ("Consumo agora", "1% desta conta ≈", "Limites desta conta", "geral"):
+            assert want in text, want
+        assert "type=range" not in html and "Usar os gerais" not in html
+        assert text.index("1% desta conta") < text.index("Limites desta conta")
+    # a card with only a message has no row; a card without budget rows keeps it
+    msg = lines_payload(lines_card())["items"][0]
+    msg.update(rows=[], message="Not signed in")
+    assert "Limites desta conta" not in run_page(tmp_path, "cardHtml(%s)" % json.dumps(msg))
+    nob = lines_payload(lines_card(b=False))["items"][0]
+    assert "Limites desta conta" in run_page(tmp_path, "cardHtml(%s)" % json.dumps(nob))
+
+
+def ranges(html):
+    return re.findall(r"<input type=range[^>]*>", html)
+
+
+@needs_node
+def test_card_limits_section_open(tmp_path):
+    # S15 code side: a click opens the section, "Usar os gerais" is selected, both sliders are disabled
+    p = lines_payload()
+    out = run_lines(tmp_path, "render(p); showCard(0); calls.length = 0; const h0 = hot; cardAct('toggle');"
+                              " return {html: cardHtml(p.items[0]), calls, hot: hot - h0};", p)
+    assert out["calls"] == [["open", True]] and out["hot"] >= 1
+    html = out["html"]
+    assert "<span class=on data-act=general>Usar os gerais</span>" in html
+    assert "<span data-act=own>Próprios</span>" in html
+    sliders = ranges(html)
+    assert len(sliders) == 2 and all(" disabled" in s for s in sliders)
+    assert "min=50 max=99 step=1" in sliders[0] and "data-kind=five" in sliders[0] and "data-kind=week" in sliders[1]
+    assert "Geral: 5 h 90% · sem 95%" in text_of(html) and "Voltar ao geral" in html
+    # the payload's open state opens it too; "Próprios" enables the sliders and writes nothing
+    out = run_lines(tmp_path, "render(p); showCard(0); calls.length = 0; cardAct('own');"
+                              " return {html: cardHtml(p.items[0]), calls};", lines_payload(open_=True))
+    assert out["calls"] == [] and "<span class=on data-act=own>Próprios</span>" in out["html"]
+    assert [" disabled" in s for s in ranges(out["html"])] == [False, False]
+
+
+@needs_node
+def test_card_own_line_writes_on_release(tmp_path):
+    # S16 code side: a drag (input events) writes nothing; the release (change event) writes one key
+    ev = "{target: {dataset: {kind: 'week', num: '5'}, value: '90', style: {setProperty() {}}}}"
+    out = run_lines(tmp_path, "render(p); showCard(0); cardAct('own'); calls.length = 0;"
+                              " onCardInput(%s); const afterInput = calls.slice(); onCardChange(%s);"
+                              " return {afterInput, calls, html: cardHtml(p.items[0])};" % (ev, ev),
+                    lines_payload(open_=True))
+    assert out["afterInput"] == []
+    assert out["calls"] == [["5", "week", 90]]
+    assert '<span class="chip own">sem 90</span>' in out["html"]
+    assert '<span class="lv own" data-v=week>90%</span>' in out["html"]
+
+
+@needs_node
+@pytest.mark.parametrize("act", ["back", "general"])
+def test_card_back_to_general(tmp_path, act):
+    # S17 code side: "Voltar ao geral" and "Usar os gerais" both clear the two account lines
+    own = lines_card(lines={"five": 80.0, "week": 90.0, "own5": True, "ownWeek": True})
+    out = run_lines(tmp_path, "render(p); showCard(0); calls.length = 0; cardAct('%s');"
+                              " return {calls, html: cardHtml(p.items[0])};" % act, lines_payload(own, open_=True))
+    assert out["calls"] == [["5", "five", None], ["5", "week", None]]
+    assert '<span class="chip">geral</span>' in out["html"]
+
+
+@needs_node
+def test_line_chip_text(tmp_path):
+    cases = [
+        {"five": 80, "week": 90, "own5": True, "ownWeek": False},
+        {"five": 90, "week": 99.9, "own5": False, "ownWeek": True},
+        {"five": 80, "week": 90, "own5": True, "ownWeek": True},
+        {"five": 82.5, "week": 90, "own5": True, "ownWeek": False},
+        {"five": 90, "week": 95, "own5": False, "ownWeek": False},
+    ]
+    assert run_page(tmp_path, "%s.map(l => chipText(l))" % json.dumps(cases)) == [
+        "5 h 80", "sem 99,9", "5 h 80 · sem 90", "5 h 82,5", "geral"]
+    css = pill.PILL_PAGE
+    assert ".chip.own{background:rgba(238,155,0,.14);color:var(--warn)}" in css
+    assert "background:var(--raised);color:var(--dim)" in css
+
+
+_PRE_MADE = """
+  var __made = [];
+  document.createElement = () => { const n = __node(); __made.push(n); return n; };
+"""
+
+
+@needs_node
+def test_gear_in_layout(tmp_path):
+    # SL3: the gear adds GEAR = 36 px after "+", and its click asks for the lines window
+    assert pill.GEAR == 36
+    for n in (0, 1, 6):
+        assert pill.pill_length(n) == 2 * (pill.FLARE + pill.PAD) + pill.SQUARE + n * pill.ITEM + pill.ADD + 36
+    p = lines_payload()
+    out = run_page(tmp_path, "(p => { render(p); const kinds = __made.map(n => n.className);"
+                             " const g = __made.find(n => n.className === 'gear'); calls.length = 0; g.onclick();"
+                             " return {kinds, calls}; })(%s)" % json.dumps(p), _PRE_DOM + _PRE_LINES + _PRE_MADE)
+    assert out["kinds"][-2:] == ["add", "gear"] and out["calls"] == [["window"]]
+    assert "width:30px;height:30px;border-radius:8px" in re.search(r"\.gear\{[^}]*\}", pill.PILL_PAGE).group(0)
+
+
+@pytest.mark.parametrize("edge", pill.EDGES)
+def test_gear_anchor_is_the_gear_in_screen_pixels(edge, monkeypatch):
+    monkeypatch.setattr(pill, "work_area", lambda: AREA)
+    ctl = make_controller(edge)
+    ctl.cards = [card(1), card(2)]
+    lay = pill.window_layout(edge, 2, AREA)
+    wx, wy = lay["win"][:2]
+    px, py, pw, ph = lay["pill"]
+    along = pill.FLARE + pill.PAD + pill.SQUARE + 2 * pill.ITEM + pill.ADD
+    want = ([wx + px + (pw - 30) // 2, wy + py + along, 30, 30] if pill.is_vertical(edge)
+            else [wx + px + along, wy + py + (ph - 30) // 2, 30, 30])
+    a = ctl.gear_anchor()
+    assert a == {"edge": edge, "square": want, "area": list(AREA)}
+    # the gear ends GEAR - 30 = 6 px before the pill's padded end
+    end = (wy + py + ph if pill.is_vertical(edge) else wx + px + pw) - pill.FLARE - pill.PAD
+    assert (a["square"][1] if pill.is_vertical(edge) else a["square"][0]) + 30 + 6 == end
+
+
+def test_bridge_lines_calls_on_lines():
+    seen = []
+    ctl = pill.PillController(None, None, make_controller().settings, lambda: None, lambda *a: None,
+                              on_lines=lambda action, args: seen.append((action, args)) or {"ok": True, "error": None})
+    bridge = pill.PillBridge(ctl)
+    assert bridge.lines_window() == {"ok": True, "error": None}
+    assert bridge.set_account_line("5", "week", 90) == {"ok": True, "error": None}
+    assert bridge.set_card_open(True) == {"ok": True, "error": None}
+    assert seen == [("toggle_window", {}), ("set_account_line", {"num": "5", "kind": "week", "value": 90}),
+                    ("set_card_open", {"open": True})]
+    alone = pill.PillBridge(make_controller())
+    assert [alone.lines_window(), alone.set_account_line("5", "five", 80), alone.set_card_open(False)] == [{"ok": False}] * 3
+
+
+def test_push_sends_general_lines_and_card_open(monkeypatch):
+    monkeypatch.setattr(pill, "work_area", lambda: AREA)
+    ctl = make_controller()
+    ctl.settings.pill_card_limits_open = True
+    sent = []
+    ctl._run_js = sent.append
+    ctl._loaded.set()
+    ctl._visible = True
+    ctl.cards = [lines_card()]
+    ctl._placed = ctl._layout()
+    ctl.update([lines_card()], general_lines=GENERAL)
+    payload = json.loads(sent[-1][len("render("):-1])
+    assert payload["generalLines"] == GENERAL and payload["cardLimitsOpen"] is True
+    assert payload["items"][0]["lines"] == LINES
+
+
+@needs_node
+def test_no_rebuild_during_drag(tmp_path):
+    # SL4: a refresh push leaves the card alone while a slider is held, and applies on release
+    p = lines_payload(open_=True)
+    out = run_lines(tmp_path, "render(p); showCard(0); cardAct('own');"
+                              " const q = JSON.parse(JSON.stringify(p)); q.items[0].rows[0].pct = 77; q.items[0].five = 77;"
+                              " dragStart(); const n = __wrote.length; render(q); const during = __wrote.slice(n);"
+                              " dragEnd(); const after = __wrote.slice(n);"
+                              " const want = cardHtml(q.items[0]) + '<div class=arrow></div>';"
+                              " return {during: during.includes(want), after: after.includes(want),"
+                              " own: want.includes('class=on data-act=own'), seen: want.includes('77%')};", p)
+    assert out == {"during": False, "after": True, "own": True, "seen": True}  # the "Próprios" pick survives the push
+
+
+FAKE_ID = "a@example.com"
+
+
+@needs_node
+def test_pill_lines_payload_has_no_identity(tmp_path):
+    # S9 pill part: email, org name and an alias that holds an email never reach the payload or the page
+    cards = []
+    for n, lines in enumerate([LINES, {**LINES, "own5": True, "five": 80.0}, {**LINES, "ownWeek": True}], 1):
+        c = lines_card(num=n, lines={**lines, "email": FAKE_ID, "alias": FAKE_ID}, active=n == 1)
+        c.update(title=f"#{n}  {FAKE_ID}", tag=f"{FAKE_ID}'s Organization", email=FAKE_ID, org_name=FAKE_ID)
+        c["budget"] = budget(alias=FAKE_ID)
+        cards.append(c)
+    payload = lines_payload(*cards, general={**GENERAL, "email": FAKE_ID}, open_=True)
+    sent = json.dumps(payload)
+    assert "@" not in sent
+    out = run_lines(tmp_path, "render(p); const html = p.items.map((it, i) => (showCard(i), cardAct('own'), cardHtml(it)));"
+                              " return {html, wrote: __wrote};", payload)
+    assert len(out["html"]) == 3 and all("Limites desta conta" in h and "type=range" in h for h in out["html"])
+    assert [t for t in [*out["html"], *out["wrote"]] if "@" in t or "Organization" in t] == []
