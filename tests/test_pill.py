@@ -1019,3 +1019,100 @@ def test_pill_lines_payload_has_no_identity(tmp_path):
                               " return {html, wrote: __wrote};", payload)
     assert len(out["html"]) == 3 and all("Limites desta conta" in h and "type=range" in h for h in out["html"])
     assert [t for t in [*out["html"], *out["wrote"]] if "@" in t or "Organization" in t] == []
+
+
+GENERAL_ON = "<span class=on data-act=general>Usar os gerais</span>"
+OWN_ON = "<span class=on data-act=own>Próprios</span>"
+
+
+@needs_node
+@pytest.mark.parametrize("act", ["back", "general"])
+def test_clear_without_an_account_line_writes_nothing(tmp_path, act):
+    # SL4: with no account line there is nothing to clear; the click only drops the "Próprios" pick
+    out = run_lines(tmp_path, "render(p); showCard(0); cardAct('own'); calls.length = 0; cardAct('%s');"
+                              " return {calls, html: cardHtml(p.items[0])};" % act, lines_payload(open_=True))
+    assert out["calls"] == [] and GENERAL_ON in out["html"]
+
+
+@needs_node
+def test_own_pick_is_forgotten_when_the_card_hides(tmp_path):
+    # SL4: the "Próprios" pick lives in page memory until the card hides
+    out = run_lines(tmp_path, "render(p); showCard(0); cardAct('own'); const before = cardHtml(p.items[0]);"
+                              " hideCard(); showCard(0); return [before, cardHtml(p.items[0])];", lines_payload(open_=True))
+    before, after = out
+    assert OWN_ON in before and [" disabled" in s for s in ranges(before)] == [False, False]
+    assert GENERAL_ON in after and [" disabled" in s for s in ranges(after)] == [True, True]
+
+
+ERR_LINE = "<div class=lim-err>Não foi possível salvar o limite.</div>"
+
+
+@needs_node
+def test_write_error_shows_one_critical_line_until_the_next_action(tmp_path):
+    # SL4: a failed write shows one line in the section; a new action removes it
+    ev = "{target: {dataset: {kind: 'five', num: '5'}, value: '80', style: {setProperty() {}}}}"
+    out = run_lines(tmp_path, "pywebview.api.set_account_line = (n, k, v) => (calls.push([n, k, v]), sync({ok: false}));"
+                              " render(p); showCard(0); cardAct('own'); onCardChange(%s); const failed = cardHtml(p.items[0]);"
+                              " cardAct('own'); return {calls, failed, next: cardHtml(p.items[0])};" % ev,
+                    lines_payload(open_=True))
+    assert out["calls"] == [["5", "five", 80]]
+    assert out["failed"].count(ERR_LINE) == 1 and ".lim-err{color:var(--crit)" in pill.PILL_PAGE
+    assert ERR_LINE not in out["next"]
+
+
+def marks(html, kind):
+    """{"use": --x, "gen": --x} of the marks on one slider of the card section."""
+    part = html.split(f'<div class="sl {kind}">')[1].split("</div>")[0]
+    return dict(re.findall(r'<s class=(use|gen) style="--x:([-\d.]+)"></s>', part))
+
+
+@needs_node
+def test_slider_marks_sit_at_the_use_and_the_general_line(tmp_path):
+    # SL4: a use below 50 sits at the left end (above 99 at the right end); the general mark is at the general line
+    p = lines_payload(lines_card(five=48.0, week=100.0), open_=True)
+    html = run_lines(tmp_path, "render(p); return cardHtml(p.items[0]);", p)
+    assert marks(html, "five") == {"use": "0.0000", "gen": "0.8163"}  # (90 - 50) / 49
+    assert marks(html, "week") == {"use": "1.0000", "gen": "0.9184"}  # (95 - 50) / 49
+
+
+@needs_node
+def test_writes_run_one_at_a_time(tmp_path):
+    # Each bridge call runs on its own thread: the second clear waits until the first answers
+    own = lines_card(lines={"five": 80.0, "week": 90.0, "own5": True, "ownWeek": True})
+    out = run_lines(tmp_path, "const pend = []; pywebview.api.set_account_line = (n, k, v) =>"
+                              " (calls.push([n, k, v]), {then(f) { pend.push(f); }});"
+                              " render(p); showCard(0); calls.length = 0; cardAct('back'); const first = calls.slice();"
+                              " pend.shift()({ok: true}); const second = calls.slice(); pend.shift()({ok: true});"
+                              " return {first, second, left: pend.length};", lines_payload(own, open_=True))
+    assert out == {"first": [["5", "five", None]], "second": [["5", "five", None], ["5", "week", None]], "left": 0}
+
+
+@needs_node
+def test_local_toggle_survives_a_push_of_the_old_stored_value(tmp_path):
+    # SL4: the toggle is shown at once; a push that still holds the old stored value does not close it again
+    out = run_lines(tmp_path, "render(p); showCard(0); cardAct('toggle'); render(p); const stale = cardHtml(p.items[0]);"
+                              " render({...p, cardLimitsOpen: true}); const saved = cardHtml(p.items[0]);"
+                              " render({...p, cardLimitsOpen: false}); return [stale, saved, cardHtml(p.items[0])];",
+                    lines_payload(open_=False))
+    stale, saved, closed_elsewhere = out
+    assert "type=range" in stale and "type=range" in saved
+    assert "type=range" not in closed_elsewhere  # a new stored value still wins
+
+
+_PRE_EVENTS = """
+  var __handlers = {}, __timers = [];
+  document.addEventListener = (t, f) => { __handlers[t] = f; };
+  setTimeout = f => { __timers.push(f); return 0; };
+"""
+
+
+@needs_node
+@pytest.mark.parametrize("event", ["mousemove", "mouseout"])
+def test_a_held_slider_does_not_hide_the_card(tmp_path, event):
+    # SL4: a drag may go past the card's edge; the card hides only when no slider is held
+    ev = "{clientX: 5000, clientY: 5000, relatedTarget: null}"
+    out = run_page(tmp_path, "(p => { render(p); showCard(0); dragStart(); __timers.length = 0; __handlers['%s'](%s);"
+                             " const during = __timers.filter(f => f === hideCard).length; dragEnd(); __timers.length = 0;"
+                             " __handlers['%s'](%s); return {during, after: __timers.filter(f => f === hideCard).length}; })(%s)"
+                   % (event, ev, event, ev, json.dumps(lines_payload(open_=True))), _PRE_DOM + _PRE_LINES + _PRE_EVENTS)
+    assert out == {"during": 0, "after": 1}
