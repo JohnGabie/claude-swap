@@ -1116,3 +1116,154 @@ def test_a_held_slider_does_not_hide_the_card(tmp_path, event):
                              " __handlers['%s'](%s); return {during, after: __timers.filter(f => f === hideCard).length}; })(%s)"
                    % (event, ev, event, ev, json.dumps(lines_payload(open_=True))), _PRE_DOM + _PRE_LINES + _PRE_EVENTS)
     assert out == {"during": 0, "after": 1}
+
+
+# A DOM whose card and document keep their real listeners by type, whose elements keep what the page writes
+# (innerHTML, textContent, title, className, style properties, querySelector results by selector), and whose
+# items list keeps each appended element. Events go through the page's own listeners, never its functions.
+_PRE_LIVE = """
+  var __wrote = [], __cardL = {}, __docL = {}, __made = [], __appended = [], __timers = [];
+  const __style = () => ({ left: '', top: '', width: '', cssText: '', props: {}, setProperty(k, v) { this.props[k] = String(v); } });
+  const __node = () => {
+    const set = {}, kids = {};
+    return new Proxy(function () {}, {
+      get: (t, k) => {
+        if (k === Symbol.toPrimitive) return () => 0;
+        if (k === Symbol.iterator) return function* () {};
+        if (k in set) return set[k];
+        if (k === 'querySelector') return s => kids[s] || (kids[s] = __node());
+        if (k === 'style') return (set.style = __style());
+        return __node();
+      },
+      set: (t, k, v) => { if (typeof v === 'string') __wrote.push(v); set[k] = v; return true; },
+      apply: (t, self, args) => { for (const a of args) if (typeof a === 'string') __wrote.push(a); return __node(); } });
+  };
+  const __card = __node(), __items = __node();
+  __card.addEventListener = (t, f) => (__cardL[t] = __cardL[t] || []).push(f);
+  __items.appendChild = n => { __appended.push(n); };
+  __items.querySelectorAll = s => s === '.item' ? __appended.filter(n => String(n.className).split(' ').includes('item')) : [];
+  document = { getElementById: id => id === 'card' ? __card : id === 'items' ? __items : __node(),
+    createElement: () => { const n = __node(); __made.push(n); return n; },
+    addEventListener: (t, f) => (__docL[t] = __docL[t] || []).push(f), documentElement: __node(), body: __node() };
+  setTimeout = (f, ms) => { __timers.push([f, ms]); return 0; };
+  const fire = (L, t, e) => { for (const f of L[t] || []) f(e); };
+  const actEl = a => ({ closest: s => s === '[data-act]' ? { dataset: { act: a } } : null });
+  const __range = (kind, value) => ({ dataset: { kind, num: '5' }, value: String(value), style: __style() });
+  const flush0 = () => { const due = __timers.filter(t => t[1] === 0); __timers.length = 0; due.forEach(t => t[0]()); };
+  const __item = () => __appended.find(n => String(n.className).split(' ').includes('item'));
+  const __bump = (p, pct) => { const q = JSON.parse(JSON.stringify(p)); q.items[0].rows[0].pct = pct; q.items[0].five = pct; return q; };
+"""
+
+
+def run_live(tmp_path, expr, payload):
+    return run_page(tmp_path, "(p => {%s})(%s)" % (expr, json.dumps(payload)), _PRE_LIVE + _PRE_LINES)
+
+
+@needs_node
+def test_card_listeners_drive_the_section(tmp_path):
+    # SL4 through the card's real click, input and change listeners: open, pick, drag, release
+    out = run_live(tmp_path, "render(p); showCard(0);"
+                             " fire(__cardL, 'click', {target: actEl('toggle')}); const opened = __card.innerHTML, openCalls = calls.slice();"
+                             " fire(__cardL, 'click', {target: actEl('own')}); const own = __card.innerHTML; calls.length = 0;"
+                             " const t = __range('week', 73); fire(__cardL, 'input', {target: t});"
+                             " const afterInput = calls.slice(), label = __card.querySelector('.lv[data-v=week]').textContent,"
+                             " x = t.style.props['--x']; fire(__cardL, 'change', {target: t});"
+                             " return {opened, openCalls, own, afterInput, label, x, calls, drawn: __card.innerHTML};",
+                   lines_payload(open_=False))
+    assert out["openCalls"] == [["open", True]]
+    assert "type=range" in out["opened"] and GENERAL_ON in out["opened"]
+    assert re.findall(r'data-kind=(\w+) data-num="5"', out["opened"]) == ["five", "week"]
+    assert OWN_ON in out["own"]
+    assert out["afterInput"] == [] and out["label"] == "73%" and out["x"] == "0.4694"  # (73 - 50) / 49
+    assert out["calls"] == [["5", "week", 73]]
+    assert '<span class="chip own">sem 73</span>' in out["drawn"]
+
+
+@needs_node
+def test_pointer_listeners_hold_and_release_the_card(tmp_path):
+    # SL4: pointerdown on a slider holds the card; the document's pointerup releases it one turn later
+    out = run_live(tmp_path, "render(p); showCard(0); fire(__cardL, 'click', {target: actEl('own')});"
+                             " fire(__cardL, 'pointerdown', {target: __range('five', 60)});"
+                             " const q = __bump(p, 77); render(q); const want = cardHtml(q.items[0]) + '<div class=arrow></div>';"
+                             " const during = __card.innerHTML === want; fire(__docL, 'pointerup', {});"
+                             " const sameTurn = __card.innerHTML === want; const h0 = hot; flush0();"
+                             " return {during, sameTurn, after: __card.innerHTML === want, hot: hot - h0};",
+                   lines_payload(open_=True))
+    assert out == {"during": False, "sameTurn": False, "after": True, "hot": 1}
+
+
+@needs_node
+def test_hiding_the_card_ends_the_drag(tmp_path):
+    # hideCard drops a held drag and its pending redraw: the next push draws, the next release does not redraw again
+    out = run_live(tmp_path, "render(p); showCard(0); fire(__cardL, 'pointerdown', {target: __range('five', 60)});"
+                             " render(__bump(p, 77)); hideCard(); showCard(0);"
+                             " const r = __bump(p, 66); render(r); const drawn = __card.innerHTML === cardHtml(r.items[0]) + '<div class=arrow></div>';"
+                             " fire(__cardL, 'pointerdown', {target: __range('five', 60)}); const n = __wrote.length;"
+                             " fire(__docL, 'pointerup', {}); flush0();"
+                             " return {drawn, redraws: __wrote.slice(n).filter(s => s.endsWith('<div class=arrow></div>')).length};",
+                   lines_payload(open_=True))
+    assert out == {"drawn": True, "redraws": 0}
+
+
+@needs_node
+def test_write_result_redraws_the_card(tmp_path):
+    # SL4: a failed write is drawn at once in the shown card (and the input region is reported); hiding clears it
+    out = run_live(tmp_path, "pywebview.api.set_account_line = (n, k, v) => (calls.push([n, k, v]), sync({ok: false}));"
+                             " render(p); showCard(0); fire(__cardL, 'click', {target: actEl('own')}); calls.length = 0;"
+                             " const h0 = hot; fire(__cardL, 'change', {target: __range('five', 80)});"
+                             " const drawn = __card.innerHTML, dh = hot - h0; hideCard(); showCard(0);"
+                             " return {drawn, dh, calls, again: __card.innerHTML};", lines_payload(open_=True))
+    assert out["calls"] == [["5", "five", 80]]
+    assert ERR_LINE in out["drawn"] and out["dh"] >= 1
+    assert ERR_LINE not in out["again"]
+
+
+@needs_node
+@pytest.mark.parametrize("bridge", [
+    "(n, k, v) => (calls.push([n, k, v]), {then(f, g) { (g || (() => {}))(new Error('x')); }})",  # the promise rejects
+    "(n, k, v) => { calls.push([n, k, v]); throw new Error('x'); }",  # the bridge call throws
+])
+def test_a_broken_write_shows_the_error_and_the_next_write_still_runs(tmp_path, bridge):
+    own = lines_card(lines={"five": 80.0, "week": 90.0, "own5": True, "ownWeek": True})
+    out = run_live(tmp_path, "pywebview.api.set_account_line = %s; render(p); showCard(0); calls.length = 0;"
+                             " fire(__cardL, 'click', {target: actEl('back')}); return {calls, drawn: __card.innerHTML};" % bridge,
+                   lines_payload(own, open_=True))
+    assert out["calls"] == [["5", "five", None], ["5", "week", None]]
+    assert ERR_LINE in out["drawn"]
+
+
+@needs_node
+def test_build_draws_the_dot_the_ticks_and_the_gear(tmp_path):
+    # SL3, SL5: the item holds the dot and the ticks group in the theme ink; the gear is appended last
+    p = lines_payload(lines_card(lines={**LINES, "week": 85.0, "ownWeek": True}), theme="white")
+    out = run_live(tmp_path, "render(p); const it = __item(), gear = __appended[__appended.length - 1];"
+                             " calls.length = 0; gear.onclick();"
+                             " return {html: it.innerHTML, cls: it.className, kinds: __appended.map(n => String(n.className).split(' ')[0]),"
+                             " gear: {text: gear.textContent, title: gear.title, i: gear.style.props['--i']}, calls};", p)
+    assert out["kinds"] == ["pill-square", "item", "add", "gear"]
+    assert "<i class=dot></i>" in out["html"] and "<g class=ticks>" in out["html"]
+    assert TICK.findall(out["html"]) == [("#16161a", "324.0"), ("#16161a", "306.0")]
+    assert "own" in out["cls"].split()
+    assert out["gear"] == {"text": "⚙︎", "title": "Limites de troca", "i": "3"}
+    assert out["calls"] == [["window"]]
+
+
+@needs_node
+def test_push_redraws_the_ticks_and_the_dot_of_a_kept_item(tmp_path):
+    # SL5: a push with the same accounts keeps the item and redraws its ticks in the theme ink, and its dot class
+    p = lines_payload(theme="white")
+    out = run_live(tmp_path, "render(p); const before = __item().className;"
+                             " const q = JSON.parse(JSON.stringify(p)); q.items[0].lines = {five: 80, week: 95, own5: true, ownWeek: false};"
+                             " const n = __made.length; render(q); const it = __item();"
+                             " return {rebuilt: __made.length - n, before, cls: it.className, ticks: it.querySelector('.ticks').innerHTML};", p)
+    assert out["rebuilt"] == 0
+    assert TICK.findall(out["ticks"]) == [("#16161a", "288.0"), ("#16161a", "342.0")]
+    assert "own" not in out["before"].split() and "own" in out["cls"].split()
+
+
+@pytest.mark.parametrize("answer", [None, ["ok"], "ok", True])
+def test_bridge_lines_returns_not_ok_when_on_lines_does_not_answer_a_dict(answer):
+    ctl = pill.PillController(None, None, make_controller().settings, lambda: None, lambda *a: None,
+                              on_lines=lambda action, args: answer)
+    bridge = pill.PillBridge(ctl)
+    assert [bridge.lines_window(), bridge.set_account_line("5", "five", 80), bridge.set_card_open(True)] == [{"ok": False}] * 3
