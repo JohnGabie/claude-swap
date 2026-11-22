@@ -36,8 +36,35 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from claude_swap.oauth import FIVE_HOUR_LABEL
+
+if TYPE_CHECKING:
+    from claude_swap.models import AccountPolicy
+
+
+def account_lines(
+    policy: AccountPolicy, threshold: float, weekly_threshold: float | None
+) -> tuple[float, float | None]:
+    """The configured ``(5-hour line, weekly line)`` of one account.
+
+    The 5-hour line is the account ``threshold``, else the general
+    ``threshold``. The weekly line is the account ``weekly_threshold``, else
+    the general ``weekly_threshold``, else ``None``. ``None`` keeps its meaning
+    in ``window_line``: the weekly windows then use the 5-hour line."""
+    five = policy.threshold if policy.threshold is not None else threshold
+    weekly = (
+        policy.weekly_threshold
+        if policy.weekly_threshold is not None
+        else weekly_threshold
+    )
+    return five, weekly
+
+
+def effective_weekly(five: float, weekly: float | None) -> float:
+    """The line the weekly windows are judged on: ``weekly``, else ``five``."""
+    return five if weekly is None else weekly
 
 
 def window_line(label: str, threshold: float, weekly_threshold: float | None) -> float:

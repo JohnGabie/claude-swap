@@ -30,7 +30,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEvent,
     pct_label,
 )
-from claude_swap.lines import binding_window
+from claude_swap.lines import account_lines, binding_window
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, load_settings, parse_model_names
 from claude_swap.tui import data
@@ -310,8 +310,9 @@ class AutoScreen(Screen):
         (best first) — the engine's own ordering."""
         # Same window set AND the same lines as the engine: autoswitch.model,
         # each account's own line (its policy threshold, else the session
-        # threshold — `_settings` is what `_set_threshold` replaces), the
-        # weekly line, and the session threshold as the ruler every account is
+        # threshold — `_settings` is what `_set_threshold` replaces), each
+        # account's weekly line (its own, else the general one), and the
+        # session threshold as the ruler every account is
         # scored on, so the displayed ranking can never disagree with the
         # account it picks.
         palette = Palette.from_theme(self.app.current_theme)
@@ -326,13 +327,11 @@ class AutoScreen(Screen):
         ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
         lines: dict[str, tuple[AccountSnapshot, Text, Text]] = {}  # (acc, name, the rest)
         for acc in candidates:
-            line = (
-                acc.policy.threshold if acc.policy.threshold is not None else threshold
-            )
+            line, account_weekly = account_lines(acc.policy, threshold, weekly)
             binding = binding_window(
                 oauth.relevant_windows(acc.usage.last_good, models),
                 line,
-                weekly,
+                account_weekly,
                 scale=threshold,
             )
             head, entry = Text(), Text()
@@ -354,7 +353,7 @@ class AutoScreen(Screen):
                     f"  {binding.label} {binding.pct:3.0f}% used",
                     style=palette.severity(binding.pct),
                 )
-                if weekly is not None or acc.policy.threshold is not None:
+                if account_weekly is not None or acc.policy.threshold is not None:
                     entry.append(
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )

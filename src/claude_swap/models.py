@@ -140,12 +140,19 @@ class AccountPolicy:
         on one shared account no longer means taxing the whole fleet with a
         global line set to the strictest member's.
 
+    ``weekly_threshold``
+        This account's own switch line for the windows that reset weekly (7d
+        and per-model). ``None`` inherits ``autoswitch.weeklyThreshold``, and
+        when that is unset too the weekly windows use the account's 5-hour
+        line (``lines.account_lines``). Stored as ``weeklyThreshold``.
+
     Frozen because ``AccountSnapshot`` is frozen — a mutable member would
     silently break that guarantee for the whole row.
     """
 
     threshold: float | None = None
     priority: int = 0
+    weekly_threshold: float | None = None
 
 
 class Platform(Enum):
