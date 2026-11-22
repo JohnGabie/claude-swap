@@ -290,3 +290,164 @@ def test_grid():
     assert out == pytest.approx({"x": [480.0, 0.0], "__other__": [0.0, 600.0]})
     out = usage_history.grid(hist, base, base + 2400, 1200, ["x", "y"])
     assert out["y"] == pytest.approx([0.0, 600.0]) and out["__other__"] == [0.0, 0.0]
+
+
+def run(env, text, binary=False):
+    root, projects = env
+    log = projects / "s.jsonl"
+    if binary:
+        log.write_bytes(text)
+    else:
+        log.write_text(text, encoding="utf-8")
+    return usage_history.update(root, projects, NOW, home=HOME), log
+
+
+def test_line_separators_inside_text_do_not_split_a_message(env):
+    row = json.loads(line(T0, "a", "r1"))
+    row["message"]["content"] = "x y\u0085z\x0b\x0c\x1c\x1d\x1e"
+    hist, _ = run(env, json.dumps(row, ensure_ascii=False) + "\n")
+    assert total_m(hist) == pytest.approx(weight())
+
+
+def test_bucket_key_is_exact(env):
+    hist, _ = run(env, line(T0 + 10, "a", "r1"))
+    assert list(hist["buckets"]) == [str(int(T0))]
+
+
+def test_updated_at_is_exact(env):
+    hist, _ = run(env, line(T0))
+    assert hist["updatedAt"] == "2026-11-21T12:00:00Z"
+    assert usage_history.load(env[0])["updatedAt"] == "2026-11-21T12:00:00Z"
+
+
+def test_message_key_with_one_id_missing(env):
+    only_rid = json.loads(line(T0, None, "r9"))
+    only_mid = json.loads(line(T0, "m9", None))
+    del only_mid["requestId"]
+    hist, _ = run(env, json.dumps(only_rid) + "\n" + json.dumps(only_mid) + "\n")
+    (entry,) = hist["files"].values()
+    assert entry["keys"] == ["|r9", "m9|"]
+    assert total_m(hist) == pytest.approx(2 * weight())
+
+
+@pytest.mark.parametrize("name", ["TMPDIR", "TEMP", "TMP"])
+def test_temp_dirs_read_environment(env, monkeypatch, name):
+    for other in ("TMPDIR", "TEMP", "TMP"):
+        monkeypatch.delenv(other, raising=False)
+    monkeypatch.setenv(name, "/scratch/fake-tmp")
+    assert "/scratch/fake-tmp" in usage_history._temp_dirs()
+    hist, _ = run(env, line(T0, cwd="/scratch/fake-tmp/job"))
+    (bucket,) = hist["buckets"].values()
+    assert list(bucket["p"]) == ["temporários"]
+
+
+def test_zero_usage_adds_no_bucket_but_keeps_key(env):
+    zero = {"input_tokens": 0, "output_tokens": 0}
+    hist, _ = run(env, line(T0, "z", "r", use=zero))
+    assert hist["buckets"] == {}
+    (entry,) = hist["files"].values()
+    assert entry["keys"] == ["z|r"]
+    both = line(T0, "z", "r", use=zero) + line(T0 + 1, "y", "r")
+    hist, _ = run(env, both)
+    (bucket,) = hist["buckets"].values()
+    assert bucket["m"] == {"claude-opus-5-5": pytest.approx(weight())}
+
+
+def test_missing_model_is_unknown(env):
+    row = json.loads(line(T0))
+    del row["message"]["model"]
+    hist, _ = run(env, json.dumps(row) + "\n")
+    (bucket,) = hist["buckets"].values()
+    assert list(bucket["m"]) == ["unknown"]
+
+
+def test_project_key_with_at_sign_is_personal():
+    assert usage_history.project_key(HOME + "/projects/x@y.com", HOME) == "pasta pessoal"
+    assert usage_history.project_key(HOME + "/projects/x@y.com/src", HOME) == "pasta pessoal"
+    assert usage_history.project_key(HOME + "/projects/ok", HOME) == "ok"
+
+
+def test_load_drops_non_numeric_values(env):
+    root, _ = env
+    path = cache_path(root)
+    path.parent.mkdir(parents=True)
+    data = {
+        "schemaVersion": 1, "updatedAt": "x", "files": {},
+        "buckets": {"300": {"m": {"a": 1.5, "b": "x", "c": None, "d": True, "e": 2}, "p": {"x": [1], "y": 3.0}}},
+    }
+    path.write_text(json.dumps(data))
+    out = usage_history.load(root)
+    assert out["buckets"]["300"] == {"m": {"a": 1.5, "e": 2}, "p": {"y": 3.0}}
+
+
+def test_deep_nesting_and_huge_number_do_not_stop_the_update(env):
+    deep = '{"usage": ' + "[" * 100000 + "\n"
+    huge = json.loads(line(T0 + 1, "h", "r"))
+    huge["message"]["usage"]["output_tokens"] = 10**400
+    good = line(T0 + 2, "g", "r")
+    text = line(T0, "a", "r") + deep + json.dumps(huge) + "\n" + good
+    hist, log = run(env, text)
+    assert total_m(hist) == pytest.approx(2 * weight())
+    (entry,) = hist["files"].values()
+    assert entry["offset"] == log.stat().st_size
+    assert cache_path(env[0]).exists()
+
+
+def test_ids_and_model_limited_to_200_chars(env):
+    long_id = "i" * 201
+    ok_id = "i" * 200
+    rows = [json.loads(line(T0, long_id, "r1", model="m" * 201)), json.loads(line(T0 + 1, ok_id, "r2"))]
+    rows[0]["message"]["usage"] = usage()
+    nonstr = json.loads(line(T0 + 2, 5, 7))
+    hist, _ = run(env, "".join(json.dumps(r) + "\n" for r in rows + [nonstr]))
+    (entry,) = hist["files"].values()
+    assert entry["keys"] == ["|r1", f"{ok_id}|r2", "|" + nonstr["timestamp"]]
+    models = {m for b in hist["buckets"].values() for m in b["m"]}
+    assert "m" * 201 not in models and "unknown" in models
+
+
+def test_assistant_line_stores_only_key_and_counts(env):
+    row = json.loads(line(T0, "a", "r1", cwd=HOME + "/projects/who@mail.example"))
+    row["message"]["content"] = [{"type": "text", "text": "secret-text"}]
+    hist, _ = run(env, json.dumps(row) + "\n")
+    text = cache_path(env[0]).read_text()
+    assert "secret-text" not in text and "@" not in text and "/" not in text
+    (bucket,) = hist["buckets"].values()
+    assert list(bucket["p"]) == ["pasta pessoal"]
+
+
+def test_update_reads_line_by_line_not_whole_tail(env, monkeypatch):
+    root, projects = env
+    log = projects / "s.jsonl"
+    log.write_text("".join(line(T0 + i, f"m{i}", "r") for i in range(50)))
+    reads = []
+    real = type(log).open
+
+    def spy(self, *a, **k):
+        handle = real(self, *a, **k)
+        if self.name != "s.jsonl":
+            return handle
+        orig = handle.read
+
+        def spy_read(*args):
+            reads.append(args)
+            return orig(*args)
+
+        class Wrap:
+            def __getattr__(self, n):
+                return getattr(handle, n)
+            def __enter__(self):
+                handle.__enter__()
+                return self
+            def __exit__(self, *e):
+                return handle.__exit__(*e)
+            def __iter__(self):
+                return iter(handle)
+            read = staticmethod(spy_read)
+
+        return Wrap()
+
+    monkeypatch.setattr(type(log), "open", spy)
+    hist = usage_history.update(root, projects, NOW, home=HOME)
+    assert total_m(hist) == pytest.approx(50 * weight())
+    assert reads == []

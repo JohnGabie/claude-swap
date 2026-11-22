@@ -34,6 +34,8 @@ KEY_TEMP = "temporários"
 KEY_OTHER = "outras pastas"
 WORKTREES_SUFFIX = ".worktrees"
 SYSTEM_TEMP_DIRS = ("/tmp", "/var/tmp")
+MAX_ID_CHARS = 200
+LINE_ERRORS = (ValueError, RecursionError, OverflowError, TypeError)
 
 
 def _iso(ts: float) -> str:
@@ -69,7 +71,7 @@ def project_key(cwd, home: str, temp_dirs: tuple[str, ...] = ()) -> str:
         name = raw[depth]
         if name.endswith(WORKTREES_SUFFIX) and len(name) > len(WORKTREES_SUFFIX):
             name = name[: -len(WORKTREES_SUFFIX)]
-        return name
+        return KEY_PERSONAL if "@" in name else name
     if _under(parts, home_parts + [".claude"]):
         return KEY_MEMORY
     for temp in (*SYSTEM_TEMP_DIRS, *temp_dirs):
@@ -95,6 +97,15 @@ def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def _numbers(value) -> dict:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        k: v for k, v in value.items()
+        if isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    }
+
+
 def load(backup_root: Path) -> dict:
     """The stored history; an empty one for a missing, bad or other-version file."""
     try:
@@ -113,10 +124,7 @@ def load(backup_root: Path) -> dict:
     clean_buckets = {}
     for key, entry in buckets.items():
         if isinstance(key, str) and key.isdigit() and isinstance(entry, dict):
-            clean_buckets[key] = {
-                "m": entry["m"] if isinstance(entry.get("m"), dict) else {},
-                "p": entry["p"] if isinstance(entry.get("p"), dict) else {},
-            }
+            clean_buckets[key] = {"m": _numbers(entry.get("m")), "p": _numbers(entry.get("p"))}
     updated = data.get("updatedAt")
     return {
         "schemaVersion": SCHEMA_VERSION,
@@ -126,55 +134,68 @@ def load(backup_root: Path) -> dict:
     }
 
 
+def _text_id(value) -> str:
+    """An id or model name: a ``str`` of at most MAX_ID_CHARS, else missing (empty)."""
+    return value if isinstance(value, str) and len(value) <= MAX_ID_CHARS else ""
+
+
 def _message_key(message: dict, row: dict, ts_text) -> str:
-    mid, rid = message.get("id"), row.get("requestId")
-    if mid is None and rid is None:
+    mid, rid = _text_id(message.get("id")), _text_id(row.get("requestId"))
+    if not mid and not rid:
         return f"|{ts_text}"
     return f"{mid}|{rid}"
 
 
+def _add_line(raw: bytes, entry: dict, seen: set, buckets: dict, home: str, temps: tuple, cutoff: float) -> None:
+    if b'"usage"' not in raw:
+        return
+    row = json.loads(raw.decode("utf-8", errors="replace"))
+    message = row.get("message") if isinstance(row, dict) else None
+    usage = message.get("usage") if isinstance(message, dict) else None
+    ts = usage_log.parse_ts(row.get("timestamp")) if isinstance(row, dict) else None
+    if not isinstance(usage, dict) or ts is None:
+        return
+    model = _text_id(message.get("model")) or None
+    weighted = token_model.weighted_tokens(model, usage)
+    key = _message_key(message, row, row.get("timestamp"))
+    if key in seen:
+        return
+    seen.add(key)
+    entry["keys"].append(key)
+    if weighted <= 0 or ts < cutoff:
+        return
+    bucket = buckets.setdefault(str(int(ts // BUCKET_S * BUCKET_S)), {"m": {}, "p": {}})
+    name = model or "unknown"
+    bucket["m"][name] = bucket["m"].get(name, 0.0) + weighted
+    project = project_key(row.get("cwd"), home, temps)
+    bucket["p"][project] = bucket["p"].get(project, 0.0) + weighted
+
+
 def _read_new(path: Path, entry: dict, size: int, buckets: dict, home: str, temps: tuple, cutoff: float) -> None:
-    """Add the whole new lines of ``path`` to ``buckets``; move ``entry["offset"]``."""
+    """Add the whole new lines of ``path`` to ``buckets``; move ``entry["offset"]``.
+
+    Reads line by line in binary mode and splits on ``\\n`` only. A last line
+    with no newline waits for the next update.
+    """
     if size < entry["offset"]:
         entry["offset"], entry["keys"] = 0, []
+    seen = set(entry["keys"])
+    consumed = 0
     try:
         with path.open("rb") as handle:
             handle.seek(entry["offset"])
-            data = handle.read()
+            for raw in handle:
+                if not raw.endswith(b"\n"):
+                    break
+                consumed += len(raw)
+                try:
+                    _add_line(raw, entry, seen, buckets, home, temps, cutoff)
+                except LINE_ERRORS:
+                    continue
     except OSError:
-        return
-    last = data.rfind(b"\n")
-    if last < 0:
-        return
-    seen = set(entry["keys"])
-    for raw in data[: last + 1].decode("utf-8", errors="replace").splitlines():
-        if '"usage"' not in raw:
-            continue
-        try:
-            row = json.loads(raw)
-        except ValueError:
-            continue
-        message = row.get("message") if isinstance(row, dict) else None
-        usage = message.get("usage") if isinstance(message, dict) else None
-        ts = usage_log.parse_ts(row.get("timestamp")) if isinstance(row, dict) else None
-        if not isinstance(usage, dict) or ts is None:
-            continue
-        key = _message_key(message, row, row.get("timestamp"))
-        if key in seen:
-            continue
-        seen.add(key)
-        entry["keys"].append(key)
-        model = message.get("model") if isinstance(message.get("model"), str) else None
-        weighted = token_model.weighted_tokens(model, usage)
-        if weighted <= 0 or ts < cutoff:
-            continue
-        bucket = buckets.setdefault(str(int(ts // BUCKET_S * BUCKET_S)), {"m": {}, "p": {}})
-        name = model or "unknown"
-        bucket["m"][name] = bucket["m"].get(name, 0.0) + weighted
-        project = project_key(row.get("cwd"), home, temps)
-        bucket["p"][project] = bucket["p"].get(project, 0.0) + weighted
+        pass
     entry["keys"] = entry["keys"][-KEYS_KEPT:]
-    entry["offset"] += last + 1
+    entry["offset"] += consumed
 
 
 def update(backup_root: Path, projects_dir: Path, now: float, home: str | None = None) -> dict:
