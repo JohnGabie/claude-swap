@@ -1,8 +1,13 @@
 """Tests for the pure parts of the Windows tray app (no pystray/pywebview needed)."""
 
 import json
+import logging
+from pathlib import Path
 
-from claude_swap import tray
+from claude_swap import fleet_page, lines_page, pill, tray
+from claude_swap.settings import AutoSwitchSettings
+
+from tests.test_account_policy_store import PolicyStoreBase
 
 
 def card(num=1, title="#1  work", active=False, disabled=False, rows=(), message=None):
@@ -170,10 +175,11 @@ def test_refresh_pill_survives_a_failure_and_logs_the_type_only(caplog, monkeypa
 
     class FakePill:
         def __init__(self):
-            self.calls = []
+            self.calls, self.general = [], []
 
-        def update(self, cards, fleet=None):
+        def update(self, cards, fleet=None, general_lines=None):
             self.calls.append((cards, fleet))
+            self.general.append(general_lines)
 
     cards = [card(1, "#1  me@example.com", rows=(("5h", 10.0),))]
     cards[0]["num"] = "1"
@@ -200,3 +206,263 @@ def test_refresh_pill_survives_a_failure_and_logs_the_type_only(caplog, monkeypa
     tray.refresh_pill(pill, cards, lambda _now: {"accounts": [{"id": 1, "plan": "pro"}]}, {}, None, 1_000_000.0, latest)
     shown, square = pill.calls[-1]
     assert shown[0]["budget"]["plan"] == "pro" and square["sparkline24h"] == [0.0] * 24
+    # the general lines reach the pill, also when the budget fails
+    general = {"five": 90.0, "week": 97.0}
+    tray.refresh_pill(pill, cards, bad_budget, {}, None, 1_000_000.0, latest, general_lines=general)
+    assert pill.general == [None] * 3 + [general] and pill.calls[-1] == (cards, None)
+
+
+# ---- switch lines: on_lines, card lines, card section state (SL3, SL4, SL6, S8, S9) ----------
+
+AREA = (0, 0, 1920, 1080)
+OK = {"ok": True, "error": None}
+
+
+def refused() -> dict:
+    return {"ok": False, "error": tray.LINES_REFUSED}
+
+
+def store(temp_home, count=6):
+    """A synthetic store with ``count`` accounts in a temp home (never the real one)."""
+    return PolicyStoreBase()._fleet(temp_home, count)
+
+
+def pill_cards(nums):
+    out = []
+    for n in nums:
+        c = card(n, f"#{n}  account-{n}@example.test", rows=(("5h", 10.0 * n), ("7d", 5.0 * n)))
+        c["num"] = str(n)  # desktop.card_dict gives the slot number as text
+        c["tag"] = f"account-{n}@example.test's Organization"
+        out.append(c)
+    return out
+
+
+class Lines:
+    """The tray's lines wiring with fakes for the window and the refresh."""
+
+    def __init__(self, switcher, tmp_path, nums=range(1, 7), settings=None):
+        self.settings = settings or tray.TraySettings()
+        self.path = tmp_path / "tray_settings.json"
+        self.changes, self.view = [], FakeView()
+        self.window = lines_page.LinesWindow(lambda fn: fn(self.view), lambda: ANCHOR)
+        self.ctl = pill.PillController(None, None, self.settings, lambda: None, lambda *a: None,
+                                       on_lines=None)
+        self.ctl.cards = pill_cards(nums)
+        self.actions = tray.LinesActions(switcher.write_account_line, self.settings, self.path,
+                                         lambda: [c["num"] for c in self.ctl.cards], self.window.toggle,
+                                         lambda: self.changes.append(1))
+        self.ctl._on_lines = self.actions
+        self.bridge = pill.PillBridge(self.ctl)
+
+
+class FakeView:
+    def __init__(self):
+        self.log = []
+        view = self
+
+        class W:
+            def __getattr__(self, name):
+                return lambda *a: view.log.append((name, *a))
+
+        class V:
+            def run_javascript(self, script, *_a):
+                view.log.append(("js", script))
+
+        self.window, self.webview = W(), V()
+
+
+ANCHOR = {"edge": "right", "square": [1880, 700, 30, 30], "area": list(AREA)}
+
+
+def test_bridge_refuses_bad_line_input(temp_home, tmp_path):
+    # S8: each bad input writes nothing and returns {"ok": false}
+    s = store(temp_home)
+    lines = Lines(s, tmp_path)
+    before = Path(s.sequence_file).read_bytes()
+    bad = [("9", "five", 80), ("2", "day", 80), ("2", "five", True), ("2", "five", 101), ("2; rm", "five", 80),
+           (2, "five", 80), ("02", "five", 80), ("٢", "five", 80), (None, "five", 80),
+           ("2", None, 80), ("2", "threshold", 80), ("2", "five", "80"), ("2", "week", False),
+           ("2", "five", 49.9), ("2", "week", 100), ("2", "five", float("nan")), ("2", "five", float("inf")),
+           ("2", "five", [80])]
+    for num, kind, value in bad:
+        assert lines.bridge.set_account_line(num, kind, value) == refused(), (num, kind, value)
+    assert Path(s.sequence_file).read_bytes() == before
+    assert lines.changes == []
+    # the edges of the range are accepted
+    assert lines.bridge.set_account_line("2", "five", 50) == OK
+    assert lines.bridge.set_account_line("2", "week", 99.9) == OK
+
+
+def test_bridge_refuses_a_pill_num_that_is_not_an_ascii_digit_string(temp_home, tmp_path):
+    # the num check does not trust the pill's own list: a card num that is not an ASCII digit string is refused
+    s = store(temp_home)
+    lines = Lines(s, tmp_path)
+    before = Path(s.sequence_file).read_bytes()
+    for num in ("x", "\u0662", " 2", ""):
+        lines.ctl.cards[0]["num"] = num
+        assert lines.bridge.set_account_line(num, "five", 80) == refused(), num
+    assert lines.changes == [] and Path(s.sequence_file).read_bytes() == before
+
+
+def test_bridge_writes_account_line(temp_home, tmp_path):
+    s = store(temp_home)
+    lines = Lines(s, tmp_path)
+    record = lambda: json.loads(Path(s.sequence_file).read_text())["accounts"]["5"]  # noqa: E731
+    assert lines.bridge.set_account_line("5", "five", 80) == OK
+    assert record()["threshold"] == 80.0 and "weeklyThreshold" not in record()
+    assert lines.bridge.set_account_line("5", "week", 92.5) == OK
+    assert record()["weeklyThreshold"] == 92.5 and record()["threshold"] == 80.0
+    assert lines.bridge.set_account_line("5", "week", None) == OK
+    assert "weeklyThreshold" not in record() and record()["threshold"] == 80.0
+    assert lines.bridge.set_account_line("5", "five", None) == OK
+    assert "threshold" not in record()
+    assert lines.changes == [1] * 4  # each write asks the tray for a refresh
+    # the writer's own refusal comes back as it is, with no refresh
+    calls = []
+    failing = tray.LinesActions(lambda num, key, value: calls.append((num, key, value)) or {"ok": False, "error": "busy"},
+                                tray.TraySettings(), tmp_path / "t.json", lambda: ["5"], lambda: None,
+                                lambda: calls.append("refresh"))
+    assert failing("set_account_line", {"num": "5", "kind": "week", "value": 90}) == {"ok": False, "error": "busy"}
+    assert calls == [("5", "weeklyThreshold", 90)]
+
+
+def test_on_lines_actions(temp_home, tmp_path):
+    lines = Lines(store(temp_home, 2), tmp_path, nums=(1, 2))
+    assert lines.bridge.lines_window() == OK
+    x, y = fleet_page.panel_position(ANCHOR, size=(320, 520))
+    assert lines.view.log == [("show_all",), ("deiconify",), ("present",), ("move", x, y),
+                              ("js", "window.linesOpen&&window.linesOpen()")]
+    lines.view.log.clear()
+    assert lines.bridge.lines_window() == OK  # a second gear click closes it
+    assert lines.view.log == [("js", "window.linesClosed&&window.linesClosed()"), ("hide",)]
+    assert lines.actions("unknown", {}) == refused()
+    assert lines.actions("set_account_line", None) == refused()
+    assert lines.actions("set_account_line", {"num": "1", "kind": "five"}) == refused()  # no value key
+
+
+def test_card_open_saved(tmp_path):
+    settings = tray.TraySettings()
+    assert settings.pill_card_limits_open is False
+    path = tmp_path / "tray_settings.json"
+    changes = []
+    actions = tray.LinesActions(lambda *a: {"ok": True, "error": None}, settings, path, lambda: [], lambda: None,
+                                lambda: changes.append(1))
+    assert actions("set_card_open", {"open": True}) == OK
+    assert settings.pill_card_limits_open is True
+    assert tray.TraySettings.load(path).pill_card_limits_open is True
+    assert actions("set_card_open", {"open": False}) == OK
+    assert tray.TraySettings.load(path).pill_card_limits_open is False
+    saved = path.read_bytes()
+    for bad in ("yes", 1, None, [True]):
+        assert actions("set_card_open", {"open": bad}) == refused()
+    assert actions("set_card_open", {}) == refused()
+    assert path.read_bytes() == saved and settings.pill_card_limits_open is False
+    assert changes == []
+    # a bad stored value loads as the default
+    path.write_text(json.dumps({"pill_card_limits_open": "yes"}), encoding="utf-8")
+    assert tray.TraySettings.load(path).pill_card_limits_open is False
+
+
+def test_on_lines_catches_errors(tmp_path, caplog):
+    def boom(*_a):
+        raise ValueError("a@example.com sk-ant-token")
+
+    actions = tray.LinesActions(boom, tray.TraySettings(), tmp_path / "t.json", lambda: ["2"], boom, boom)
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        results = [actions("set_account_line", {"num": "2", "kind": "five", "value": 80}),
+                   actions("toggle_window", {})]
+        broken_nums = tray.LinesActions(boom, tray.TraySettings(), tmp_path / "t.json", boom, boom, boom)
+        results.append(broken_nums("set_account_line", {"num": "2", "kind": "five", "value": 80}))
+        unsaved = tray.TraySettings()
+        unsaved.save = boom
+        results.append(tray.LinesActions(boom, unsaved, tmp_path / "t.json", boom, boom, boom)(
+            "set_card_open", {"open": True}))
+    assert results == [{"ok": False, "error": tray.LINES_FAILED}] * 4
+    assert caplog.text.count("ValueError") == 4
+    assert "@" not in caplog.text and "sk-ant" not in caplog.text
+
+
+def test_tray_card_lines_from_policies(temp_home, caplog):
+    s = store(temp_home, 4)
+    assert s.write_account_line("2", "threshold", 85)["ok"]
+    assert s.write_account_line("2", "weeklyThreshold", 92)["ok"]
+    assert s.write_account_line("3", "weeklyThreshold", 93.5)["ok"]
+    assert s.write_account_line("4", "threshold", 80)["ok"]
+    cards = pill_cards(range(1, 5))
+    shown, general = tray.lines_inputs(cards, s.account_policies,
+                                       lambda: AutoSwitchSettings(threshold=90.0, weekly_threshold=97.0))
+    assert [c["lines"] for c in shown] == [
+        {"five": 90.0, "week": 97.0, "own5": False, "ownWeek": False},
+        {"five": 85.0, "week": 92.0, "own5": True, "ownWeek": True},
+        {"five": 90.0, "week": 93.5, "own5": False, "ownWeek": True},
+        {"five": 80.0, "week": 97.0, "own5": True, "ownWeek": False},
+    ]
+    assert general == {"five": 90.0, "week": 97.0}
+    assert all("lines" not in c for c in cards)
+    # no general weekly line: each effective weekly line is the account's 5-hour line
+    shown, general = tray.lines_inputs(cards, s.account_policies, lambda: AutoSwitchSettings(threshold=88.0))
+    assert [(c["lines"]["five"], c["lines"]["week"]) for c in shown] == [(88.0, 88.0), (85.0, 92.0), (88.0, 93.5),
+                                                                         (80.0, 80.0)]
+    assert general == {"five": 88.0, "week": 88.0}
+
+    def boom():
+        raise RuntimeError(SECRET_PATH + " a@example.com")
+
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        assert tray.lines_inputs(cards, boom, lambda: AutoSwitchSettings()) == (cards, None)
+        assert tray.lines_inputs(cards, s.account_policies, boom) == (cards, None)
+    assert caplog.text.count("RuntimeError") == 2 and "secret" not in caplog.text and "@" not in caplog.text
+
+
+def test_pill_payload_has_lines(temp_home, monkeypatch):
+    s = store(temp_home, 2)
+    assert s.write_account_line("2", "weeklyThreshold", 92)["ok"]
+    monkeypatch.setattr(pill, "work_area", lambda: AREA)
+    for open_ in (True, False):
+        settings = tray.TraySettings(pill_card_limits_open=open_)
+        ctl = pill.PillController(None, None, settings, lambda: None, lambda *a: None)
+        sent = []
+        ctl._run_js = sent.append
+        ctl._loaded.set()
+        ctl._visible = True
+        ctl.cards = pill_cards((1, 2))  # the same count and layout: update() pushes, it does not relayout
+        ctl._placed = ctl._layout()
+        shown, general = tray.lines_inputs(pill_cards((1, 2)), s.account_policies,
+                                           lambda: AutoSwitchSettings(threshold=90.0))
+        tray.refresh_pill(ctl, shown, lambda _now: {"accounts": []}, {}, None, 1_000_000.0, {},
+                          general_lines=general)
+        payload = json.loads(sent[-1][len("render("):-1])
+        assert payload["cardLimitsOpen"] is open_
+        assert payload["generalLines"] == {"five": 90.0, "week": 90.0}
+        assert [i["lines"] for i in payload["items"]] == [
+            {"five": 90.0, "week": 90.0, "own5": False, "ownWeek": False},
+            {"five": 90.0, "week": 92.0, "own5": False, "ownWeek": True}]
+
+
+def test_lines_payloads_have_no_identity(temp_home, tmp_path, monkeypatch):
+    # S9 tray and window part: email, org name and alias all hold a@example.com
+    s = store(temp_home, 3)
+    data = s._get_sequence_data()
+    for rec in data["accounts"].values():
+        rec["email"] = "a@example.com"
+        rec["organizationName"] = "a@example.com"
+        rec["alias"] = "a@example.com"
+    data["accounts"]["2"]["weeklyThreshold"] = 92.0
+    s._write_json(s.sequence_file, data)
+    cards = pill_cards((1, 2, 3))
+    for c in cards:
+        c["title"], c["tag"] = "#%s  a@example.com" % c["num"], "a@example.com"
+    core = lambda: AutoSwitchSettings(threshold=90.0, weekly_threshold=97.0)  # noqa: E731
+    shown, general = tray.lines_inputs(cards, s.account_policies, core)
+    monkeypatch.setattr(pill, "work_area", lambda: AREA)
+    payload = pill.pill_payload(shown, "right", "black", pill.window_layout("right", 3, AREA),
+                                general_lines=general, card_limits_open=True)
+    window = lines_page.LinesWindowApi(core, s.account_policies, lambda: shown, lambda: True,
+                                       lambda c, a: {"ok": False, "output": "bad a@example.com"},
+                                       lambda: None, lambda: None)
+    lines = Lines(s, tmp_path, nums=(1, 2, 3))
+    out = [payload, window.get(), window.set("five", 80), window.close(),
+           lines.bridge.set_account_line("2", "week", 101), lines.bridge.set_account_line("7", "week", 90)]
+    assert out[1]["accounts"][1]["week"] == 92.0  # the window did read the store
+    for o in out:
+        assert "@" not in json.dumps(o), o
