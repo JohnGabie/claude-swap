@@ -29,6 +29,31 @@ def _plans(pace: dict) -> dict[str, str]:
     }
 
 
+def account_lines(root: Path, threshold: float, weekly_threshold: float | None) -> dict | None:
+    """``{str(id): (5-hour line, weekly line or None)}`` of the accounts with a line of their own.
+
+    Reads ``sequence.json`` of ``root`` and writes nothing. A read error gives
+    None: every account then uses the general lines. Never raises.
+    """
+    try:
+        from claude_swap import lines
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        data = json.loads((Path(root) / "sequence.json").read_text(encoding="utf-8"))
+        accounts = data.get("accounts")
+        if not isinstance(accounts, dict):
+            return None
+        out = {}
+        for number in accounts:
+            policy = ClaudeAccountSwitcher._policy_from_data(data, str(number))
+            if policy.threshold is None and policy.weekly_threshold is None:
+                continue
+            out[str(number)] = lines.account_lines(policy, threshold, weekly_threshold)
+        return out
+    except Exception:  # noqa: BLE001 - the general lines still give a budget
+        return None
+
+
 def token_rates(root: Path, pace: dict, now: float) -> dict:
     """Per-account token rates; the store is brought up to date first. Never raises."""
     from claude_swap import budget_calibrate
@@ -71,6 +96,7 @@ def current_budget(now: float | None = None, horizon_hours: tuple | None = None,
             ),
             token_meta=token_model.meta(),
             horizon_hours=horizon_hours,
+            account_lines=account_lines(root, settings.threshold, settings.weekly_threshold),
         )
     except Exception:  # noqa: BLE001 - a planner must get an answer, not a traceback
         return budget.build_budget({}, now)

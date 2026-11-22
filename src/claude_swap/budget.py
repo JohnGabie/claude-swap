@@ -21,9 +21,10 @@ elapsed share (both weighted by capacity). 1.0 uses the whole week exactly.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from datetime import datetime, timezone
 
-from claude_swap import balance
+from claude_swap import balance, lines
 
 SCHEMA_VERSION = 1
 SLOW_DOWN_RATIO = 1.05
@@ -84,8 +85,18 @@ def _round(value: float | None, digits: int = 2) -> float | None:
     return None if value is None else round(value, digits)
 
 
-def _account(raw: dict, now: float, threshold: float, weekly_threshold: float) -> dict:
-    """One account of the budget. ``measured`` is False with no usable reading."""
+def _account(
+    raw: dict,
+    now: float,
+    threshold: float,
+    weekly_threshold: float,
+    own_lines: tuple[float, float | None] | None = None,
+) -> dict:
+    """One account of the budget. ``measured`` is False with no usable reading.
+
+    ``threshold`` and ``weekly_threshold`` are the general lines. ``own_lines``
+    is the ``(5-hour line, weekly line or None)`` of an account that has a line
+    of its own: the account is then judged on those, and ``lines`` says so."""
     plan = raw.get("plan") if isinstance(raw.get("plan"), str) else "unknown"
     capacity = balance.plan_capacity(plan)
     out: dict = {
@@ -106,6 +117,14 @@ def _account(raw: dict, now: float, threshold: float, weekly_threshold: float) -
         # 2026-11-17 to 2026-11-21: no reading for 4 days, counted usable).
         out["noRecentReading"] = True
         return out
+    if own_lines is not None:
+        threshold = own_lines[0]
+        weekly_threshold = lines.effective_weekly(*own_lines)
+    out["lines"] = {
+        "fivePct": threshold,
+        "weeklyPct": weekly_threshold,
+        "own": own_lines is not None,
+    }
     account = balance.Account(0, plan, _window(raw.get("fiveHour")), _window(raw.get("sevenDay")))
     weekly = balance._weekly(account, now)
     if weekly is None:
@@ -230,6 +249,7 @@ def build_budget(
     token_rates: dict | None = None,
     token_meta: dict | None = None,
     horizon_hours: tuple | None = None,
+    account_lines: Mapping[str, tuple[float, float | None]] | None = None,
 ) -> dict:
     """The budget of the fleet at ``now``, from one ``cswap pace`` payload.
 
@@ -240,11 +260,17 @@ def build_budget(
     ``token_rates`` maps an account id to ``{"weekPerPct", "fivePerPct",
     "confidence"}`` (see ``budget_calibrate.rates``). With it, every quota
     figure also comes in tokens. ``token_meta`` describes the token unit.
+
+    ``account_lines`` maps ``str(id)`` to the ``(5-hour line, weekly line or
+    None)`` of an account that has a line of its own. That account is judged
+    on them (``usableNow``, ``fiveHour.headroomPct``); every other account
+    uses the general lines. The fleet fields keep the general lines.
     """
+    own = account_lines if isinstance(account_lines, Mapping) else {}
     weekly_line = threshold if weekly_threshold is None else weekly_threshold
     raw_accounts = pace.get("accounts") if isinstance(pace, dict) else None
     accounts = [
-        _account(raw, now, threshold, weekly_line)
+        _account(raw, now, threshold, weekly_line, own.get(str(raw.get("id"))))
         for raw in (raw_accounts if isinstance(raw_accounts, list) else [])
         if isinstance(raw, dict)
     ]
