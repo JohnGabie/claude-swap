@@ -73,7 +73,7 @@ The engine in ``autoswitch.py`` keeps its own guards on top of this module.
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -195,6 +195,23 @@ class Hold:
 
 
 Decision = Stay | SwitchTo | Hold
+
+#: Each account's own ``(threshold, weekly_threshold)``, by account id. An
+#: account missing from the mapping uses the general lines of the call.
+AccountLines = Mapping[int, tuple[float, float | None]]
+
+
+def _lines_of(
+    account_id: int,
+    threshold: float,
+    weekly_threshold: float | None,
+    lines: AccountLines | None,
+) -> tuple[float, float | None]:
+    """The two switch lines of one account: its entry in ``lines``, else the
+    general ``threshold`` and ``weekly_threshold``."""
+    if lines and account_id in lines:
+        return lines[account_id]
+    return threshold, weekly_threshold
 
 
 # --- Scoring -------------------------------------------------------------
@@ -383,17 +400,20 @@ def _rank_key(s: Score) -> tuple:
 def _ranked(accounts: Sequence[Account], now: float, *, threshold: float,
             weekly_threshold: float | None,
             candidate_margin: float, f: float | None = None,
-            min_headroom: bool = True) -> list[Score]:
-    """Usable accounts, best first (see ``_rank_key``)."""
+            min_headroom: bool = True,
+            lines: AccountLines | None = None) -> list[Score]:
+    """Usable accounts, best first (see ``_rank_key``). Each account is
+    scored on its own lines (``_lines_of``)."""
     if f is None:
         f = line_height(accounts, now)
-    scores = (
-        score_account(a, now, threshold=threshold,
-                      weekly_threshold=weekly_threshold,
-                      candidate_margin=candidate_margin, f=f,
-                      min_headroom=min_headroom)
-        for a in accounts
-    )
+    scores = []
+    for a in accounts:
+        five, weekly = _lines_of(a.id, threshold, weekly_threshold, lines)
+        scores.append(
+            score_account(a, now, threshold=five, weekly_threshold=weekly,
+                          candidate_margin=candidate_margin, f=f,
+                          min_headroom=min_headroom)
+        )
     return sorted((s for s in scores if s.usable), key=_rank_key)
 
 
@@ -404,6 +424,7 @@ def rank(
     threshold: float = DEFAULT_THRESHOLD,
     weekly_threshold: float | None = None,
     candidate_margin: float = DEFAULT_CANDIDATE_MARGIN,
+    lines: AccountLines | None = None,
 ) -> list[int]:
     """Return the ids of usable accounts, best first.
 
@@ -411,10 +432,13 @@ def rank(
     ``candidate_margin`` (see ``score_account``) and passes the headroom
     gates. The order is the loss guard, then the largest deficit, then less
     weekly percent used, then the lower id.
+
+    ``lines`` gives an account its own ``(threshold, weekly_threshold)``; an
+    account missing from it uses ``threshold`` and ``weekly_threshold``.
     """
     ranked = _ranked(accounts, now, threshold=threshold,
                      weekly_threshold=weekly_threshold,
-                     candidate_margin=candidate_margin)
+                     candidate_margin=candidate_margin, lines=lines)
     return [s.id for s in ranked]
 
 
@@ -427,7 +451,8 @@ def _cooldown_running(last_ts: float | None, now: float, cooldown_s: float) -> b
 
 def _active_score(accounts: Sequence[Account], active_id: int | None,
                   now: float, *, threshold: float,
-                  weekly_threshold: float | None, f: float) -> Score | None:
+                  weekly_threshold: float | None, f: float,
+                  lines: AccountLines | None = None) -> Score | None:
     """Score of the active account, or ``None`` when it is not in the list."""
     # The active account is judged against the user's lines only: the
     # MIN_HEADROOM gates keep a move from landing on an almost full account,
@@ -435,8 +460,9 @@ def _active_score(accounts: Sequence[Account], active_id: int | None,
     # the active account was forced out at 90-92% eight times).
     for a in accounts:
         if a.id == active_id:
-            return score_account(a, now, threshold=threshold,
-                                 weekly_threshold=weekly_threshold, f=f,
+            five, weekly = _lines_of(a.id, threshold, weekly_threshold, lines)
+            return score_account(a, now, threshold=five,
+                                 weekly_threshold=weekly, f=f,
                                  min_headroom=False)
     return None
 
@@ -463,6 +489,7 @@ def decide(
     weekly_threshold: float | None = None,
     candidate_margin: float = DEFAULT_CANDIDATE_MARGIN,
     burn_rate: float = 0.0,
+    lines: AccountLines | None = None,
 ) -> Decision:
     """Decide whether to leave the active account, and for which account.
 
@@ -508,10 +535,17 @@ def decide(
     ``Stay``. The proactive path keeps the margin and has no fallback. With
     margin 0 the fallback changes nothing.
 
+    ``lines`` gives an account its own ``(threshold, weekly_threshold)``;
+    an account missing from it uses ``threshold`` and ``weekly_threshold``.
+    Every rule above, the runway rule included, reads each account's own
+    lines.
+
     With no usable target this returns ``Stay``; the caller handles the case
     where every account is blocked.
     """
-    lines = {"threshold": threshold, "weekly_threshold": weekly_threshold}
+    own = lines
+    lines = {"threshold": threshold, "weekly_threshold": weekly_threshold,
+             "lines": own}
     # One line height for the whole decision: it does not depend on the margin.
     f = line_height(accounts, now)
     ranked = _ranked(accounts, now, **lines, candidate_margin=candidate_margin,
@@ -560,9 +594,14 @@ def decide(
         by_id = {a.id: a for a in accounts}
         active_account = by_id.get(active_id)
         need = burn_rate * MIN_RUNWAY_S
+        def five_line(account_id: int) -> float:
+            return _lines_of(account_id, threshold, weekly_threshold, own)[0]
+
         if active_account is not None:
-            need = min(need, five_hour_room(active_account, now, threshold))
-        others = [s for s in others if five_hour_room(by_id[s.id], now, threshold) >= need]
+            need = min(need, five_hour_room(active_account, now,
+                                            five_line(active_account.id)))
+        others = [s for s in others
+                  if five_hour_room(by_id[s.id], now, five_line(s.id)) >= need]
     if not others:
         return Stay()
     best = others[0]

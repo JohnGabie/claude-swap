@@ -11,7 +11,8 @@ Policy in one paragraph: when any of the active account's usage windows (5h,
 7d, and the per-model windows named by ``settings.model``) reaches its own
 switch line — that account's **effective threshold** (its per-account
 override where one is set, otherwise ``settings.threshold``), or
-``settings.weekly_threshold`` for the windows that reset weekly once that is
+that account's weekly line for the windows that reset weekly (its own
+``weeklyThreshold``, else ``settings.weekly_threshold``) once one is
 set — switch to the candidate with the most headroom measured against its
 own lines (see ``lines.py``; with one line it is plain ``100 - max pct``) —
 proactively, so the old account is
@@ -54,7 +55,13 @@ from claude_swap import balance, oauth, pace_feed, poll_policy
 from claude_swap.decision_log import DecisionLog
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
-from claude_swap.lines import BindingWindow, binding_window, line_room, window_line
+from claude_swap.lines import (
+    BindingWindow,
+    binding_window,
+    effective_weekly,
+    line_room,
+    window_line,
+)
 from claude_swap.locking import FileLock
 from claude_swap.models import AccountPolicy
 from claude_swap.poll_policy import (
@@ -668,12 +675,22 @@ def _balance_windows(
     return five, seven
 
 
+def _weekly_for(
+    weekly_threshold: float | None | Mapping[str, float | None], num: str
+) -> float | None:
+    """One account's weekly line: its entry when ``weekly_threshold`` is a
+    map (a total ``WeeklyLineMap``), else the one value given for all."""
+    if isinstance(weekly_threshold, Mapping):
+        return weekly_threshold[num]
+    return weekly_threshold
+
+
 def _balance_accounts(
     current: str,
     candidates: Sequence[str],
     usage: Mapping[str, dict | str | None],
     thresholds: Mapping[str, float],
-    weekly_threshold: float | None,
+    weekly_threshold: float | None | Mapping[str, float | None],
     models: Sequence[str],
     plan_of: Callable[[str], str],
 ) -> list[balance.Account]:
@@ -684,7 +701,8 @@ def _balance_accounts(
     API-key account). ``resets_at`` is converted to epoch seconds with
     ``poll_policy.parse_reset_ts``. A candidate is ``blocked`` when its binding
     window is at or over its own per-account line (``thresholds[num]``, and
-    ``weekly_threshold`` for weekly windows), the test of ``_binding``. For a
+    ``weekly_threshold`` for weekly windows: one value, or a total map of
+    each account's weekly line), the test of ``_binding``. For a
     plan in ``balance.NO_FIVE_HOUR_LIMIT_PLANS`` (Ultra) the "5h" line does
     not count. The active account is never marked blocked here: use
     ``_balance_active_at_threshold``. An account with no entry in
@@ -706,7 +724,9 @@ def _balance_accounts(
             )
             if plan in balance.NO_FIVE_HOUR_LIMIT_PLANS:
                 windows = [w for w in windows if w[0] != oauth.FIVE_HOUR_LABEL]
-            binding = binding_window(windows, thresholds[num], weekly_threshold)
+            binding = binding_window(
+                windows, thresholds[num], _weekly_for(weekly_threshold, num)
+            )
             blocked = binding is not None and binding.over
         accounts.append(balance.Account(int(num), plan, five, seven, blocked))
     return accounts
@@ -716,18 +736,20 @@ def _balance_active_at_threshold(
     current: str,
     value: dict | str | None,
     thresholds: Mapping[str, float],
-    weekly_threshold: float | None,
+    weekly_threshold: float | None | Mapping[str, float | None],
     models: Sequence[str],
     plan_of: Callable[[str], str],
 ) -> bool:
     """True when any window of the active account is at or over its line.
 
     Uses the engine's lines (``lines.window_line``) on ``thresholds[current]``
-    and ``weekly_threshold``. The "5h" window is skipped when the plan is
-    "ultra" (no 5-hour limit). A sentinel or ``None`` row gives False. Pure.
+    and ``weekly_threshold`` (one value, or a total map). The "5h" window is
+    skipped when the plan is "ultra" (no 5-hour limit). A sentinel or
+    ``None`` row gives False. Pure.
     """
     ultra = plan_of(current) == "ultra"
     line_base = thresholds[current]
+    weekly_threshold = _weekly_for(weekly_threshold, current)
     for label, pct, _ in oauth.relevant_windows(
         value if isinstance(value, dict) else None, models
     ):
@@ -885,6 +907,39 @@ class ThresholdMap(dict):
 
     def __missing__(self, key: str) -> float:
         return self.default
+
+
+class WeeklyLineMap(dict):
+    """Configured weekly switch line per account number — total, as
+    ``ThresholdMap`` is.
+
+    An account with its own ``weeklyThreshold`` maps to it; every other
+    account reads ``default``, the tick's ``settings.weekly_threshold``, which
+    may be ``None``. ``None`` keeps its meaning in ``lines.window_line``: the
+    weekly windows then use the account's 5-hour line. The dict holds the
+    account values only, so an empty map means "no account weekly line".
+    """
+
+    def __init__(
+        self, overrides: Mapping[str, float], default: float | None
+    ) -> None:
+        super().__init__(overrides)
+        self.default = default
+
+    def __missing__(self, key: str) -> float | None:
+        return self.default
+
+
+#: Default of the helpers that take one account's weekly line: "the weekly
+#: line of the ``settings`` handed in". ``None`` is a legal weekly line, so it
+#: cannot mean "not passed".
+_SETTINGS_WEEKLY: object = object()
+
+
+def _weekly_or_settings(weekly_line: object, settings: AutoSwitchSettings) -> float | None:
+    if weekly_line is _SETTINGS_WEEKLY:
+        return settings.weekly_threshold
+    return weekly_line  # type: ignore[return-value]
 
 
 def _every_candidate_above_threshold(
@@ -1066,8 +1121,11 @@ class AutoSwitchEngine:
         # the one that decides when collection must already be tight. Taking
         # the minimum can only make collection earlier, never lazier — the
         # safe direction when accounts disagree about where their line is.
+        # The weekly input follows the same rule (SL2): the general weekly
+        # line while no account has a weekly line of its own, else the lowest
+        # effective weekly line in the fleet.
         switcher.set_poll_policy_inputs(
-            self._min_effective_threshold(), settings.weekly_threshold, self._models
+            self._min_effective_threshold(), self._min_effective_weekly(), self._models
         )
         self.on_event = on_event
         self.dry_run = dry_run
@@ -1357,6 +1415,55 @@ class AutoSwitchEngine:
             effective.threshold,
         )
 
+    def _resolve_weekly_lines(
+        self, settings: AutoSwitchSettings | None = None,
+        *, policies: Mapping[str, AccountPolicy] | None = None,
+    ) -> WeeklyLineMap:
+        """The configured weekly line of every account, resolved once per
+        tick from the same policies as ``_resolve_thresholds``.
+
+        Resolution is ``policy(n).weekly_threshold if set else
+        settings.weekly_threshold`` (``lines.account_lines``); the default may
+        be ``None``. Passed down as a parameter, like the threshold map."""
+        effective = settings or self.settings
+        if policies is None:
+            policies = self.switcher.account_policies()
+        return WeeklyLineMap(
+            {
+                num: policy.weekly_threshold
+                for num, policy in policies.items()
+                if policy.weekly_threshold is not None
+            },
+            effective.weekly_threshold,
+        )
+
+    def _min_effective_weekly(
+        self,
+        thresholds: ThresholdMap | None = None,
+        weekly_lines: WeeklyLineMap | None = None,
+    ) -> float | None:
+        """The weekly input of poll cadence (``set_poll_policy_inputs``).
+
+        With no account weekly line it is ``settings.weekly_threshold``, as
+        before the account weekly line existed (``None`` included). With one
+        or more, it is the lowest effective weekly line
+        (``lines.effective_weekly``) over the switchable accounts: cadence is
+        fleet-wide, so it follows the account that reaches its weekly line
+        first. Never used for a switch decision."""
+        if thresholds is None or weekly_lines is None:
+            policies = self.switcher.account_policies()
+            if thresholds is None:
+                thresholds = self._resolve_thresholds(policies=policies)
+            if weekly_lines is None:
+                weekly_lines = self._resolve_weekly_lines(policies=policies)
+        if not weekly_lines:
+            return weekly_lines.default
+        values = [
+            effective_weekly(thresholds[num], weekly_lines[num])
+            for num in self.switcher.switchable_account_numbers()
+        ]
+        return min(values) if values else weekly_lines.default
+
     def _min_effective_threshold(
         self, thresholds: ThresholdMap | None = None
     ) -> float:
@@ -1379,7 +1486,9 @@ class AutoSwitchEngine:
         ]
         return min(values) if values else self.settings.threshold
 
-    def _refresh_poll_policy_inputs(self, thresholds: ThresholdMap) -> None:
+    def _refresh_poll_policy_inputs(
+        self, thresholds: ThresholdMap, weekly_lines: WeeklyLineMap | None = None
+    ) -> None:
         """Re-pin poll cadence from this tick's threshold map.
 
         ``set_poll_policy_inputs`` used to be called in exactly two places,
@@ -1403,9 +1512,11 @@ class AutoSwitchEngine:
         per-tick cost is one ``switchable_account_numbers()`` read, which
         ``_tick_inner`` already performs for candidate construction.
         """
+        if weekly_lines is None:
+            weekly_lines = self._resolve_weekly_lines()
         self.switcher.set_poll_policy_inputs(
             self._min_effective_threshold(thresholds),
-            self.settings.weekly_threshold,
+            self._min_effective_weekly(thresholds, weekly_lines),
             self._models,
         )
 
@@ -1537,14 +1648,18 @@ class AutoSwitchEngine:
         # global rather than raising mid-tick.
         policies = self.switcher.account_policies()
         thresholds = self._resolve_thresholds(settings, policies=policies)
+        # Each account's configured weekly line, from the same read. Every
+        # gate below passes `weekly_lines[num]` for account `num`; with no
+        # account key every value is `settings.weekly_threshold`.
+        weekly_lines = self._resolve_weekly_lines(settings, policies=policies)
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
-        self._refresh_poll_policy_inputs(thresholds)
+        self._refresh_poll_policy_inputs(thresholds, weekly_lines)
         entries, usage, headroom = self._collect_scheduled_usage(
             current,
             quarantined,
             threshold=thresholds[current],
-            weekly_threshold=settings.weekly_threshold,
+            weekly_threshold=weekly_lines[current],
         )
         # Readings are 1 to 4 minutes apart and a heavy load fills a small
         # account between two of them. The decision reads the active
@@ -1563,7 +1678,9 @@ class AutoSwitchEngine:
                 # render as "the threshold" must be the one the departure
                 # gate below actually used, or the UI contradicts the engine.
                 threshold=thresholds[current],
-                weekly_threshold=settings.weekly_threshold,
+                # The active account's configured weekly line; with no
+                # account key it is the general one (None stays None).
+                weekly_threshold=weekly_lines[current],
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1606,7 +1723,8 @@ class AutoSwitchEngine:
             # lines.py). A readable headroom means a readable window, so the
             # account-wide fallback is unreachable; kept as the exact old test.
             active_binding = self._binding(
-                usage.get(current), settings, thresholds[current]
+                usage.get(current), settings, thresholds[current],
+                weekly_lines[current],
             )
             below = (
                 not active_binding.over
@@ -1623,7 +1741,7 @@ class AutoSwitchEngine:
                     current,
                     usage.get(current),
                     thresholds,
-                    settings.weekly_threshold,
+                    weekly_lines,
                     self._models,
                     plan_of,
                 )
@@ -1693,7 +1811,7 @@ class AutoSwitchEngine:
                     self._endpoint_trouble_verdict(
                         entries.get(current),
                         thresholds[current],
-                        settings.weekly_threshold,
+                        weekly_lines[current],
                     )
                     == "hold"
                 ):
@@ -1761,7 +1879,7 @@ class AutoSwitchEngine:
             # the flag alone.
             self._emit(self._below_threshold_event(
                 usage.get(current), active_binding, active_headroom,
-                settings, thresholds[current],
+                settings, thresholds[current], weekly_lines[current],
             ))
             return TickOutcome.NO_ACTION
         if not oauth_candidates and not api_key_candidates:
@@ -1825,7 +1943,7 @@ class AutoSwitchEngine:
                     usage=kw["usage"], headroom=kw["headroom"],
                     current=current, active_enabled=current in switchable,
                     settings=settings, now=kw["now"], thresholds=thresholds,
-                    policies=policies,
+                    policies=policies, weekly_lines=weekly_lines,
                 )
             # Recomputed per snapshot, never once per tick: the consume-first
             # two-phase commit replaces `headroom` and `active_headroom` and
@@ -1842,6 +1960,7 @@ class AutoSwitchEngine:
                 kw["now"],
                 kw["current"],
                 thresholds=kw["thresholds"],
+                weekly_lines=kw["weekly_lines"],
             )
             no_return = self._no_return_account(
                 trigger,
@@ -1853,6 +1972,7 @@ class AutoSwitchEngine:
                 kw["current"],
                 thresholds=kw["thresholds"],
                 usage=kw["usage"],
+                weekly_lines=kw["weekly_lines"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
@@ -1869,6 +1989,7 @@ class AutoSwitchEngine:
             barred = self._forced_no_return_account(
                 trigger, state, entries, kw["usage"], kw["settings"],
                 kw["thresholds"], kw["current"], kw["now"],
+                weekly_lines=kw["weekly_lines"],
             )
             if barred is None:
                 return self._rank_candidates(no_return=None, **kw)
@@ -1914,12 +2035,13 @@ class AutoSwitchEngine:
                 active_headroom=active_headroom,
                 settings=settings,
                 thresholds=thresholds,
+                weekly_lines=weekly_lines,
                 now=decided_now,
                 plan_of=plan_of,
             )
             first_hold = self._below_threshold_event(
                 usage.get(current), active_binding, active_headroom,
-                settings, thresholds[current],
+                settings, thresholds[current], weekly_lines[current],
             )
             if trigger == "balanced" and isinstance(
                 choice.decision, balance.SwitchTo
@@ -1938,7 +2060,8 @@ class AutoSwitchEngine:
                 usage = _project_five_hour(usage, current, lookahead)
                 active_headroom = headroom.get(current)
                 active_binding = self._binding(
-                    usage.get(current), settings, thresholds[current]
+                    usage.get(current), settings, thresholds[current],
+                    weekly_lines[current],
                 )
                 decided_now = self.clock()
                 choice = self._balanced_choice(
@@ -1951,6 +2074,7 @@ class AutoSwitchEngine:
                     active_headroom=active_headroom,
                     settings=settings,
                     thresholds=thresholds,
+                    weekly_lines=weekly_lines,
                     now=decided_now,
                     plan_of=plan_of,
                 )
@@ -1965,7 +2089,7 @@ class AutoSwitchEngine:
                 self._emit(
                     self._below_threshold_event(
                         usage.get(current), active_binding, active_headroom,
-                        settings, thresholds[current],
+                        settings, thresholds[current], weekly_lines[current],
                     )
                     if active_headroom is not None
                     else first_hold
@@ -1995,6 +2119,7 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
                 thresholds=thresholds,
+                weekly_lines=weekly_lines,
             )
 
         if (trigger == "consume-first" or priority_mode) and ordered:
@@ -2029,10 +2154,12 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
                 thresholds=thresholds,
+                weekly_lines=weekly_lines,
             )
 
         priority_active_ready = priority_mode and current in switchable and self._priority_ready(
-            usage.get(current), headroom.get(current), settings, thresholds[current]
+            usage.get(current), headroom.get(current), settings, thresholds[current],
+            weekly_lines[current],
         )
         if (
             not ordered and api_key_candidates
@@ -2173,7 +2300,7 @@ class AutoSwitchEngine:
                 self._models,
                 decided_now,
                 threshold=thresholds[current],
-                weekly_threshold=settings.weekly_threshold,
+                weekly_threshold=weekly_lines[current],
                 scale=settings.threshold,
             ),
         )
@@ -2273,6 +2400,9 @@ class AutoSwitchEngine:
         # today's exact semantics: one global line for every account. The
         # engine's own tick always passes the resolved map explicitly.
         thresholds: Mapping[str, float] | None = None,
+        # Each account's weekly line; optional for the same reason, with the
+        # same fallback: `settings.weekly_threshold` for every account.
+        weekly_lines: Mapping[str, float | None] | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -2345,6 +2475,8 @@ class AutoSwitchEngine:
         """
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
+        if weekly_lines is None:
+            weekly_lines = WeeklyLineMap({}, settings.weekly_threshold)
         came_from = state.get("lastSwitchFrom")
         if (
             trigger not in ("proactive", "consume-first", "balanced")
@@ -2379,7 +2511,10 @@ class AutoSwitchEngine:
                 # `_left_account_recovered` uses when it, too, has no active
                 # to compare against: would the ranking accept the peer as a
                 # landing spot, i.e. is it under every one of its own lines?
-                left = self._binding(usage.get(barred), settings, thresholds[barred])
+                left = self._binding(
+                    usage.get(barred), settings, thresholds[barred],
+                    weekly_lines[barred],
+                )
                 if left is not None and not left.over:
                     return None
         return barred
@@ -2394,6 +2529,8 @@ class AutoSwitchEngine:
         thresholds: Mapping[str, float],
         current: str,
         now: float,
+        *,
+        weekly_lines: Mapping[str, float | None] | None = None,
     ) -> str | None:
         """F2: the account the engine just left, barred for an `at-limit` or
         `failover` switch. None when no bar applies or the account recovered.
@@ -2434,8 +2571,14 @@ class AutoSwitchEngine:
             and recovery_at is not None
             and now >= recovery_at
         )
+        weekly = (
+            weekly_lines[barred]
+            if weekly_lines is not None
+            else settings.weekly_threshold
+        )
         if window_reset and self._left_account_fresh_and_healthy(
-            entries.get(barred), settings, thresholds.get(barred, settings.threshold)
+            entries.get(barred), settings, thresholds.get(barred, settings.threshold),
+            weekly,
         ):
             return None
         return barred
@@ -2445,6 +2588,7 @@ class AutoSwitchEngine:
         entry: UsageEntry | None,
         settings: AutoSwitchSettings,
         line: float,
+        weekly_line: object = _SETTINGS_WEEKLY,
     ) -> bool:
         if (
             entry is None
@@ -2458,7 +2602,7 @@ class AutoSwitchEngine:
         windows = list(oauth.relevant_windows(entry.last_good, self._models))
         if not windows or any(pct >= 100.0 for _, pct, _ in windows):
             return False
-        binding = self._binding(entry.last_good, settings, line)
+        binding = self._binding(entry.last_good, settings, line, weekly_line)
         return binding is not None and not binding.over
 
     @staticmethod
@@ -2485,6 +2629,9 @@ class AutoSwitchEngine:
         # today's exact semantics: one global line for every account. The
         # engine's own tick always passes the resolved map explicitly.
         thresholds: Mapping[str, float] | None = None,
+        # Each account's weekly line; `settings.weekly_threshold` for every
+        # account when omitted.
+        weekly_lines: Mapping[str, float | None] | None = None,
     ) -> bool:
         """Is the account we left a better proposition than when we left it?
 
@@ -2588,6 +2735,8 @@ class AutoSwitchEngine:
         """
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
+        if weekly_lines is None:
+            weekly_lines = WeeklyLineMap({}, settings.weekly_threshold)
         came_from = state.get("lastSwitchFrom")
         if came_from is None:
             # Unreachable through `_no_return_account`, the only caller: it
@@ -2648,7 +2797,10 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            peer = self._binding(usage.get(barred), settings, thresholds[barred])
+            peer = self._binding(
+                usage.get(barred), settings, thresholds[barred],
+                weekly_lines[barred],
+            )
             if peer is not None and not peer.over:
                 return True
             peer_recovery_ts = _binding_recovery_ts(
@@ -2656,7 +2808,7 @@ class AutoSwitchEngine:
                 self._models,
                 now,
                 threshold=thresholds[barred],
-                weekly_threshold=settings.weekly_threshold,
+                weekly_threshold=weekly_lines[barred],
                 scale=settings.threshold,
             )
             active_recovery_ts = _binding_recovery_ts(
@@ -2664,7 +2816,7 @@ class AutoSwitchEngine:
                 self._models,
                 now,
                 threshold=thresholds[current],
-                weekly_threshold=settings.weekly_threshold,
+                weekly_threshold=weekly_lines[current],
                 scale=settings.threshold,
             )
             # The active's recovery must be a REAL measurement, not merely
@@ -2729,7 +2881,8 @@ class AutoSwitchEngine:
                     return True
             else:
                 peer = self._binding(
-                    usage.get(barred), settings, thresholds[barred]
+                    usage.get(barred), settings, thresholds[barred],
+                    weekly_lines[barred],
                 )
                 if peer is not None and not peer.over:
                     return True
@@ -2749,7 +2902,7 @@ class AutoSwitchEngine:
                 self._models,
                 now,
                 threshold=thresholds[barred],
-                weekly_threshold=settings.weekly_threshold,
+                weekly_threshold=weekly_lines[barred],
                 scale=settings.threshold,
             )
             < was - RECOVERY_HYSTERESIS_S
@@ -2758,9 +2911,10 @@ class AutoSwitchEngine:
     def _priority_ready(
         self, value: dict | str | None, headroom: float | None,
         settings: AutoSwitchSettings, threshold: float,
+        weekly_line: object = _SETTINGS_WEEKLY,
     ) -> bool:
         """Priority rotation never lands at or above any configured line."""
-        binding = self._binding(value, settings, threshold)
+        binding = self._binding(value, settings, threshold, weekly_line)
         return (
             headroom is not None and headroom > 0
             and binding is not None and not binding.over
@@ -2772,6 +2926,7 @@ class AutoSwitchEngine:
         current: str, active_enabled: bool, settings: AutoSwitchSettings,
         now: float, thresholds: Mapping[str, float],
         policies: Mapping[str, AccountPolicy],
+        weekly_lines: Mapping[str, float | None] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Highest usable tier, then earliest weekly reset, with stable ties.
 
@@ -2781,6 +2936,9 @@ class AutoSwitchEngine:
         existing strategies, even at-limit/failover never selects an account
         at its switch line. Priorities do not bypass eligibility checks.
         """
+        if weekly_lines is None:
+            weekly_lines = WeeklyLineMap({}, settings.weekly_threshold)
+
         def key(num: str) -> tuple[int, float]:
             reset = _seven_day_reset_ts(usage.get(num), now)
             return (-policies.get(num, AccountPolicy()).priority,
@@ -2789,12 +2947,16 @@ class AutoSwitchEngine:
         active_key = (
             key(current)
             if active_enabled and self._priority_ready(
-                usage.get(current), headroom.get(current), settings, thresholds[current]
+                usage.get(current), headroom.get(current), settings, thresholds[current],
+                weekly_lines[current],
             ) else None
         )
         ordered = [
             num for num in oauth_candidates
-            if self._priority_ready(usage.get(num), headroom.get(num), settings, thresholds[num])
+            if self._priority_ready(
+                usage.get(num), headroom.get(num), settings, thresholds[num],
+                weekly_lines[num],
+            )
             and (active_key is None or key(num) < active_key)
         ]
         ordered.sort(key=key)  # Sequence order breaks candidate ties.
@@ -2821,6 +2983,9 @@ class AutoSwitchEngine:
         # for every account, so a caller without per-account context behaves
         # exactly as this function did before per-account thresholds existed.
         thresholds: Mapping[str, float] | None = None,
+        # Each account's weekly line; `settings.weekly_threshold` for every
+        # account when omitted.
+        weekly_lines: Mapping[str, float | None] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -2831,6 +2996,8 @@ class AutoSwitchEngine:
         """
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
+        if weekly_lines is None:
+            weekly_lines = WeeklyLineMap({}, settings.weekly_threshold)
         # weekly-first is `best` with consume-first's ranking: the same
         # departure line, landing gates, hysteresis and escapes as `best`, but
         # a proactive move picks the eligible account whose weekly window
@@ -2845,7 +3012,9 @@ class AutoSwitchEngine:
         # consume-first phase-2 refetch hands in fresh `usage`, so nothing the
         # trigger computed is reused here.
         bindings = {
-            num: self._binding(usage.get(num), settings, thresholds[num])
+            num: self._binding(
+                usage.get(num), settings, thresholds[num], weekly_lines[num]
+            )
             for num in (*oauth_candidates, current)
         }
         active_binding = bindings[current]
@@ -2935,7 +3104,9 @@ class AutoSwitchEngine:
             # Points left before the candidate reaches the nearest of its own
             # lines, each window in its own points (`lines.line_room`); the
             # single line against raw `h` when it reports no window.
-            room = self._room(usage.get(num), settings, thresholds[num])
+            room = self._room(
+                usage.get(num), settings, thresholds[num], weekly_lines[num]
+            )
             if room is None:
                 room = thresholds[num] - (100.0 - h)
             over = (
@@ -3361,11 +3532,17 @@ class AutoSwitchEngine:
     # -- helpers --------------------------------------------------------------
 
     def _binding(
-        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+        self,
+        value: dict | str | None,
+        settings: AutoSwitchSettings,
+        line: float,
+        weekly_line: object = _SETTINGS_WEEKLY,
     ) -> BindingWindow | None:
         """The window binding this account under the tick's lines (see
         ``lines.binding_window``), or None when it reports no window. ``line``
-        is the account's effective threshold from the tick's map. Reads
+        is the account's effective threshold from the tick's map, and
+        ``weekly_line`` its configured weekly line from the tick's
+        ``WeeklyLineMap`` (omitted: ``settings.weekly_threshold``). Reads
         only ``self._models`` and the ``settings`` it is handed, never
         ``self.settings``: a tick snapshots its settings once, and the ranking
         helpers are exercised directly on bare engines."""
@@ -3374,12 +3551,16 @@ class AutoSwitchEngine:
                 value if isinstance(value, dict) else None, self._models
             ),
             line,
-            settings.weekly_threshold,
+            _weekly_or_settings(weekly_line, settings),
             scale=settings.threshold,
         )
 
     def _room(
-        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+        self,
+        value: dict | str | None,
+        settings: AutoSwitchSettings,
+        line: float,
+        weekly_line: object = _SETTINGS_WEEKLY,
     ) -> float | None:
         """Points left before this account's nearest line under the tick's
         lines (see ``lines.line_room``), or None when it reports no window.
@@ -3389,7 +3570,7 @@ class AutoSwitchEngine:
                 value if isinstance(value, dict) else None, self._models
             ),
             line,
-            settings.weekly_threshold,
+            _weekly_or_settings(weekly_line, settings),
         )
 
     def _in_cooldown(self, state: dict) -> bool:
@@ -3448,6 +3629,7 @@ class AutoSwitchEngine:
         now: float,
         plan_of: Callable[[str], str],
         raw_usage: dict[str, dict | str | None] | None = None,
+        weekly_lines: Mapping[str, float | None] | None = None,
     ) -> _BalancedChoice:
         """Run ``balance.decide`` on one snapshot. Pure apart from the plan
         reads: no emits, no state writes, so the two-phase commit runs it
@@ -3462,34 +3644,47 @@ class AutoSwitchEngine:
         plus the rest of ``balance.rank`` for a forced switch (the freshen
         loop tries them in turn). It is empty for ``Stay`` and ``Hold``.
         """
+        if weekly_lines is None:
+            weekly_lines = WeeklyLineMap({}, settings.weekly_threshold)
         # Every account of the tick in the map: the builder never blocks an
         # account that is missing from it.
         lines = {num: thresholds[num] for num in (current, *candidates)}
+        weekly = {num: weekly_lines[num] for num in (current, *candidates)}
         # The accounts as read: the burn lookahead only decides whether the
         # active account must leave (``at_threshold`` below), it does not
         # shrink the active account's room in the comparison with the others.
         accounts = _balance_accounts(
             current, candidates, raw_usage if raw_usage is not None else usage,
-            lines, settings.weekly_threshold, self._models, plan_of,
+            lines, weekly, self._models, plan_of,
         )
         at_threshold = _balance_active_at_threshold(
-            current, usage.get(current), lines, settings.weekly_threshold,
+            current, usage.get(current), lines, weekly,
             self._models, plan_of,
         )
         recovered = self._left_account_recovered(
             state, usage, headroom, active_headroom, settings, now, current,
-            thresholds=thresholds,
+            thresholds=thresholds, weekly_lines=weekly_lines,
         )
         # The bar has the scope of the trigger this decision would switch
         # with: the engine's own one at the threshold, else "balanced".
         barred = self._no_return_account(
             _forced_trigger(active_headroom) if at_threshold else "balanced",
             state, headroom, active_headroom, recovered, settings, current,
-            thresholds=thresholds, usage=usage,
+            thresholds=thresholds, usage=usage, weekly_lines=weekly_lines,
         )
+        # Each account's own two lines (SL2). The 5-hour line stays the
+        # general one, as before the account weekly line: `balance` has
+        # always scored the 5-hour window on `settings.threshold` and left
+        # the account's own 5-hour line to the `blocked` flag and
+        # `at_threshold` above. The weekly line is the account's configured
+        # one; with no account key that is `settings.weekly_threshold`, so
+        # the result is unchanged.
         lines_kw = {
             "threshold": settings.threshold,
             "weekly_threshold": settings.weekly_threshold,
+            "lines": {
+                int(num): (settings.threshold, weekly[num]) for num in weekly
+            },
         }
 
         def run(accs: list[balance.Account]) -> balance.Decision:
@@ -3546,6 +3741,7 @@ class AutoSwitchEngine:
         active_headroom: float,
         settings: AutoSwitchSettings,
         line: float,
+        weekly_line: object = _SETTINGS_WEEKLY,
     ) -> NoSwitchEvent:
         """The below-threshold hold. An Ultra active account can be over its
         5h line and still below for the balanced strategy: the detail then
@@ -3559,7 +3755,8 @@ class AutoSwitchEngine:
                 if w[0] != oauth.FIVE_HOUR_LABEL
             ]
             binding = binding_window(
-                windows, line, settings.weekly_threshold, scale=settings.threshold
+                windows, line, _weekly_or_settings(weekly_line, settings),
+                scale=settings.threshold,
             )
         return NoSwitchEvent(
             reason="below-threshold",
@@ -3731,7 +3928,7 @@ class AutoSwitchEngine:
         # lower than the new session global, and cadence follows the minimum.
         self.switcher.set_poll_policy_inputs(
             self._min_effective_threshold(),
-            self.settings.weekly_threshold,
+            self._min_effective_weekly(),
             self._models,
         )
 

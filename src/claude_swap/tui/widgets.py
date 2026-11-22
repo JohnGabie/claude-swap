@@ -496,8 +496,13 @@ class AccountsPanel(Static):
                 blocks.append(
                     fitted_card_text(
                         acc, width, panel_width, threshold=app.threshold_pct,
-                        weekly_threshold=app.weekly_threshold_pct, now=now,
-                        palette=palette, show_tag=app.tag_shown(acc),
+                        # The account's own weekly line, else the general one.
+                        weekly_threshold=(
+                            acc.policy.weekly_threshold
+                            if acc.policy.weekly_threshold is not None
+                            else app.weekly_threshold_pct
+                        ),
+                        now=now, palette=palette, show_tag=app.tag_shown(acc),
                     )
                 )
             elif self._show_minis:

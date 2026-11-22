@@ -59,6 +59,8 @@ from claude_swap.fsutil import (
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
+    ACCOUNT_THRESHOLD_MAX,
+    ACCOUNT_THRESHOLD_MIN,
     AccountPolicy,
     AccountSnapshot,
     AccountsSnapshot,
@@ -109,6 +111,14 @@ from claude_swap.usage_store import (
     UsageStore,
     with_sentinel,
 )
+
+# Account record keys of the two account lines (spec 2026-11-22 SL2/SL6):
+# the 5-hour line and the weekly line, both in percent used.
+ACCOUNT_WEEKLY_LINE_KEY = "weeklyThreshold"
+ACCOUNT_LINE_KEYS = ("threshold", ACCOUNT_WEEKLY_LINE_KEY)
+# How long the silent line writer waits for the account lock. The tray calls
+# it from its UI thread, so it must give up quickly.
+ACCOUNT_LINE_LOCK_TIMEOUT_S = 2.0
 
 # Service name under which the legacy ``keyring`` library stored per-account
 # backup credentials on macOS (kept for the one-time keyring → security migration
@@ -2152,7 +2162,9 @@ class ClaudeAccountSwitcher:
     #: rewrites from the new credential. ``add_account`` and
     #: ``add_account_from_token`` rebuild a ``--slot`` record wholesale and
     #: carry exactly these across; a new per-account setting belongs here.
-    USER_ACCOUNT_SETTINGS: tuple[str, ...] = ("alias", "disabled", "threshold", "priority")
+    USER_ACCOUNT_SETTINGS: tuple[str, ...] = (
+        "alias", "disabled", "threshold", "priority", "weeklyThreshold",
+    )
 
     @classmethod
     def _carried_settings(cls, record: dict | None) -> dict:
@@ -2197,22 +2209,27 @@ class ClaudeAccountSwitcher:
         record = data.get("accounts", {}).get(str(account_num))
         if not record:
             return AccountPolicy()
-        raw = record.get("threshold")
-        threshold: float | None
-        if raw is None:
-            threshold = None
-        else:
+
+        def line(key: str) -> float | None:
+            raw = record.get(key)
+            if raw is None:
+                return None
             try:
-                threshold = normalize_account_threshold(raw)
+                return normalize_account_threshold(raw)
             except ValueError:
                 # Hand-edited garbage, out-of-range, NaN/inf: inherit the
                 # global default rather than propagate an unusable number.
-                threshold = None
+                return None
+
         try:
             priority = normalize_account_priority(record.get("priority", 0))
         except ValueError:
             priority = 0
-        return AccountPolicy(threshold=threshold, priority=priority)
+        return AccountPolicy(
+            threshold=line("threshold"),
+            priority=priority,
+            weekly_threshold=line(ACCOUNT_WEEKLY_LINE_KEY),
+        )
 
     def account_policies(self) -> dict[str, AccountPolicy]:
         """Every managed slot's auto-switch policy, from one sequence read.
@@ -2329,6 +2346,133 @@ class ClaudeAccountSwitcher:
             )
             print(f"{accent('Set')} Account-{account_num} ({email}) "
                   f"threshold to {normalized:g}%.")
+
+    def set_account_weekly_threshold(
+        self, identifier: str, threshold: object | None
+    ) -> None:
+        """Set or clear one account's own weekly switch line (CLI setter).
+
+        The value replaces ``autoswitch.weeklyThreshold`` for this account
+        only, on the 7d and per-model windows. Same checks, store rules and
+        message style as :meth:`set_account_threshold`: the value is validated
+        before any write, and ``None`` pops the ``weeklyThreshold`` key.
+
+        Raises:
+            ConfigError: No accounts are managed yet, or the email is ambiguous.
+            AccountNotFoundError: The identifier matches no managed account.
+            ValueError: The value is not a number in range.
+        """
+        key = ACCOUNT_WEEKLY_LINE_KEY
+        normalized = None if threshold is None else normalize_account_threshold(threshold)
+
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+
+        current = record.get(key)
+        if normalized is None and key not in record:
+            print(dimmed(
+                f"Account-{account_num} ({email}) has no weekly threshold override "
+                f"— already using the global default."
+            ))
+            return
+        if normalized is not None and current == normalized:
+            print(dimmed(
+                f"Account-{account_num} ({email}) is already at {normalized:g}% weekly."
+            ))
+            return
+
+        if normalized is None:
+            record.pop(key, None)
+        else:
+            record[key] = normalized
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        # No email in the log: the account number names the slot.
+        if normalized is None:
+            self._logger.info(f"Cleared weekly threshold for account {account_num}")
+            print(f"{accent('Cleared')} weekly threshold for Account-{account_num} "
+                  f"({email}) — now using the global default.")
+        else:
+            self._logger.info(
+                f"Set weekly threshold {normalized:g} for account {account_num}"
+            )
+            print(f"{accent('Set')} Account-{account_num} ({email}) "
+                  f"weekly threshold to {normalized:g}%.")
+
+    def write_account_line(
+        self, num: object, key: str, value: object | None
+    ) -> dict:
+        """Silent writer of one account line, for the tray and the pill.
+
+        ``num`` is the slot number. ``key`` is ``"threshold"`` (5-hour line)
+        or ``"weeklyThreshold"`` (weekly line). ``value`` is a number in
+        ``[ACCOUNT_THRESHOLD_MIN, ACCOUNT_THRESHOLD_MAX]``, or ``None`` to
+        clear: the key is popped, never written as ``null``.
+
+        Prints nothing and never raises. Returns ``{"ok": bool, "error": str |
+        None}``. The error text and the log lines name the slot number only:
+        no email, organization name, alias or exception text, so no identity
+        can leak to a UI. A refused call leaves ``sequence.json`` unchanged.
+        """
+        if key not in ACCOUNT_LINE_KEYS:
+            return {"ok": False, "error": "unknown line key"}
+        if isinstance(num, bool) or not isinstance(num, (str, int)):
+            return {"ok": False, "error": "unknown account"}
+        account_num = str(num)
+        if value is None:
+            normalized = None
+        else:
+            try:
+                normalized = normalize_account_threshold(value)
+            except ValueError:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"line must be between {ACCOUNT_THRESHOLD_MIN:g} "
+                        f"and {ACCOUNT_THRESHOLD_MAX:g}"
+                    ),
+                }
+        if not self.sequence_file.exists():
+            return {"ok": False, "error": "no accounts are managed yet"}
+        # The account lock, as a switch takes it: the tray writes while the
+        # engine may switch in another thread, and a read-modify-write
+        # without it can put back an old `activeAccountNumber`.
+        lock = FileLock(self.lock_file, timeout=ACCOUNT_LINE_LOCK_TIMEOUT_S)
+        try:
+            locked = lock.acquire()
+        except OSError:
+            locked = False
+        if not locked:
+            return {"ok": False, "error": "account store is busy"}
+        try:
+            try:
+                data = self._get_sequence_data()
+            except Exception:  # noqa: BLE001 - silent writer: never raises
+                return {"ok": False, "error": "account store is unreadable"}
+            accounts = data.get("accounts") if isinstance(data, dict) else None
+            record = accounts.get(account_num) if isinstance(accounts, dict) else None
+            if not isinstance(record, dict):
+                return {"ok": False, "error": "unknown account"}
+            if normalized is None:
+                if key not in record:
+                    return {"ok": True, "error": None}
+                record.pop(key)
+            else:
+                if record.get(key) == normalized:
+                    return {"ok": True, "error": None}
+                record[key] = normalized
+            data["lastUpdated"] = get_timestamp()
+            try:
+                self._write_json(self.sequence_file, data)
+            except Exception:  # noqa: BLE001 - silent writer: never raises
+                return {"ok": False, "error": "account store write failed"}
+        finally:
+            lock.release()
+        if normalized is None:
+            self._logger.info(f"Cleared {key} for account {account_num}")
+        else:
+            self._logger.info(f"Set {key} {normalized:g} for account {account_num}")
+        return {"ok": True, "error": None}
 
     def set_account_priority(self, identifier: str, priority: object | None) -> None:
         """Set a priority tier, or remove it with None/0. Validate before writing."""
