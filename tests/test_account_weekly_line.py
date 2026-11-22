@@ -165,6 +165,190 @@ class TestWriteAccountLine(PolicyStoreBase):
         assert Path(s.sequence_file).read_bytes() == before
 
 
+class TestWriteAccountLineReturnPaths(PolicyStoreBase):
+    """One test per return path of `write_account_line`: the exact result,
+    no `@` in it, and `sequence.json` bytes unchanged on every refusal."""
+
+    BACKDATED = "2024-01-01T00:00:00Z"
+
+    @pytest.fixture
+    def acquires(self, monkeypatch) -> list:
+        """Each `FileLock.acquire` call: the checks before the lock must
+        refuse without taking it."""
+        from claude_swap.locking import FileLock
+
+        calls: list = []
+        real = FileLock.acquire
+
+        def counted(self, timeout=None):
+            calls.append(self.lock_path)
+            return real(self, timeout)
+
+        monkeypatch.setattr(FileLock, "acquire", counted)
+        return calls
+
+    def _refused(self, s, result: dict, error: str, before: bytes) -> None:
+        assert result == {"ok": False, "error": error}
+        assert "@" not in json.dumps(result)
+        assert Path(s.sequence_file).read_bytes() == before
+
+    def test_unknown_key(self, temp_home: Path, acquires):
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+        self._refused(
+            s, s.write_account_line("2", "dailyThreshold", 80), "unknown line key", before
+        )
+        assert acquires == []
+
+    @pytest.mark.parametrize("num", [True, None, 2.0, ["2"]])
+    def test_a_number_that_is_not_a_slot_type(self, temp_home: Path, acquires, num):
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+        self._refused(
+            s, s.write_account_line(num, "threshold", 80), "unknown account", before
+        )
+        assert acquires == []
+
+    def test_unknown_account(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+        self._refused(
+            s, s.write_account_line("9", "threshold", 80), "unknown account", before
+        )
+
+    @pytest.mark.parametrize("value", [101, 49.9, True, "abc", float("nan")])
+    def test_out_of_range(self, temp_home: Path, acquires, value):
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+        self._refused(
+            s, s.write_account_line("2", "weeklyThreshold", value),
+            "line must be between 50 and 99.9", before,
+        )
+        assert acquires == []
+
+    def test_no_accounts_managed_yet(self, temp_home: Path, acquires):
+        s = ClaudeAccountSwitcher()
+        assert not Path(s.sequence_file).exists()
+        assert s.write_account_line("2", "weeklyThreshold", 92) == {
+            "ok": False, "error": "no accounts are managed yet",
+        }
+        assert not Path(s.lock_file).exists()
+        assert not Path(s.sequence_file).exists()
+        assert acquires == []
+
+    def test_busy_while_the_account_lock_is_held(self, temp_home: Path, monkeypatch):
+        from claude_swap import switcher as switcher_module
+        from claude_swap.locking import FileLock
+
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+        monkeypatch.setattr(switcher_module, "ACCOUNT_LINE_LOCK_TIMEOUT_S", 0.1)
+        held = FileLock(s.lock_file, timeout=0.1)
+        assert held.acquire()
+        try:
+            result = s.write_account_line("2", "weeklyThreshold", 92)
+        finally:
+            held.release()
+        self._refused(s, result, "account store is busy", before)
+
+    def test_busy_when_the_lock_cannot_be_opened(self, temp_home: Path, monkeypatch):
+        from claude_swap.locking import FileLock
+
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+
+        def refuse(self, timeout=None):
+            raise OSError("lock directory is read-only")
+
+        monkeypatch.setattr(FileLock, "acquire", refuse)
+        self._refused(
+            s, s.write_account_line("2", "weeklyThreshold", 92),
+            "account store is busy", before,
+        )
+
+    def test_unreadable_store(self, temp_home: Path, monkeypatch):
+        from claude_swap.exceptions import ConfigError
+
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+
+        def torn():
+            raise ConfigError("sequence.json is torn")
+
+        monkeypatch.setattr(s, "_get_sequence_data", torn)
+        self._refused(
+            s, s.write_account_line("2", "weeklyThreshold", 92),
+            "account store is unreadable", before,
+        )
+
+    def test_write_failed(self, temp_home: Path, monkeypatch):
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+
+        def boom(path, payload):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(s, "_write_json", boom)
+        self._refused(
+            s, s.write_account_line("2", "weeklyThreshold", 92),
+            "account store write failed", before,
+        )
+
+    def test_clearing_an_absent_line_writes_nothing(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        before = Path(s.sequence_file).read_bytes()
+        assert s.write_account_line("2", "weeklyThreshold", None) == {
+            "ok": True, "error": None,
+        }
+        assert Path(s.sequence_file).read_bytes() == before
+
+    def test_setting_the_same_value_writes_nothing(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        assert s.write_account_line("2", "weeklyThreshold", 92)["ok"]
+        data = s._get_sequence_data()
+        data["lastUpdated"] = self.BACKDATED
+        s._write_json(s.sequence_file, data)
+        before = Path(s.sequence_file).read_bytes()
+        assert s.write_account_line("2", "weeklyThreshold", 92.0) == {
+            "ok": True, "error": None,
+        }
+        assert Path(s.sequence_file).read_bytes() == before
+
+    def test_a_write_stamps_last_updated(self, temp_home: Path):
+        s = self._fleet(temp_home)
+        assert s._get_sequence_data()["lastUpdated"] == self.BACKDATED
+        assert s.write_account_line("2", "weeklyThreshold", 92)["ok"]
+        assert s._get_sequence_data()["lastUpdated"] != self.BACKDATED
+
+    def test_the_lock_is_released_before_the_log_line(self, temp_home: Path, monkeypatch):
+        """The writer releases the account lock itself, before it logs, not
+        when the lock object is garbage collected at return."""
+        from claude_swap.locking import FileLock
+
+        s = self._fleet(temp_home)
+        free: list[bool] = []
+
+        def probe(msg, *args, **kwargs):
+            lock = FileLock(s.lock_file, timeout=0.0)
+            got = lock.acquire()
+            if got:
+                lock.release()
+            free.append(got)
+
+        monkeypatch.setattr(s._logger, "info", probe)
+        assert s.write_account_line("2", "weeklyThreshold", 92)["ok"]
+        assert free == [True]
+
+    def test_the_lock_is_released_after_a_write(self, temp_home: Path):
+        from claude_swap.locking import FileLock
+
+        s = self._fleet(temp_home)
+        assert s.write_account_line("2", "weeklyThreshold", 92)["ok"]
+        probe = FileLock(s.lock_file, timeout=0.0)
+        assert probe.acquire()
+        probe.release()
+
+
 class TestReloginKeepsTheWeeklyLine(PolicyStoreBase):
     def test_relogin_keeps_weekly_account_line(self, temp_home: Path):
         """S7: `add --slot 2` on the same identity keeps `weeklyThreshold`."""
@@ -747,6 +931,65 @@ class TestPollCadenceWeeklyInput:
     def test_accounts_without_a_weekly_line_count_with_their_5h_line(self, temp_home):
         h = _s3_fleet(temp_home, weekly_key=95.0)
         assert h.switcher._poll_inputs_override[1] == 90.0
+
+    def test_an_accounts_own_5h_line_counts_when_it_has_no_weekly_line(self, temp_home):
+        """N1. Account 2 weekly 95; account 3 has its own 5-hour line 80 and
+        no weekly line, so its effective weekly line is 80: cadence pins 80."""
+        h = _s3_fleet(temp_home, weekly_key=95.0)
+        assert h.switcher.write_account_line("3", "threshold", 80)["ok"]
+        h.engine = h._make_engine()
+        assert h.switcher._poll_inputs_override[1] == 80.0
+
+    def test_the_general_line_is_not_in_the_minimum(self, temp_home):
+        """P5. Every account has its own weekly line (92, 95); the general
+        weekly line 60 belongs to no account: cadence pins 92."""
+        h = _s3_fleet(temp_home, weekly_key=92.0, weekly_threshold=60.0)
+        assert h.switcher.write_account_line("3", "weeklyThreshold", 95)["ok"]
+        h.engine = h._make_engine()
+        assert h.switcher._poll_inputs_override[1] == 92.0
+
+    def test_a_disabled_account_does_not_drag_the_minimum_down(self, temp_home):
+        h = _s3_fleet(temp_home, weekly_key=92.0, weekly_threshold=97.0)
+        assert h.switcher.write_account_line("3", "weeklyThreshold", 60)["ok"]
+        h.switcher.set_account_disabled("3", True)
+        h.engine = h._make_engine()
+        assert h.switcher._poll_inputs_override[1] == 92.0
+
+    def test_no_switchable_account_pins_the_general_line(self, temp_home):
+        h = _s3_fleet(temp_home, weekly_key=92.0, weekly_threshold=97.0)
+        h.switcher.set_account_disabled("2", True)
+        h.switcher.set_account_disabled("3", True)
+        h.engine = h._make_engine()
+        assert h.switcher._poll_inputs_override[1] == 97.0
+
+    def test_apply_threshold_repins_the_weekly_input(self, temp_home):
+        """P2. Account 2 weekly 92, general 97: after `apply_threshold(85)`
+        the 5-hour input is 85 and the weekly input stays 92."""
+        h = _s3_fleet(temp_home, weekly_key=92.0, weekly_threshold=97.0)
+        h.switcher.set_poll_policy_inputs(90.0, None, ())
+        h.engine.apply_threshold(85.0)
+        assert h.switcher._poll_inputs_override[:2] == (85.0, 92.0)
+
+    def test_apply_threshold_moves_the_5h_fallback_of_the_weekly_input(self, temp_home):
+        """General weekly unset: account 3 has no line, so its weekly windows
+        use the session 5-hour line. After `apply_threshold(85)` the weekly
+        input is min(92, 85) = 85."""
+        h = _s3_fleet(temp_home, weekly_key=92.0)
+        assert h.switcher._poll_inputs_override[1] == 90.0
+        h.engine.apply_threshold(85.0)
+        assert h.switcher._poll_inputs_override[1] == 85.0
+
+    def test_a_tick_reads_the_account_policies_once(self, temp_home):
+        """SL2: one store read per tick resolves both lines for every
+        account; the cadence pin reuses the tick's maps."""
+        from unittest.mock import patch
+
+        h = _s3_fleet(temp_home, weekly_key=92.0, weekly_threshold=97.0)
+        real = h.switcher.account_policies
+        with patch.object(h.switcher, "account_policies", side_effect=real) as reads:
+            h.tick_with_usage({"2": _usage7(10.0, 20.0), "3": _usage7(0.0, 20.0)})
+        assert reads.call_count == 1
+        assert h.switcher._poll_inputs_override[1] == 92.0
 
     def test_a_tick_repins_after_a_store_change(self, temp_home):
         h = _s3_fleet(temp_home, weekly_key=None, weekly_threshold=97.0)
