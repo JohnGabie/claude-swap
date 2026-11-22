@@ -128,7 +128,7 @@ def pill_position(edge: str, size: tuple[int, int], area: tuple[int, int, int, i
 
 
 # The tallest account card: FP10's rows plus the open "Limites desta conta" section (SL4 replaces FP10's 372)
-CARD_MAX_H = 560
+CARD_MAX_H = 600  # tallest measured in Chrome: 571 (3-line alert, critical line, open section, error line)
 
 
 def window_layout(edge: str, n_accounts: int, area: tuple[int, int, int, int], offset: int = 0) -> dict:

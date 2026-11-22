@@ -447,7 +447,7 @@ def test_square_is_inside_the_pill_length_and_the_payload():
 
 def test_card_is_300_wide_and_the_window_has_room_for_it():
     assert pill.CARD_W == 300
-    assert pill.CARD_MAX_H == 560  # SL4 replaces FP10's 372: the card has the open "Limites desta conta" section
+    assert pill.CARD_MAX_H == 600  # SL4 replaces FP10's 372: the open "Limites desta conta" section; tallest measured 571
 
 
 def test_payload_passes_the_card_budget_through():
