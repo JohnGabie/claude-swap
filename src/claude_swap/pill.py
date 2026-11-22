@@ -428,9 +428,8 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 .sl input::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;margin-top:-6px;border-radius:50%;
  background:var(--fg);box-shadow:0 0 0 3px rgba(244,238,219,.15)}
 .sl input:disabled{cursor:default;opacity:.4}
-.sl s{position:absolute;top:5px;width:2px;height:8px;margin-left:-1px;background:var(--ink2);opacity:.55;pointer-events:none;
+.sl s{position:absolute;top:3px;width:2px;height:12px;margin-left:-1px;background:var(--fg);opacity:.9;pointer-events:none;
  left:calc(8px + (100% - 16px) * var(--x))}
-.sl s.gen{top:3px;height:12px;background:var(--fg);opacity:.9}
 .lim-err{color:var(--crit);font-size:11.5px;margin:0 0 8px}
 .lim-foot{display:flex;justify-content:space-between;align-items:center;color:var(--dim);font-size:11.5px}
 .lim-foot .lnk{color:var(--avail);cursor:pointer}
@@ -571,13 +570,13 @@ function cardHtml(it){
  return head+alert+meters(it,b)+`<div class=foot><div><div class=l>Consumo agora</div><div class=v>${it.active&&typeof b.nowPerMin==='number'?tok(b.nowPerMin)+'/min':DASH}</div></div>
   <div><div class=l>1% desta conta \\u2248</div><div class=v>${typeof b.tokensPerPercent==='number'?tok(b.tokensPerPercent)+' tokens':DASH}</div></div></div>`+limitsHtml(it);
 }
-// Slider position 0..1 of a percent on the 50-99 scale; a use below 50 sits at the left end
+// Slider position 0..1 of a percent on the 50-99 scale; outside it, the end of the scale
 const lfrac=v=>Math.max(0,Math.min(1,(Number(v)-LMIN)/(LMAX-LMIN))).toFixed(4);
 function lineSlider(it,kind,on){
- const l=it.lines, v=l[kind], own=kind==='five'?l.own5:l.ownWeek, g=P&&P.generalLines, use=it[kind];
+ const l=it.lines, v=l[kind], own=kind==='five'?l.own5:l.ownWeek, g=P&&P.generalLines;
  return `<div class=sl-top><span class=k>${NAMES[kind==='five'?'5h':'7d']}</span><span class="lv${own?' own':''}" data-v=${kind}>${lnum(v)}%</span></div>
   <div class="sl ${kind}"><input type=range min=${LMIN} max=${LMAX} step=1 value="${Math.round(v)}" data-kind=${kind} data-num="${esc(it.num)}" style="--x:${lfrac(v)}"${on?'':' disabled'}>`+
-  (use!=null?`<s class=use style="--x:${lfrac(use)}"></s>`:'')+(g?`<s class=gen style="--x:${lfrac(g[kind])}"></s>`:'')+'</div>';
+  (g?`<s class=gen style="--x:${lfrac(g[kind])}"></s>`:'')+'</div>';
 }
 // "Limites desta conta" (SL4): the last row of a card with usage rows; open, the selector, two sliders and the foot
 function limitsHtml(it){

@@ -1070,12 +1070,15 @@ def marks(html, kind):
 
 
 @needs_node
-def test_slider_marks_sit_at_the_use_and_the_general_line(tmp_path):
-    # SL4: a use below 50 sits at the left end (above 99 at the right end); the general mark is at the general line
+def test_slider_has_the_general_mark_and_no_use_mark(tmp_path):
+    # SL4 (L6): the bars above show the use, so the sliders draw no use mark; the general mark keeps its place
     p = lines_payload(lines_card(five=48.0, week=100.0), open_=True)
-    html = run_lines(tmp_path, "render(p); return cardHtml(p.items[0]);", p)
-    assert marks(html, "five") == {"use": "0.0000", "gen": "0.8163"}  # (90 - 50) / 49
-    assert marks(html, "week") == {"use": "1.0000", "gen": "0.9184"}  # (95 - 50) / 49
+    html = run_live(tmp_path, "render(p); showCard(0); fire(__cardL, 'click', {target: actEl('own')});"
+                              " return __card.innerHTML;", p)
+    assert "type=range" in html  # the section is open, so the sliders were drawn
+    assert "class=use" not in html
+    assert marks(html, "five") == {"gen": "0.8163"}  # (90 - 50) / 49
+    assert marks(html, "week") == {"gen": "0.9184"}  # (95 - 50) / 49
 
 
 @needs_node
