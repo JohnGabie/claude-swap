@@ -201,15 +201,10 @@ def _polls(h) -> list[PollEvent]:
     return [e for e in h.events if isinstance(e, PollEvent)]
 
 
-@pytest.mark.parametrize(
-    "general_weekly", [None, 97.0], ids=["general-weekly-unset", "general-weekly-97"]
-)
-def test_engine_switches_at_account_weekly_line(temp_home, general_weekly):
-    """S3: account 2 leaves at its own weekly line 92 (7d at 92).
-
-    The `general-weekly-97` case is the same fleet with a general weekly
-    line of 97: only the account line puts 7d 92 at the line there."""
-    h = _s3_fleet(temp_home, weekly_key=92.0, weekly_threshold=general_weekly)
+def test_engine_switches_at_account_weekly_line(temp_home):
+    """S3: general weekly line 97; account 2 leaves at its own weekly line
+    92 (7d at 92). The general line alone would keep it (92 < 97)."""
+    h = _s3_fleet(temp_home, weekly_key=92.0, weekly_threshold=97.0)
     outcome = h.tick_with_usage(S3_USAGE)
     assert outcome is TickOutcome.SWITCHED
     switches = _switches(h)
@@ -293,6 +288,26 @@ def test_balanced_uses_account_weekly_line(temp_home):
     })
     assert 2 in h.engine.balanced_rank
     assert 3 not in h.engine.balanced_rank
+
+
+def test_balanced_uses_account_five_line(temp_home):
+    """Active account 1 has its own 5-hour line 80 and sits at 5h 85: it is
+    not usable in balanced, so it has no rank. On the general line 90 it
+    would be usable (85 < 90; `balancedMargin` 0)."""
+    h = EngineHarness(temp_home, strategy="balanced", balanced_margin=0.0)
+    h.seed(1, "a@example.com")
+    h.seed(2, "b@example.com")
+    h.seed(3, "c@example.com")
+    h.make_live("a@example.com", 1)
+    assert h.switcher.write_account_line("1", "threshold", 80)["ok"]
+    h.engine = h._make_engine()
+    h.tick_with_usage({
+        "1": _usage7(85, 10, R_LATER),
+        "2": _usage7(10, 20, R_LATER),
+        "3": _usage7(10, 30, R_LATER),
+    })
+    assert 1 not in h.engine.balanced_rank
+    assert 2 in h.engine.balanced_rank and 3 in h.engine.balanced_rank
 
 
 class TestBalanceModuleTakesPerAccountLines:

@@ -3672,18 +3672,15 @@ class AutoSwitchEngine:
             state, headroom, active_headroom, recovered, settings, current,
             thresholds=thresholds, usage=usage, weekly_lines=weekly_lines,
         )
-        # Each account's own two lines (SL2). The 5-hour line stays the
-        # general one, as before the account weekly line: `balance` has
-        # always scored the 5-hour window on `settings.threshold` and left
-        # the account's own 5-hour line to the `blocked` flag and
-        # `at_threshold` above. The weekly line is the account's configured
-        # one; with no account key that is `settings.weekly_threshold`, so
-        # the result is unchanged.
+        # Each account's own two lines (SL2): its effective 5-hour line and
+        # its configured weekly line. With no account key at all (neither
+        # `threshold` nor `weeklyThreshold`) these are `settings.threshold`
+        # and `settings.weekly_threshold`, so the result is unchanged.
         lines_kw = {
             "threshold": settings.threshold,
             "weekly_threshold": settings.weekly_threshold,
             "lines": {
-                int(num): (settings.threshold, weekly[num]) for num in weekly
+                int(num): (lines[num], weekly[num]) for num in weekly
             },
         }
 
