@@ -62,6 +62,7 @@ class TraySettings:
     pill_edge: str = "right"
     pill_offset: int = 0  # px below centre on the left/right edges (negative: above)
     pill_theme: str = "black"
+    pill_card_limits_open: bool = False  # the card section "Limites desta conta" (SL4), one state for all accounts
 
     @classmethod
     def load(cls, path: Path) -> "TraySettings":
@@ -225,7 +226,8 @@ def pill_inputs(cards: list[dict], budget: dict, aliases: dict, history: dict | 
     return shown, fleet_view.square(budget, history, now)
 
 
-def refresh_pill(pill, cards: list[dict], budget_fn, aliases: dict, history, now: float, latest: dict) -> None:
+def refresh_pill(pill, cards: list[dict], budget_fn, aliases: dict, history, now: float, latest: dict,
+                 general_lines: dict | None = None) -> None:
     """One refresh of the pill. A failure logs its exception type name only; the pill still gets the cards."""
     shown, square = cards, None
     try:
@@ -233,7 +235,94 @@ def refresh_pill(pill, cards: list[dict], budget_fn, aliases: dict, history, now
         shown, square = pill_inputs(cards, latest["budget"], aliases, history, now)
     except Exception as e:  # noqa: BLE001 - the refresh loop must go on
         _logger.warning("pill refresh failed: %s", type(e).__name__)
-    pill.update(shown, fleet=square)
+    pill.update(shown, fleet=square, general_lines=general_lines)
+
+
+# ---- switch lines (SL3, SL4, SL6) -------------------------------------------------
+
+LINE_KINDS = {"five": "threshold", "week": "weeklyThreshold"}  # the pill's kind -> the account record key
+LINES_REFUSED = "invalid input"
+LINES_FAILED = "the lines action failed"
+
+
+def lines_inputs(cards: list[dict], policies_fn, core_fn) -> tuple[list[dict], dict | None]:
+    """The cards with their ``lines`` field, and the effective general lines (SL6).
+
+    A failure logs its exception type name only; the cards then go on without lines.
+    """
+    from claude_swap import lines_page
+
+    try:
+        core = core_fn()
+        shown = lines_page.with_lines(cards, policies_fn(), core.threshold, core.weekly_threshold)
+        return shown, lines_page.general_lines(core.threshold, core.weekly_threshold)
+    except Exception as e:  # noqa: BLE001 - the refresh loop must go on
+        _logger.warning("pill lines failed: %s", type(e).__name__)
+        return cards, None
+
+
+def _line_value_ok(value) -> bool:
+    """None (clear), or an int or float in the account line range (NaN fails the range); a bool is refused."""
+    from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
+
+    if value is None:
+        return True
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return ACCOUNT_THRESHOLD_MIN <= value <= ACCOUNT_THRESHOLD_MAX
+
+
+class LinesActions:
+    """``on_lines(action, args)`` of the pill (SL6): it checks each input, then runs the action.
+
+    ``write_line`` is ``switcher.write_account_line``; ``pill_nums()`` gives the account numbers of the
+    current pill; ``toggle_window`` opens or hides the lines window; ``on_change`` asks for a refresh.
+    Each call returns ``{"ok": bool, "error": str | None}`` and never raises: a failure returns a fixed
+    text and logs its exception type name only.
+    """
+
+    def __init__(self, write_line, settings: TraySettings, settings_path: Path, pill_nums, toggle_window, on_change):
+        self._write_line = write_line
+        self._settings = settings
+        self._path = settings_path
+        self._pill_nums = pill_nums
+        self._toggle_window = toggle_window
+        self._on_change = on_change
+
+    def __call__(self, action, args) -> dict:
+        try:
+            if action == "toggle_window":
+                self._toggle_window()
+                return {"ok": True, "error": None}
+            if not isinstance(args, dict):
+                return {"ok": False, "error": LINES_REFUSED}
+            if action == "set_account_line":
+                return self._set_account_line(args)
+            if action == "set_card_open":
+                return self._set_card_open(args)
+            return {"ok": False, "error": LINES_REFUSED}
+        except Exception as e:  # noqa: BLE001 - the page gets a fixed text, the log the type only
+            _logger.warning("lines action failed: %s", type(e).__name__)
+            return {"ok": False, "error": LINES_FAILED}
+
+    def _set_account_line(self, args: dict) -> dict:
+        num, kind = args.get("num"), args.get("kind")
+        if not (isinstance(num, str) and num.isascii() and num.isdigit() and num in self._pill_nums()):
+            return {"ok": False, "error": LINES_REFUSED}
+        if not isinstance(kind, str) or kind not in LINE_KINDS or "value" not in args or not _line_value_ok(args["value"]):
+            return {"ok": False, "error": LINES_REFUSED}
+        res = self._write_line(num, LINE_KINDS[kind], args["value"])
+        if res.get("ok") is True:
+            self._on_change()
+        return {"ok": res.get("ok") is True, "error": res.get("error")}
+
+    def _set_card_open(self, args: dict) -> dict:
+        value = args.get("open")
+        if not isinstance(value, bool):
+            return {"ok": False, "error": LINES_REFUSED}
+        self._settings.pill_card_limits_open = value
+        self._settings.save(self._path)
+        return {"ok": True, "error": None}
 
 
 # ---- start with Windows ----------------------------------------------------
@@ -414,7 +503,9 @@ def run(switcher) -> int:
                 if pill is not None:
                     from claude_swap.budget_source import current_budget
 
-                    refresh_pill(pill, cards, current_budget, aliases(), history.data(), time.time(), latest)
+                    shown, general = lines_inputs(cards, switcher.account_policies, core_settings)
+                    refresh_pill(pill, shown, current_budget, aliases(), history.data(), time.time(), latest,
+                                 general_lines=general)
                 icon.title = tooltip(cards)
                 icon.update_menu()
             wake.wait(REFRESH_INTERVAL_S)
@@ -485,8 +576,9 @@ def run(switcher) -> int:
     latest: dict = {}  # the last budget of the refresh loop, for the panel
     panel_window = None
     panel_open = threading.Event()
+    lines_window = None  # the lines window (SL3), opened from the pill gear
     if sys.platform == "linux":
-        from claude_swap import fleet_page
+        from claude_swap import fleet_page, lines_page
         from claude_swap.desktop_notify import send_notification
         from claude_swap.pill import EDGES, THEMES, PillController
         from claude_swap.usage_log import claude_projects_dir
@@ -564,7 +656,40 @@ def run(switcher) -> int:
 
         panel_window.events.closing += on_panel_closing
 
-        pill = PillController(webview, api, settings, wake.set, say, on_fleet=toggle_panel)
+        # The lines window (SL3): driven through GTK like the fleet panel, placed beside the pill gear.
+        def lines_gtk(fn):
+            from gi.repository import GLib
+            from webview.platforms import gtk as wgtk
+
+            def run():
+                view = wgtk.BrowserView.instances.get(lines_window.uid)
+                if view is not None:
+                    fn(view)
+                return False
+
+            GLib.idle_add(run)
+
+        lines_ui = lines_page.LinesWindow(lines_gtk, lambda: pill.gear_anchor())
+        lines_window = webview.create_window(
+            lines_page.LINES_TITLE, html=lines_page.LINES_PAGE,
+            js_api=lines_page.LinesWindowApi(
+                lambda: core_settings(), switcher.account_policies, lambda: list(cards),
+                lambda: settings.auto_switch, api.save_settings, lines_ui.close, wake.set),
+            width=lines_page.LINES_W, height=lines_page.LINES_H, resizable=False,
+            background_color="#000000", hidden=True,
+        )
+
+        def on_lines_closing():
+            if quitting.is_set():
+                return None
+            lines_ui.close()
+            return False
+
+        lines_window.events.closing += on_lines_closing
+
+        on_lines = LinesActions(switcher.write_account_line, settings, settings_path,
+                                lambda: [c.get("num") for c in pill.cards], lines_ui.toggle, wake.set)
+        pill = PillController(webview, api, settings, wake.set, say, on_fleet=toggle_panel, on_lines=on_lines)
         pill.create()
 
     def set_pill_option(field, value):
@@ -593,6 +718,8 @@ def run(switcher) -> int:
         threshold_window.destroy()
         if panel_window is not None:
             panel_window.destroy()
+        if lines_window is not None:
+            lines_window.destroy()
         window.destroy()
 
     def core_settings():
