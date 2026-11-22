@@ -135,14 +135,22 @@ def test_pill_payload_has_fleet_and_card_budget():
                           "tokensPerPercent": 1200000}},
         ],
     }
-    bucket = str(int((now - 600) // 300 * 300))
-    history = {"buckets": {bucket: {"m": {"claude-opus-5-5": 2_520_000.0}, "p": {"guilda": 2_520_000.0}}}}
+    # Buckets on the edges of the square's hourly steps, with distinct values, so that moving the square's
+    # "now" by one bucket (300 s) or more either way changes the exact list:
+    # - now-300 is the newest bucket: a "now" 300 s earlier or more leaves it out;
+    # - now-3600 starts the last hour: a "now" 300 s later or more moves it to the hour before;
+    # - now-600 makes the last hour hold 2 520 000 (the active card's 42 000/min);
+    # - now-3*3600-600 sits in hour 20 alone.
+    weights = {300: 1_800_000.0, 600: 720_000.0, 3600: 600_000.0, 3 * 3600 + 600: 300_000.0}
+    assert now % 300 == 0
+    history = {"buckets": {str(int(now - age)): {"m": {"claude-opus-5-5": w}, "p": {"guilda": w}}
+                           for age, w in weights.items()}}
     shown, fleet = tray.pill_inputs(cards, budget, {"4": "work"}, history, now)
     payload = pill.pill_payload(shown, "right", "black", pill.window_layout("right", 2, (0, 0, 1920, 1080)),
                                 fleet=fleet)
     assert payload["fleet"]["pace"] == 106 and payload["fleet"]["level"] == "critical"
-    # 23 empty hours, then the last hour: 2 520 000 weighted tokens over 60 minutes
-    assert payload["fleet"]["sparkline24h"] == [0.0] * 23 + [42000.0]
+    # weighted tokens per minute of each hour: hour 20 holds 300 000, hour 23 holds 1 800 000 + 720 000 + 600 000
+    assert payload["fleet"]["sparkline24h"] == [0.0] * 20 + [5000.0, 0.0, 0.0, 52000.0]
     one, four = payload["items"]
     assert one["budget"]["plan"] == "max" and one["budget"]["nowPerMin"] is None
     assert four["budget"] == {"plan": "pro", "fiveResetAt": "2026-11-22T00:29:00Z",
