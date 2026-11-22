@@ -98,6 +98,7 @@ const ctx = vm.createContext({
   addEventListener(t, f) { (winL[t] = winL[t] || []).push(f); },
   setInterval(f, ms) { timers.push({ f, ms, on: true }); return timers.length; },
   clearInterval(id) { if (timers[id - 1]) timers[id - 1].on = false; },
+  setTimeout(f, ms) { timeouts.push({ f, ms }); return timeouts.length; },
   pywebview: { api }, Math, JSON, Number, String, Array, isFinite });
 vm.runInContext('var window = globalThis;', ctx);
 const pre = process.argv[4] || '';
@@ -106,6 +107,9 @@ const ev = () => { const e = { prevented: false, preventDefault() { e.prevented 
 const state = () => Object.fromEntries(Object.entries(els).map(([k, v]) => [k, { value: v.value, disabled: v.disabled,
   checked: v.checked, hidden: v.hidden, textContent: v.textContent, innerHTML: v.innerHTML, p: v.style.props['--p'] }]));
 const ready = d => { DATA = d; fire(winL, 'pywebviewready'); };
+const timeouts = [];
+const tick = () => timers.filter(t => t.on).forEach(t => t.f());  // the 30 s read
+const flush = () => { const due = timeouts.splice(0); due.forEach(t => t.f()); return due.map(t => t.ms); };
 const window = ctx;
 if (pre) eval(pre);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
@@ -445,4 +449,38 @@ def test_with_lines_and_general_lines():
     assert lines_page.general_lines(90.0, None) == {"five": 90.0, "week": 90.0}
     assert lines_page.general_lines(88, 97) == {"five": 88.0, "week": 97.0}
     assert isinstance(lines_page.general_lines(88, 97)["five"], float)
+
+
+@needs_node
+def test_a_read_waits_while_a_slider_is_held(tmp_path):
+    # SL3: the 30 s read lands during a drag: no redraw; the release applies it after the slider's own change
+    newer = data(five=85.0, accounts=[account(7, 3.0, 4.0)])
+    out = drive(tmp_path, "window.linesOpen(); calls.length = 0;"
+                          " fire(el('s5').L, 'pointerdown', {}); el('s5').value = '72'; fire(el('s5').L, 'input', {});"
+                          " DATA = %s; tick(); const during = state();"
+                          " fire(docL, 'pointerup', {}); const sameTurn = state();"
+                          " fire(el('s5').L, 'change', {}); const written = calls.slice(); const delays = flush();"
+                          " return {during, sameTurn, written, delays, after: state()};" % json.dumps(newer))
+    for s in (out["during"], out["sameTurn"]):
+        assert s["s5"]["value"] == "72" and s["v5"]["textContent"] == "72%"
+        assert s["accs"]["innerHTML"].count("class=acc>") == 4  # still the first data
+    assert out["written"] == [["get"], ["set", "five", 72], ["get"]]  # the dragged value is the one written
+    assert out["delays"] == [0]
+    after = out["after"]
+    assert after["s5"]["value"] == "85" and after["v5"]["textContent"] == "85%"
+    assert after["accs"]["innerHTML"].startswith("<div class=acc><span class=n>#7</span>")
+
+
+@needs_node
+def test_week_slider_holds_and_pointercancel_releases(tmp_path):
+    # the week slider holds too; a release with nothing waiting draws nothing, so the newest data stays
+    first, second = data(five=85.0, accounts=[account(7)]), data(five=70.0, accounts=[account(8)])
+    out = drive(tmp_path, "window.linesOpen(); fire(el('sw').L, 'pointerdown', {});"
+                          " DATA = %s; tick(); const during = state().v5.textContent;"
+                          " fire(docL, 'pointercancel', {}); flush(); const applied = state().v5.textContent;"
+                          " DATA = %s; tick(); const free = state().v5.textContent;"
+                          " fire(docL, 'pointerup', {}); flush();"
+                          " return {during, applied, free, after: state().v5.textContent};"
+                   % (json.dumps(first), json.dumps(second)))
+    assert out == {"during": "90%", "applied": "85%", "free": "70%", "after": "70%"}
 

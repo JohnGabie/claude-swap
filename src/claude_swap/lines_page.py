@@ -272,7 +272,7 @@ const $=id=>document.getElementById(id);
 const LMIN=__MIN__,LMAX=__MAX__,RELOAD_MS=__RELOAD_MS__;
 const FAIL='__FAIL__';
 const s5=$('s5'),sw=$('sw'),same=$('same');
-let timer=null;
+let timer=null,held=false,waiting=null;
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 // A whole number has no decimal; any other value has one, with a comma ("99,9")
 const lnum=v=>{const r=Math.round(Number(v)*10)/10;return Number.isInteger(r)?String(r):r.toFixed(1).replace('.',',');};
@@ -297,7 +297,7 @@ function paint(d){
 const bridge=()=>window.pywebview&&pywebview.api;
 function load(){
  if(!bridge()) return;
- pywebview.api.get().then(d=>{if(d&&Array.isArray(d.accounts))paint(d);},()=>{});
+ pywebview.api.get().then(d=>{if(!(d&&Array.isArray(d.accounts)))return;if(held)waiting=d;else paint(d);},()=>{});
 }
 function write(key,value){
  if(!bridge()) return;
@@ -305,6 +305,13 @@ function write(key,value){
   ()=>{$('err').textContent=FAIL;load();});
 }
 function close(){if(bridge())pywebview.api.close();}
+// A read that lands while a slider is held waits for the release (SL3): a redraw would move the thumb mid-drag.
+function release(){held=false;if(waiting){const d=waiting;waiting=null;paint(d);}}
+const letGo=()=>setTimeout(release,0); // one turn later: the slider's own change event reads its value first
+s5.addEventListener('pointerdown',()=>{held=true;});
+sw.addEventListener('pointerdown',()=>{held=true;});
+document.addEventListener('pointerup',letGo);
+document.addEventListener('pointercancel',letGo);
 s5.addEventListener('input',()=>{showFive(Number(s5.value));if(same.checked){sw.value=s5.value;showWeek(Number(sw.value));}});
 s5.addEventListener('change',()=>write('five',Number(s5.value)));
 sw.addEventListener('input',()=>showWeek(Number(sw.value)));
