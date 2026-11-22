@@ -1162,6 +1162,40 @@ def run_live(tmp_path, expr, payload):
     return run_page(tmp_path, "(p => {%s})(%s)" % (expr, json.dumps(payload)), _PRE_LIVE + _PRE_LINES)
 
 
+# The gear and "+" keep their listeners by type, and the card keeps a real class set (L5).
+_PRE_GEAR_ADD = """
+  const __cls = new Set(), __seen = [], __mk = document.createElement;
+  __card.classList = { add: (...c) => c.forEach(x => __cls.add(x)), remove: (...c) => c.forEach(x => __cls.delete(x)),
+    toggle: (c, f) => (f ? __cls.add(c) : __cls.delete(c)), contains: c => __cls.has(c) };
+  document.createElement = () => { const n = __mk(), L = {}; n.__L = L;
+    n.addEventListener = (t, f) => (L[t] = L[t] || []).push(f); return n; };
+  const __byClass = c => __appended.find(n => String(n.className).split(' ').includes(c));
+  const __on = (n, t) => { for (const f of n.__L[t] || []) f({}); };
+  const __shown = () => __cls.has('show');
+  pywebview.api.lines_window = () => (__seen.push(['window', __shown()]), sync({ ok: true }));
+  pywebview.api.add = () => (__seen.push(['add', __shown()]), sync({}));
+"""
+
+
+@needs_node
+def test_gear_and_add_close_the_card(tmp_path):
+    # L5 (FP10): the card shows only over an account, so the gear and "+" close it, through their real listeners
+    out = run_page(tmp_path, "(p => { render(p); const gear = __byClass('gear'), add = __byClass('add'), r = {};"
+                             " for (const [name, el] of [['gear', gear], ['add', add]]) {"
+                             "   showCard(0); r[name + 'Open'] = __shown(); __on(el, 'mouseenter'); r[name + 'Enter'] = __shown();"
+                             "   showCard(0); el.onclick(); r[name + 'Click'] = __shown(); }"
+                             " r.seen = __seen.slice();"
+                             # an add that never answers keeps "+" busy; a click on the busy "+" must still close the card
+                             " pywebview.api.add = () => ({ then() {} }); add.onclick(); showCard(0); add.onclick(); r.busyClick = __shown();"
+                             " return r; })(%s)" % json.dumps(lines_payload(open_=False)),
+                   _PRE_LIVE + _PRE_LINES + _PRE_GEAR_ADD)
+    assert out["gearOpen"] is True and out["addOpen"] is True  # the card did show before the pointer moved on
+    assert out["gearEnter"] is False and out["addEnter"] is False
+    assert out["gearClick"] is False and out["addClick"] is False
+    assert out["seen"] == [["window", False], ["add", False]]  # the card was already hidden when the action ran
+    assert out["busyClick"] is False
+
+
 @needs_node
 def test_card_listeners_drive_the_section(tmp_path):
     # SL4 through the card's real click, input and change listeners: open, pick, drag, release
