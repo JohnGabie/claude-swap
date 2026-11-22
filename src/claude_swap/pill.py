@@ -578,7 +578,8 @@ function buildSquare(){
  const d=document.createElement('div');
  d.className='pill-square'; d.style.setProperty('--i',0); d.title='Painel da frota';
  d.innerHTML='<svg viewBox="0 0 46 46"><polyline points=""></polyline></svg><span></span>';
- d.onclick=()=>{pywebview.api.fleet();};
+ d.addEventListener('mouseenter',hideCard); // the card shows only over an account (FP10)
+ d.onclick=()=>{hideCard();pywebview.api.fleet();};
  return d;
 }
 function applySquare(d,f){

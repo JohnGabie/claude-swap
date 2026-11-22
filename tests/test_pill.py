@@ -569,6 +569,28 @@ def test_apply_square_draws_a_flat_line_with_no_history_and_the_data_otherwise(t
     assert pts[0].split(",")[1] == "27.0" and pts[-1].split(",")[1] == "7.0"  # the peak is the top of the line
 
 
+_PRE_SQUARE_CARD = """
+  const log = [], shown = new Set(), handlers = {};
+  const fakeCard = { classList: { add: (...c) => c.forEach(x => shown.add(x)), remove: (...c) => c.forEach(x => shown.delete(x)) },
+                     addEventListener() {} };
+  const fakeEl = { style: { setProperty() {} }, addEventListener(t, f) { handlers[t] = f; }, querySelector: () => ({}) };
+  const realDoc = document;
+  document = { getElementById: id => id === 'card' ? fakeCard : realDoc.getElementById(id), createElement: () => fakeEl,
+               addEventListener() {}, documentElement: {}, body: {} };
+  pywebview = { api: { fleet() { log.push('fleet:' + [...shown].join(',')); } } };
+"""
+
+
+@needs_node
+def test_pill_square_closes_the_card(tmp_path):
+    # FP10: the card shows only while the pointer is over an account, so the square must close it.
+    show = "(shown.add('show'), shown.add('glide'))"
+    enter = run_page(tmp_path, "(buildSquare(), %s, handlers.mouseenter && handlers.mouseenter(), [...shown])" % show, _PRE_SQUARE_CARD)
+    assert enter == []
+    click = run_page(tmp_path, "(buildSquare(), %s, fakeEl.onclick(), log)" % show, _PRE_SQUARE_CARD)
+    assert click == ["fleet:"]  # the card was already closed when the fleet panel was asked for
+
+
 # ---- no identity in the card, pt-BR fallback rows (FP10) ----------------------
 
 def real_card(num=1, usage=None, active=False, disabled=False, alias="", email=FAKE_EMAIL, org=FAKE_ORG):
