@@ -18,6 +18,8 @@ import os
 import subprocess
 import threading
 
+from claude_swap.models import normalize_alias
+
 EDGES = ("right", "left", "top", "bottom")
 THEMES = ("black", "white")
 DEFAULT_EDGE, DEFAULT_THEME = "right", "black"
@@ -28,7 +30,9 @@ CORNER = 18  # radius of the pill's own convex corners
 PAD = 8  # space between the flares and the first/last item
 ITEM = 66  # one account along the edge: ring + percentage
 ADD = 36  # the "+" button
-CARD_W, ARROW, GAP = 268, 12, 6  # hover card width, its pointer, gap to the pill
+SQUARE_SIZE, SQUARE_GAP = 46, 10  # the pill square (FP3) and the gap below it
+SQUARE = SQUARE_SIZE + SQUARE_GAP  # what the square adds to the pill's length
+CARD_W, ARROW, GAP = 300, 12, 6  # hover card width, its pointer, gap to the pill
 
 
 def normalize_edge(value) -> str:
@@ -45,7 +49,7 @@ def is_vertical(edge: str) -> bool:
 
 
 def pill_length(n_accounts: int) -> int:
-    return 2 * (FLARE + PAD) + n_accounts * ITEM + ADD
+    return 2 * (FLARE + PAD) + SQUARE + n_accounts * ITEM + ADD
 
 
 def pill_size(edge: str, n_accounts: int) -> tuple[int, int]:
@@ -55,7 +59,7 @@ def pill_size(edge: str, n_accounts: int) -> tuple[int, int]:
 
 def item_center(index: int) -> float:
     """Distance of account ``index``'s ring centre from the pill's start, along the edge."""
-    return FLARE + PAD + index * ITEM + ITEM / 2
+    return FLARE + PAD + SQUARE + index * ITEM + ITEM / 2
 
 
 def pill_path(edge: str, length: int, thickness: int = THICKNESS) -> str:
@@ -120,11 +124,8 @@ def pill_position(edge: str, size: tuple[int, int], area: tuple[int, int, int, i
     return ax + (aw - w) // 2, ay + ah - h
 
 
-def card_height(n_rows: int) -> int:
-    return 76 + max(1, n_rows) * 50
-
-
-CARD_MAX_H = card_height(2) + 8  # the tallest card (5-hour + weekly rows), plus slack for its border/rounding
+# The tallest account card (FP10): head, alert line, two meters, the critical line, the footer; plus slack
+CARD_MAX_H = 372
 
 
 def window_layout(edge: str, n_accounts: int, area: tuple[int, int, int, int], offset: int = 0) -> dict:
@@ -173,9 +174,41 @@ def rank_of(card: dict) -> int:
     return v if isinstance(v, int) and not isinstance(v, bool) and 1 <= v <= 3 else 0
 
 
+_BUDGET_KEYS = ("plan", "fiveResetAt", "weekResetAt", "weekElapsedPct", "projectedEndPct", "tokensPerPercent",
+                "nowPerMin", "alias", "readAgeS")
+
+
+def _alias(value) -> str | None:
+    """The alias only when it is a valid stored alias, which can never hold an email (FP10)."""
+    try:
+        return value if isinstance(value, str) and normalize_alias(value) == value else None
+    except ValueError:
+        return None
+
+
+def _budget(card: dict) -> dict | None:
+    b = card.get("budget")
+    if not isinstance(b, dict):
+        return None
+    out = {k: b.get(k) for k in _BUDGET_KEYS}
+    out["alias"] = _alias(out["alias"])
+    return out
+
+
+_FLEET_KEYS = ("sparkline24h", "pace", "level")
+
+
+def _fleet(fleet) -> dict | None:
+    return {k: fleet.get(k) for k in _FLEET_KEYS} if isinstance(fleet, dict) else None
+
+
 def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: bool = False,
-                 reveal: bool = False) -> dict:
-    """Everything the page needs to draw the pill and, on hover, each account's card."""
+                 reveal: bool = False, fleet: dict | None = None) -> dict:
+    """Everything the page needs to draw the pill and, on hover, each account's card.
+
+    Only named fields reach the page. A card's ``title`` (alias or email) and ``tag`` (the organization
+    name, which holds the email on a personal account) never do (FP10).
+    """
     pw, ph = pill_size(edge, len(cards))
     return {
         "edge": edge,
@@ -189,6 +222,9 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
         "reveal": bool(reveal),
         "pad": FLARE + PAD,
         "item": ITEM,
+        "square": SQUARE,
+        # The pill square's data (fleet_view.square), or None until the first reading
+        "fleet": _fleet(fleet),
         "card": {"w": CARD_W, "arrow": ARROW, "gap": GAP},
         "items": [
             {
@@ -199,9 +235,8 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
                 "week": _pct(_row(c, "7d")),
                 "rank": rank_of(c),
                 "alert": c.get("alert") if isinstance(c.get("alert"), str) else None,
-                "title": c.get("title", ""),
-                "tag": c.get("tag", ""),
                 "message": c.get("message"),
+                "budget": _budget(c),
                 "rows": [
                     {"label": r["label"], "pct": r.get("pct"), "reset": r.get("reset"), "age": r.get("age")}
                     for r in c.get("rows") or ()
@@ -215,13 +250,17 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
 # ---- page ----------------------------------------------------------------------
 
 _THEME_CSS = """
-:root{--bg:#000;--fg:#f2f0e3;--dim:#8d8d93;--track:#2c2c30;--line:transparent;
- --l0:#34d17a;--l1:#f5c542;--l2:#ff8a3d;--l3:#ff4d3d;--hover:#ffffff14}
-:root[data-theme=white]{--bg:#f6f5f1;--fg:#16161a;--dim:#6d6d74;--track:#dedcd5;--line:#cfcdc5;
- --l0:#17a35a;--l1:#c99a0a;--l2:#e06a14;--l3:#d8321f;--hover:#00000010}
+/* Ocean Sunset (FP2). spent: outer ring, 5-hour bars; avail: inner ring, weekly bars; warn and crit: status only.
+   The account card is black in both themes (FP10), so it takes the dark values itself. */
+:root,#card{--bg:#000;--fg:#F4EEDB;--ink2:#CFC6A8;--dim:#8F8873;--track:#1E2426;--line:transparent;--grid:rgba(233,216,166,.08);
+ --raised:#121A1C;--spent:#0A9396;--spent-track:#05282A;--avail:#94D2BD;--avail-track:#1D3A31;--warn:#EE9B00;--crit:#CF4332;
+ --hover:#ffffff14}
+:root[data-theme=white]{--bg:#f6f5f1;--fg:#16161a;--ink2:#46464c;--dim:#6d6d74;--track:#dedcd5;--line:#cfcdc5;--grid:#cfcdc5;
+ --raised:#ebe9e2;--spent:#087A7D;--spent-track:#dedcd5;--avail:#2F8A6F;--avail-track:#dedcd5;--warn:#B87700;--crit:#C0341F;
+ --hover:#00000010}
 html,body{margin:0;height:100%;background:transparent;overflow:hidden;user-select:none;cursor:default;
  font:500 12px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--fg)}
-.l0{--c:var(--l0)}.l1{--c:var(--l1)}.l2{--c:var(--l2)}.l3{--c:var(--l3)}
+.l0{--c:var(--spent)}.l1{--c:var(--warn)}.l2{--c:var(--crit)}
 """
 
 PILL_PAGE = """<!doctype html><meta charset=utf-8><style>""" + _THEME_CSS + """
@@ -250,9 +289,18 @@ body.edge-bottom #rest{bottom:0;left:50%;translate:-50% 0;width:79px;height:10px
 #items{position:absolute;display:flex;align-items:center}
 .vertical #items{left:0;right:0;flex-direction:column}
 .horizontal #items{top:0;bottom:0;flex-direction:row}
-.item,.add{transition:opacity .12s ease calc(var(--i,0) * 14ms),translate .2s var(--ease) calc(var(--i,0) * 14ms),background .15s ease,color .15s ease}
-body.folded .item,body.folded .add{transition:opacity .18s ease calc(var(--i,0) * 28ms),translate .3s var(--ease) calc(var(--i,0) * 28ms)}
-#pill.entering .item,#pill.entering .add,body.folded .item,body.folded .add{opacity:0;translate:var(--slide)}
+.item,.add,.pill-square{transition:opacity .12s ease calc(var(--i,0) * 14ms),translate .2s var(--ease) calc(var(--i,0) * 14ms),background .15s ease,color .15s ease}
+body.folded .item,body.folded .add,body.folded .pill-square{transition:opacity .18s ease calc(var(--i,0) * 28ms),translate .3s var(--ease) calc(var(--i,0) * 28ms)}
+#pill.entering .item,#pill.entering .add,#pill.entering .pill-square,body.folded .item,body.folded .add,body.folded .pill-square{opacity:0;translate:var(--slide)}
+/* The pill square (FP3): 46 px, raised surface, the last 24 hours and the fleet pace. It is not an account. */
+.pill-square{flex:none;width:46px;height:46px;margin:0 0 10px;border-radius:10px;background:var(--raised);position:relative;
+ box-shadow:inset 0 0 0 1px var(--grid);cursor:pointer}
+.horizontal .pill-square{margin:0 10px 0 0}
+.pill-square:hover{box-shadow:inset 0 0 0 1px var(--ink2)}
+.pill-square svg{position:absolute;inset:0;width:46px;height:46px}
+.pill-square polyline{fill:none;stroke:var(--spent);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
+.pill-square span{position:absolute;right:6px;bottom:4px;font:600 10.5px/1 system-ui,sans-serif;color:var(--ink2);font-variant-numeric:tabular-nums}
+.pill-square.warning span{color:var(--warn)}.pill-square.critical span{color:var(--crit)}
 .item{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;border-radius:12px;
  cursor:pointer;position:relative}
 .item:hover{background:var(--hover)}
@@ -263,7 +311,9 @@ body.folded .item,body.folded .add{transition:opacity .18s ease calc(var(--i,0) 
 .item:hover .ring{transform:scale(1.07)}
 .item.pressed .ring{transform:scale(.93)}
 .ring .track{stroke:var(--track)}
-.ring .arc{stroke:var(--c);stroke-linecap:round;transition:stroke-dasharray .6s var(--ease),stroke .3s ease}
+.ring .arc{stroke-linecap:round;transition:stroke-dasharray .6s var(--ease),stroke .3s ease}
+.ring .arc.five{stroke:var(--c)}
+.ring .arc.week{stroke:var(--avail)}
 .ring .num{fill:var(--fg);font:700 11px system-ui,sans-serif}
 .ring .disc{transition:fill .3s ease}
 .item.active .ring .disc{fill:var(--fg)}
@@ -273,8 +323,8 @@ body.folded .item,body.folded .add{transition:opacity .18s ease calc(var(--i,0) 
 .add:hover{background:var(--hover);color:var(--fg)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .add.busy{animation:spin 1.2s steps(12) infinite}
-#card{position:absolute;visibility:hidden;opacity:0;background:var(--bg);border:1px solid var(--line);border-radius:16px;
- padding:14px 16px;box-sizing:border-box;transform:translate(var(--cx,0),var(--cy,0)) scale(.97);transform-origin:var(--origin,center);
+#card{color:var(--fg);position:absolute;visibility:hidden;opacity:0;background:var(--bg);border:1px solid var(--grid);border-radius:16px;
+ padding:16px 18px 18px;box-sizing:border-box;transform:translate(var(--cx,0),var(--cy,0)) scale(.97);transform-origin:var(--origin,center);
  transition:opacity .16s ease,transform .3s var(--ease),visibility 0s linear .3s}
 body.edge-right{--cx:8px;--origin:right center}body.edge-left{--cx:-8px;--origin:left center}
 body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:center bottom}
@@ -283,19 +333,33 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 #card.show.glide{transition:opacity .18s ease,transform .3s var(--ease),top .28s var(--ease),left .28s var(--ease),visibility 0s}
 .arrow{position:absolute;width:0;height:0;border:6px solid transparent;transition:top .28s var(--ease),left .28s var(--ease)}
 .head{margin-bottom:10px;min-width:0}
-.title{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tag{color:var(--dim);font-size:11px;white-space:nowrap}
-.head .tag{margin-top:2px;overflow:hidden;text-overflow:ellipsis}
+.age{color:var(--dim);font-size:11px;white-space:nowrap}
+/* The account card (FP10) */
+.t1{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t2{color:var(--dim);font-size:11.5px;margin-top:2px}
+.m{margin-top:16px}.mr{display:flex;justify-content:space-between;align-items:baseline}
+.m .k{color:var(--ink2);font-size:12px}.m .r{color:var(--dim);font-size:11px}
+.m .v{font-size:18px;font-weight:600;margin-top:2px;font-variant-numeric:tabular-nums}
+.m .v small{font-size:11.5px;font-weight:400;color:var(--dim)}
+.mb{position:relative;height:8px;border-radius:4px;background:var(--avail-track);margin-top:7px}
+.mb b{position:absolute;left:0;top:0;bottom:0;border-radius:4px;background:var(--avail);transition:width .5s var(--ease)}
+.mb.g{background:var(--spent-track)}.mb.g b{background:var(--c)}
+.mb u{position:absolute;top:-4px;width:2px;height:16px;border-radius:1px;background:var(--ink2)}
+.status{display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11.5px;font-weight:600;color:var(--crit)}
+.status i{width:14px;height:14px;border-radius:50%;background:var(--crit);color:var(--bg);display:grid;place-items:center;font:800 9px system-ui;font-style:normal}
+.foot{margin-top:16px;padding-top:12px;border-top:1px solid var(--grid);display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.foot .l{color:var(--dim);font-size:11px}.foot .v{font-size:13px;font-weight:600;margin-top:1px;font-variant-numeric:tabular-nums}
 .row{margin-bottom:12px}.row:last-child{margin-bottom:0}
 .top{display:flex;justify-content:space-between;color:var(--dim);font-size:11.5px;margin-bottom:5px}
-.bar{height:6px;border-radius:3px;background:var(--track);overflow:hidden}
+.bar{height:6px;border-radius:3px;background:var(--spent-track);overflow:hidden}
+.row.wk .bar{background:var(--avail-track)}.row.wk .bar i{background:var(--avail)}
 .bar i{display:block;height:100%;border-radius:3px;background:var(--c);transition:width .5s var(--ease)}
 .used{margin-top:4px;font-size:12px}
 .msg{color:var(--dim);font-size:12px;padding:6px 0}
 .alert{color:#e0a800;font-weight:700;margin-left:1px}
 .alert-msg{color:#e0a800;font-size:11.5px;line-height:1.35;margin:0 0 8px}
 @media (prefers-reduced-motion: reduce){
- #pill,body.folded #pill,#rest,.item,.add,body.folded .item,body.folded .add,.item .ring,.ring .arc,.ring .disc,#card,#card.show,#card.show.glide,.arrow,.bar i{transition:none}
+ #pill,body.folded #pill,#rest,.item,.add,body.folded .item,body.folded .add,.item .ring,.ring .arc,.ring .disc,#card,#card.show,#card.show.glide,.arrow,.bar i,.mb b,.pill-square,body.folded .pill-square{transition:none}
  .add.busy{animation:none}
 }
 </style>
@@ -303,9 +367,19 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 <script>
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const R5=17,R7=11.5,C5=2*Math.PI*R5,C7=2*Math.PI*R7;
-const lvl=p=>p==null?0:p<50?0:p<75?1:p<90?2:3;
-const NAMES={'5h':'Current session','7d':'Weekly (all models)'};
-const resetText=t=>!t?'':/^resets/i.test(t)?t[0].toUpperCase()+t.slice(1):'Resets '+t;
+const lvl=p=>p==null?0:p<70?0:p<90?1:2; // FP2 level rule: spent below 70, warning 70-89, critical from 90
+const NAMES={'5h':'Sess\\u00e3o de 5 h','7d':'Semana'}, VERB={'5h':'volta','7d':'renova'};
+// The rows' texts are English, from tui/data.py: window_reset_text gives "resets now" or "resets {dur}",
+// format_age gives "\\u00b7 {dur} ago"; {dur} is format_duration ("45s", "12m", "2h 13m", "2h", "3d 4h", "3d").
+// They become pt-BR; any other text is left out rather than shown in English.
+const DUR='\\\\d+[smhd](?: \\\\d+[smhd])?';
+const resetText=(t,l)=>{
+ const v=VERB[l]||'volta', s=String(t??'');
+ if(s==='resets now') return v+' agora';
+ const m=s.match(new RegExp('^resets ('+DUR+')$'));
+ return m?v+' em '+m[1]:'';
+};
+const ageText=t=>{const m=String(t??'').match(new RegExp('^\\u00b7 ('+DUR+') ago$')); return m?'\\u00b7 h\\u00e1 '+m[1]:'';};
 // Both arcs always exist (an empty one has no length), so a reading arriving or changing animates rather than appearing.
 const dash=(c,p)=>`${p==null?0:c*Math.min(p,100)/100} ${c}`;
 const arc=(r,c,p,w,k)=>`<circle class=track cx=21 cy=21 r=${r} fill=none stroke-width=${w}></circle>`+
@@ -358,19 +432,52 @@ function showCard(i){
  reportHot();
 }
 
+const WD=['dom','seg','ter','qua','qui','sex','s\\u00e1b'], DASH='\\u2014';
+const when=iso=>{const d=iso?new Date(iso):null; return !d||isNaN(d)?DASH:WD[d.getDay()]+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
+// {dur} of FP8: under 60 min "45 min", under 48 h "10 h", else "2 d"
+const dur=s=>s<3600?Math.max(1,Math.floor(s/60))+' min':s<172800?Math.floor(s/3600)+' h':Math.floor(s/86400)+' d';
+const readAge=s=>s==null?'':s<180?'lido agora':'lido h\\u00e1 '+dur(s);
+const cap=s=>s?s[0].toUpperCase()+s.slice(1):'';
+const tok=n=>typeof n!=='number'?DASH:n>=1e6?(n/1e6).toFixed(1).replace('.',',').replace(/,0$/,'')+'M':n>=1e3?Math.round(n/1e3)+'K':String(Math.round(n));
+const pctText=p=>p==null?'\\u2013':Math.round(p)+'%';
+function meters(it,b){
+ const r5=it.rows.find(r=>r.label==='5h'), r7=it.rows.find(r=>r.label==='7d'), out=[];
+ if(r5) out.push(`<div class="m l${lvl(r5.pct)}"><div class=mr><span class=k>Sess\\u00e3o de 5 h</span><span class=r>volta ${when(b.fiveResetAt)}</span></div>
+  <div class=v>${pctText(r5.pct)} <small>usado</small></div><div class="mb g"><b style="width:${Math.min(r5.pct||0,100)}%"></b></div></div>`);
+ if(r7){
+  const proj=b.projectedEndPct, el=b.weekElapsedPct, early=proj!=null&&proj>=100&&!(r7.pct>=100);
+  out.push(`<div class=m><div class=mr><span class=k>Semana</span><span class=r>renova ${when(b.weekResetAt)}</span></div>
+  <div class=v>${pctText(r7.pct)} <small>usado${proj!=null?' \\u00b7 fecha em '+Math.round(proj)+'%':''}</small></div>
+  <div class=mb><b style="width:${Math.min(r7.pct||0,100)}%"></b>${el!=null?`<u style="left:calc(${Math.min(el,100)}% - 1px)"></u>`:''}</div>
+  ${early?'<div class=status><i>!</i>Acaba antes de renovar</div>':''}</div>`);
+ }
+ return out.join('');
+}
+// The account card's HTML (FP10). Without budget data it is today's rows in the new style.
+// No identity field reaches it: the payload has no title and no tag, and the alias is a checked alias (FP-D4).
+function cardHtml(it){
+ const b=it.budget;
+ const state=(it.active?' \\u00b7 conta ativa':'')+(it.disabled?' \\u00b7 pausada':'');
+ const head=b
+  ?`<div class=head><div class=t1>#${esc(it.num)}${b.alias?' '+esc(b.alias):''}${state}</div><div class=t2>${esc([cap(b.plan),readAge(b.readAgeS)].filter(Boolean).join(' \\u00b7 '))}</div></div>`
+  :`<div class=head><div class=t1>#${esc(it.num)}${state}</div></div>`;
+ const alert=it.alert?`<div class=alert-msg>* ${esc(it.alert)}</div>`:'';
+ if(!it.rows.length) return head+alert+(it.message?`<div class=msg>${esc(it.message)}</div>`:'');
+ if(!b) return head+alert+it.rows.map(r=>`<div class="row ${r.label==='7d'?'wk':'l'+lvl(r.pct)}"><div class=top><span>${esc(NAMES[r.label]||r.label)}</span><span>${esc(resetText(r.reset,r.label))}</span></div>
+  <div class=bar><i style="width:${Math.min(r.pct||0,100)}%"></i></div>
+  <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% usado'}${ageText(r.age)?' <span class=age>'+esc(ageText(r.age))+'</span>':''}</div></div>`).join('');
+ return head+alert+meters(it,b)+`<div class=foot><div><div class=l>Consumo agora</div><div class=v>${it.active&&typeof b.nowPerMin==='number'?tok(b.nowPerMin)+'/min':DASH}</div></div>
+  <div><div class=l>1% desta conta \\u2248</div><div class=v>${typeof b.tokensPerPercent==='number'?tok(b.tokensPerPercent)+' tokens':DASH}</div></div></div>`;
+}
 function renderCard(){
  const it=P.items[hoverId]; if(!it){hideCard();return;}
- const rows=it.rows.map(r=>`<div class="row l${lvl(r.pct)}"><div class=top><span>${esc(NAMES[r.label]||r.label)}</span><span>${esc(resetText(r.reset))}</span></div>
-  <div class=bar><i style="width:${Math.min(r.pct||0,100)}%"></i></div>
-  <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% used'}${r.age?' <span class=tag>'+esc(r.age)+'</span>':''}</div></div>`).join('');
- card.innerHTML=`<div class=head><div class=title>${esc(it.title)}</div><div class=tag>${esc(it.tag)}${it.disabled?' \\u00b7 paused':''}</div></div>`+
-  (it.alert?`<div class=alert-msg>* ${esc(it.alert)}</div>`:'')+rows+(it.message&&!it.rows.length?`<div class=msg>${esc(it.message)}</div>`:'')+'<div class=arrow></div>';
+ card.innerHTML=cardHtml(it)+'<div class=arrow></div>';
  placeCard();
 }
 // Show first, then place: the card's height is only known once it has content (Codenotch's placeCard).
 function placeCard(){
  const [lx,ly,lw,lh]=P.layout.pill, [,,W,H]=P.layout.win, {w:cw,arrow:A,gap:G}=P.card;
- const ch=card.offsetHeight, v=P.vertical, i=hoverId, along=(P.pad+i*P.item+P.item/2);
+ const ch=card.offsetHeight, v=P.vertical, i=hoverId, along=(P.pad+P.square+i*P.item+P.item/2);
  const clamp=(n,lo,hi)=>Math.max(lo,Math.min(n,hi));
  let x,y,ax;
  if(v){
@@ -460,18 +567,34 @@ window.codenotchPointer=inside=>{
 
 const items=document.getElementById('items');
 function applyItem(d,it){
- d.className=d.className.replace(/\\b(l[0-3]|active|off)\\b/g,'').trim()+' l'+lvl(it.five)+(it.active?' active':'')+(it.disabled?' off':'');
+ d.className=d.className.replace(/\\b(l[0-2]|active|off)\\b/g,'').trim()+' l'+lvl(it.five)+(it.active?' active':'')+(it.disabled?' off':'');
  for(const [k,p,c] of [['five',it.five,C5],['week',it.week,C7]]){
   const el=d.querySelector('.arc.'+k); if(el) el.setAttribute('stroke-dasharray',dash(c,p));
  }
  d.querySelector('.pct').innerHTML=spark(it.rank)+(it.five==null?'\\u2013':Math.round(it.five)+'%')+(it.alert?'<span class=alert title="'+esc(it.alert)+'">*</span>':'');
 }
+// The pill square (FP3): the last 24 hours as a line, the fleet pace bottom right. A click opens the fleet panel.
+function buildSquare(){
+ const d=document.createElement('div');
+ d.className='pill-square'; d.style.setProperty('--i',0); d.title='Painel da frota';
+ d.innerHTML='<svg viewBox="0 0 46 46"><polyline points=""></polyline></svg><span></span>';
+ d.onclick=()=>{pywebview.api.fleet();};
+ return d;
+}
+function applySquare(d,f){
+ const v=f&&Array.isArray(f.sparkline24h)&&f.sparkline24h.length?f.sparkline24h:new Array(24).fill(0), n=v.length, mx=Math.max(...v)||0;
+ // x 6..40, y 7..27 (the pace sits below the line); no history gives a flat line
+ d.querySelector('polyline').setAttribute('points',v.map((y,i)=>(6+34*i/Math.max(1,n-1)).toFixed(1)+','+(mx>0?27-20*Math.max(0,y)/mx:27).toFixed(1)).join(' '));
+ d.className='pill-square'+(f&&(f.level==='warning'||f.level==='critical')?' '+f.level:'');
+ d.querySelector('span').textContent=f&&typeof f.pace==='number'?f.pace+'%':'\\u2013';
+}
 // The structure is rebuilt only when it changes, so a refresh animates the arcs rather than replaying the entrance
 function build(p){
  items.innerHTML='';
+ items.appendChild(buildSquare());
  p.items.forEach((it,i)=>{
   const d=document.createElement('div');
-  d.className='item'; d.style.setProperty('--i',i);
+  d.className='item'; d.style.setProperty('--i',i+1);
   d.style.width=d.style.height=p.item+'px';
   d.innerHTML=ring(it)+'<span class=pct></span>';
   d.onclick=()=>{d.classList.add('pressed');pywebview.api.switch(it.num).then(()=>d.classList.remove('pressed'));};
@@ -479,7 +602,7 @@ function build(p){
   items.appendChild(d);
  });
  const a=document.createElement('div');a.className='add'+(busyAdd?' busy':'');a.textContent='+';a.title='Add account (browser login)';
- a.style.setProperty('--i',p.items.length);
+ a.style.setProperty('--i',p.items.length+1);
  a.onclick=()=>{if(busyAdd)return;busyAdd=true;a.classList.add('busy');
   pywebview.api.add().then(()=>{busyAdd=false;a.classList.remove('busy');});};
  items.appendChild(a);
@@ -503,6 +626,7 @@ function render(p){
  const key=p.edge+'|'+p.items.map(i=>i.num).join(',');
  if(key!==builtKey){ build(p); builtKey=key; }
  else [...items.querySelectorAll('.item')].forEach((d,i)=>applyItem(d,p.items[i]));
+ applySquare(items.querySelector('.pill-square'),p.fleet);
  if(hoverId!==null){ if(hoverId<p.items.length) renderCard(); else hideCard(); }
  if(p.reveal){ unfold(); reportHot(); foldTimer=setTimeout(()=>{if(foldAllowed())setFolded(true);},REVEAL_MS); return; }
  reportHot();
@@ -578,6 +702,9 @@ class PillBridge:
     def set_hot(self, rects):
         self._c.set_hot(rects)
 
+    def fleet(self):
+        return self._c.fleet()
+
 
 class PillController:
     """Owns the pill window and keeps it in step with the account cards.
@@ -587,12 +714,14 @@ class PillController:
     changed edge/theme only needs ``relayout()``.
     """
 
-    def __init__(self, webview, api, settings, on_change, notify):
+    def __init__(self, webview, api, settings, on_change, notify, on_fleet=None):
         self._wv = webview
         self._api = api
         self.settings = settings
         self._on_change = on_change
         self._notify = notify
+        self._on_fleet = on_fleet
+        self.fleet_data: dict | None = None  # the pill square's data (fleet_view.square)
         self.cards: list[dict] = []
         self.window = None
         self._hot: list[list[float]] = []
@@ -624,10 +753,11 @@ class PillController:
         else:
             _gtk_call(self.window, lambda w: w.hide())
 
-    def update(self, cards: list[dict]) -> None:
+    def update(self, cards: list[dict], fleet: dict | None = None) -> None:
         """New account data from the tray's refresh loop."""
         resized = len(cards) != len(self.cards)
         self.cards = list(cards)
+        self.fleet_data = fleet
         if not self._visible:
             return
         # Also when the layout moved under us: a bar came up, or a monitor changed.
@@ -640,10 +770,25 @@ class PillController:
         self._push(reveal=reveal)
         _place(self.window, lay["win"], lambda: self._hot or [lay["pill"]])
 
+    def _area(self) -> tuple[int, int, int, int]:
+        return work_area() or self._screen_area()
+
     def _layout(self) -> dict:
         edge = normalize_edge(self.settings.pill_edge)
-        area = work_area() or self._screen_area()
-        return window_layout(edge, len(self.cards), area, getattr(self.settings, "pill_offset", 0))
+        return window_layout(edge, len(self.cards), self._area(), getattr(self.settings, "pill_offset", 0))
+
+    def panel_anchor(self) -> dict:
+        """Where the fleet panel goes: the pill's edge, its square and the work area, in screen pixels."""
+        lay = self._placed or self._layout()
+        edge = normalize_edge(self.settings.pill_edge)
+        wx, wy = lay["win"][:2]
+        px, py, pw, ph = lay["pill"]
+        along = FLARE + PAD  # the square is the first thing along the pill
+        if is_vertical(edge):
+            x, y = wx + px + (pw - SQUARE_SIZE) // 2, wy + py + along
+        else:
+            x, y = wx + px + along, wy + py + (ph - SQUARE_SIZE) // 2
+        return {"edge": edge, "square": [x, y, SQUARE_SIZE, SQUARE_SIZE], "area": list(self._area())}
 
     def _screen_area(self):
         s = self._wv.screens[0]
@@ -654,7 +799,8 @@ class PillController:
             return
         edge = normalize_edge(self.settings.pill_edge)
         payload = pill_payload(self.cards, edge, normalize_theme(self.settings.pill_theme), self._layout(),
-                               fold=bool(getattr(self.settings, "pill_fold", False)), reveal=reveal)
+                               fold=bool(getattr(self.settings, "pill_fold", False)), reveal=reveal,
+                               fleet=self.fleet_data)
         self._run_js("render(%s)" % json.dumps(payload))
 
     def _run_js(self, script: str) -> None:
@@ -690,6 +836,12 @@ class PillController:
             self._notify("cswap", res["output"])
         self._on_change()
         return {"ok": res["ok"]}
+
+    def fleet(self) -> dict:
+        """The square was clicked: the tray opens or closes the fleet panel."""
+        if self._on_fleet is not None:
+            self._on_fleet()
+        return {"ok": True}
 
     def add_account(self) -> dict:
         self._notify("cswap", "Opening your browser to sign in. Your current account stays active.")
