@@ -17,13 +17,13 @@ from pathlib import Path
 import pytest
 
 from claude_swap import balance
+from claude_swap import autoswitch
 from claude_swap.autoswitch import (
     NoSwitchEvent,
     PollEvent,
     SwitchEvent,
     ThresholdMap,
     TickOutcome,
-    WeeklyLineMap,
     _parse_reset_ts,
 )
 from claude_swap.usage_store import STALE_OK_S, UsageEntry
@@ -393,7 +393,7 @@ def test_no_return_bar_reads_the_barred_accounts_weekly_line(temp_home):
         "2",
         usage={"1": _usage7(10.0, 85.0)},
         thresholds=ThresholdMap({}, 90.0),
-        weekly_lines=WeeklyLineMap({"1": 80.0}, 97.0),
+        weekly_lines=autoswitch.WeeklyLineMap({"1": 80.0}, 97.0),
     )
     assert barred == "1"
 
@@ -418,7 +418,7 @@ def test_priority_candidates_read_their_own_weekly_line(temp_home):
         now=now,
         thresholds=ThresholdMap({}, 90.0),
         policies={},
-        weekly_lines=WeeklyLineMap({"3": 70.0}, 97.0),
+        weekly_lines=autoswitch.WeeklyLineMap({"3": 70.0}, 97.0),
     )
     assert ordered == ["2"]
     assert any_known is True
@@ -460,7 +460,7 @@ def test_priority_active_key_reads_the_active_weekly_line(temp_home):
         now=h.clock.now,
         thresholds=ThresholdMap({}, 90.0),
         policies={},
-        weekly_lines=WeeklyLineMap({"4": 70.0}, 97.0),
+        weekly_lines=autoswitch.WeeklyLineMap({"4": 70.0}, 97.0),
     )
     assert ordered == ["2"]
 
@@ -484,7 +484,7 @@ def test_forced_bar_reads_the_barred_accounts_weekly_line(temp_home):
         ThresholdMap({}, 90.0),
         "2",
         now,
-        weekly_lines=WeeklyLineMap({"1": 80.0}, 97.0),
+        weekly_lines=autoswitch.WeeklyLineMap({"1": 80.0}, 97.0),
     )
     assert barred == "1"
 
@@ -500,7 +500,7 @@ class TestLeftAccountRecoveredReadsWeeklyLines:
         return h.engine._left_account_recovered(
             state, usage, headroom, active_headroom, h.settings, h.clock.now, "2",
             thresholds=ThresholdMap({}, 90.0),
-            weekly_lines=WeeklyLineMap(own, 97.0),
+            weekly_lines=autoswitch.WeeklyLineMap(own, 97.0),
         )
 
     def _split(self, h, five_h: float, week_h: float) -> dict:
