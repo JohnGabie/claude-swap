@@ -797,13 +797,15 @@ function build(p){
  });
  const a=document.createElement('div');a.className='add'+(busyAdd?' busy':'');a.textContent='+';a.title='Add account (browser login)';
  a.style.setProperty('--i',p.items.length+1);
- a.onclick=()=>{if(busyAdd)return;busyAdd=true;a.classList.add('busy');
+ a.addEventListener('mouseenter',hideCard); // the card shows only over an account (FP10)
+ a.onclick=()=>{hideCard();if(busyAdd)return;busyAdd=true;a.classList.add('busy');
   pywebview.api.add().then(()=>{busyAdd=false;a.classList.remove('busy');});};
  items.appendChild(a);
  // The pill gear (SL3): after "+", opens or closes the lines window
  const gr=document.createElement('div');gr.className='gear';gr.textContent='\\u2699\\ufe0e';gr.title='Limites de troca';
  gr.style.setProperty('--i',p.items.length+2);
- gr.onclick=()=>{pywebview.api.lines_window();};
+ gr.addEventListener('mouseenter',hideCard); // same as the square and "+" (FP10)
+ gr.onclick=()=>{hideCard();pywebview.api.lines_window();};
  items.appendChild(gr);
  pill.classList.add('entering');
  requestAnimationFrame(()=>requestAnimationFrame(()=>pill.classList.remove('entering')));
