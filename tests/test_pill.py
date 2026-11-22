@@ -1079,6 +1079,10 @@ def test_slider_has_the_general_mark_and_no_use_mark(tmp_path):
     assert "class=use" not in html
     assert marks(html, "five") == {"gen": "0.8163"}  # (90 - 50) / 49
     assert marks(html, "week") == {"gen": "0.9184"}  # (95 - 50) / 49
+    # the one mark rule is the general mark's look, and no rule is left for a use mark
+    assert (".sl s{position:absolute;top:3px;width:2px;height:12px;margin-left:-1px;background:var(--fg);opacity:.9;"
+            "pointer-events:none;\n left:calc(8px + (100% - 16px) * var(--x))}\n") in pill.PILL_PAGE
+    assert ".sl s.use" not in pill.PILL_PAGE and ".use{" not in pill.PILL_PAGE and "s.gen" not in pill.PILL_PAGE
 
 
 @needs_node
