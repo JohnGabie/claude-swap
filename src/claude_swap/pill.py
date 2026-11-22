@@ -18,6 +18,8 @@ import os
 import subprocess
 import threading
 
+from claude_swap.models import normalize_alias
+
 EDGES = ("right", "left", "top", "bottom")
 THEMES = ("black", "white")
 DEFAULT_EDGE, DEFAULT_THEME = "right", "black"
@@ -176,14 +178,37 @@ _BUDGET_KEYS = ("plan", "fiveResetAt", "weekResetAt", "weekElapsedPct", "project
                 "nowPerMin", "alias", "readAgeS")
 
 
+def _alias(value) -> str | None:
+    """The alias only when it is a valid stored alias, which can never hold an email (FP10)."""
+    try:
+        return value if isinstance(value, str) and normalize_alias(value) == value else None
+    except ValueError:
+        return None
+
+
 def _budget(card: dict) -> dict | None:
     b = card.get("budget")
-    return {k: b.get(k) for k in _BUDGET_KEYS} if isinstance(b, dict) else None
+    if not isinstance(b, dict):
+        return None
+    out = {k: b.get(k) for k in _BUDGET_KEYS}
+    out["alias"] = _alias(out["alias"])
+    return out
+
+
+_FLEET_KEYS = ("sparkline24h", "pace", "level")
+
+
+def _fleet(fleet) -> dict | None:
+    return {k: fleet.get(k) for k in _FLEET_KEYS} if isinstance(fleet, dict) else None
 
 
 def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: bool = False,
                  reveal: bool = False, fleet: dict | None = None) -> dict:
-    """Everything the page needs to draw the pill and, on hover, each account's card."""
+    """Everything the page needs to draw the pill and, on hover, each account's card.
+
+    Only named fields reach the page. A card's ``title`` (alias or email) and ``tag`` (the organization
+    name, which holds the email on a personal account) never do (FP10).
+    """
     pw, ph = pill_size(edge, len(cards))
     return {
         "edge": edge,
@@ -199,7 +224,7 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
         "item": ITEM,
         "square": SQUARE,
         # The pill square's data (fleet_view.square), or None until the first reading
-        "fleet": fleet,
+        "fleet": _fleet(fleet),
         "card": {"w": CARD_W, "arrow": ARROW, "gap": GAP},
         "items": [
             {
@@ -210,8 +235,6 @@ def pill_payload(cards: list[dict], edge: str, theme: str, layout: dict, fold: b
                 "week": _pct(_row(c, "7d")),
                 "rank": rank_of(c),
                 "alert": c.get("alert") if isinstance(c.get("alert"), str) else None,
-                "title": c.get("title", ""),
-                "tag": c.get("tag", ""),
                 "message": c.get("message"),
                 "budget": _budget(c),
                 "rows": [
@@ -310,8 +333,7 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 #card.show.glide{transition:opacity .18s ease,transform .3s var(--ease),top .28s var(--ease),left .28s var(--ease),visibility 0s}
 .arrow{position:absolute;width:0;height:0;border:6px solid transparent;transition:top .28s var(--ease),left .28s var(--ease)}
 .head{margin-bottom:10px;min-width:0}
-.title{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.tag{color:var(--dim);font-size:11px;white-space:nowrap}
+.age{color:var(--dim);font-size:11px;white-space:nowrap}
 /* The account card (FP10) */
 .t1{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .t2{color:var(--dim);font-size:11.5px;margin-top:2px}
@@ -327,7 +349,6 @@ body.edge-top{--cy:-8px;--origin:center top}body.edge-bottom{--cy:8px;--origin:c
 .status i{width:14px;height:14px;border-radius:50%;background:var(--crit);color:var(--bg);display:grid;place-items:center;font:800 9px system-ui;font-style:normal}
 .foot{margin-top:16px;padding-top:12px;border-top:1px solid var(--grid);display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .foot .l{color:var(--dim);font-size:11px}.foot .v{font-size:13px;font-weight:600;margin-top:1px;font-variant-numeric:tabular-nums}
-.head .tag{margin-top:2px;overflow:hidden;text-overflow:ellipsis}
 .row{margin-bottom:12px}.row:last-child{margin-bottom:0}
 .top{display:flex;justify-content:space-between;color:var(--dim);font-size:11.5px;margin-bottom:5px}
 .bar{height:6px;border-radius:3px;background:var(--spent-track);overflow:hidden}
@@ -348,8 +369,17 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const R5=17,R7=11.5,C5=2*Math.PI*R5,C7=2*Math.PI*R7;
 const lvl=p=>p==null?0:p<70?0:p<90?1:2; // FP2 level rule: spent below 70, warning 70-89, critical from 90
 const NAMES={'5h':'Sess\\u00e3o de 5 h','7d':'Semana'}, VERB={'5h':'volta','7d':'renova'};
-// The tray's reset text is English ("in 1h", "resets Sun 05:59"): keep its time, say the verb in pt-BR
-const resetText=(t,l)=>!t?'':(VERB[l]||'volta')+' '+String(t).replace(/^resets\\s*/i,'').replace(/^in\\s+/i,'em ');
+// The rows' texts are English, from tui/data.py: window_reset_text gives "resets now" or "resets {dur}",
+// format_age gives "\\u00b7 {dur} ago"; {dur} is format_duration ("45s", "12m", "2h 13m", "2h", "3d 4h", "3d").
+// They become pt-BR; any other text is left out rather than shown in English.
+const DUR='\\\\d+[smhd](?: \\\\d+[smhd])?';
+const resetText=(t,l)=>{
+ const v=VERB[l]||'volta', s=String(t??'');
+ if(s==='resets now') return v+' agora';
+ const m=s.match(new RegExp('^resets ('+DUR+')$'));
+ return m?v+' em '+m[1]:'';
+};
+const ageText=t=>{const m=String(t??'').match(new RegExp('^\\u00b7 ('+DUR+') ago$')); return m?'\\u00b7 h\\u00e1 '+m[1]:'';};
 // Both arcs always exist (an empty one has no length), so a reading arriving or changing animates rather than appearing.
 const dash=(c,p)=>`${p==null?0:c*Math.min(p,100)/100} ${c}`;
 const arc=(r,c,p,w,k)=>`<circle class=track cx=21 cy=21 r=${r} fill=none stroke-width=${w}></circle>`+
@@ -424,16 +454,18 @@ function meters(it,b){
  return out.join('');
 }
 // The account card's HTML (FP10). Without budget data it is today's rows in the new style.
+// No identity field reaches it: the payload has no title and no tag, and the alias is a checked alias (FP-D4).
 function cardHtml(it){
  const b=it.budget;
+ const state=(it.active?' \\u00b7 conta ativa':'')+(it.disabled?' \\u00b7 pausada':'');
  const head=b
-  ?`<div class=head><div class=t1>#${esc(it.num)}${b.alias?' '+esc(b.alias):''}${it.active?' \\u00b7 conta ativa':''}${it.disabled?' \\u00b7 pausada':''}</div><div class=t2>${esc([cap(b.plan),readAge(b.readAgeS)].filter(Boolean).join(' \\u00b7 '))}</div></div>`
-  :`<div class=head><div class=t1>#${esc(it.num)}${it.disabled?' \\u00b7 pausada':''}</div><div class=t2>${esc(it.tag)}</div></div>`; // never the email (FP-D4)
+  ?`<div class=head><div class=t1>#${esc(it.num)}${b.alias?' '+esc(b.alias):''}${state}</div><div class=t2>${esc([cap(b.plan),readAge(b.readAgeS)].filter(Boolean).join(' \\u00b7 '))}</div></div>`
+  :`<div class=head><div class=t1>#${esc(it.num)}${state}</div></div>`;
  const alert=it.alert?`<div class=alert-msg>* ${esc(it.alert)}</div>`:'';
  if(!it.rows.length) return head+alert+(it.message?`<div class=msg>${esc(it.message)}</div>`:'');
  if(!b) return head+alert+it.rows.map(r=>`<div class="row ${r.label==='7d'?'wk':'l'+lvl(r.pct)}"><div class=top><span>${esc(NAMES[r.label]||r.label)}</span><span>${esc(resetText(r.reset,r.label))}</span></div>
   <div class=bar><i style="width:${Math.min(r.pct||0,100)}%"></i></div>
-  <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% usado'}${r.age?' <span class=tag>'+esc(r.age)+'</span>':''}</div></div>`).join('');
+  <div class=used>${r.pct==null?'\\u2013':Math.round(r.pct)+'% usado'}${ageText(r.age)?' <span class=age>'+esc(ageText(r.age))+'</span>':''}</div></div>`).join('');
  return head+alert+meters(it,b)+`<div class=foot><div><div class=l>Consumo agora</div><div class=v>${it.active&&typeof b.nowPerMin==='number'?tok(b.nowPerMin)+'/min':DASH}</div></div>
   <div><div class=l>1% desta conta \\u2248</div><div class=v>${typeof b.tokensPerPercent==='number'?tok(b.tokensPerPercent)+' tokens':DASH}</div></div></div>`;
 }

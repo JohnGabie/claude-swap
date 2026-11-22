@@ -1,18 +1,33 @@
 """Pure parts of the screen-edge pill: geometry, outline, payloads, settings."""
 
+import itertools
 import json
+from datetime import datetime, timezone
 
 import pytest
 
-from claude_swap import pill
+from claude_swap import desktop, pill
+from claude_swap.models import AccountSnapshot
+from claude_swap.switcher import SENTINEL_NOTES
 from claude_swap.tray import TraySettings
+from claude_swap.tui import data
+from claude_swap.usage_store import UsageEntry
+
+NOW = 1_790_000_000.0
+FAKE_EMAIL = "a@b.c"
+FAKE_ORG = "a@b.c's Organization"  # a personal account's organization name holds its email
+
+
+def window(remaining=3600.0, pct=50.0):
+    """One usage window that resets ``remaining`` seconds after NOW."""
+    return {"pct": pct, "resets_at": datetime.fromtimestamp(NOW + remaining, timezone.utc).isoformat()}
 
 
 def card(num=1, five=50.0, week=10.0, active=False):
     return {
-        "num": num, "title": f"#{num} a@b.c", "tag": "Pro", "active": active, "disabled": False,
+        "num": num, "title": f"#{num}  {FAKE_EMAIL}", "tag": FAKE_ORG, "active": active, "disabled": False,
         "message": None,
-        "rows": [{"label": "5h", "pct": five, "reset": "in 1h", "age": None},
+        "rows": [{"label": "5h", "pct": five, "reset": data.reset_text(window(), NOW), "age": None},
                  {"label": "7d", "pct": week, "reset": None, "age": None}],
     }
 
@@ -143,7 +158,7 @@ def test_pill_payload_carries_each_accounts_card_data():
     assert payload["theme"] == "white" and payload["vertical"] is True and payload["layout"] == lay
     first, second = payload["items"]
     assert (first["five"], first["week"], first["active"]) == (73.0, 15.0, True)
-    assert [r["label"] for r in first["rows"]] == ["5h", "7d"] and first["title"] and first["tag"] == "Pro"
+    assert [r["label"] for r in first["rows"]] == ["5h", "7d"] and "title" not in first and "tag" not in first
     assert second["five"] is None
     json.dumps(payload)  # it is handed to the page as JSON
 
@@ -552,3 +567,161 @@ def test_apply_square_draws_a_flat_line_with_no_history_and_the_data_otherwise(t
         assert len(view["pts"].split(" ")) == 24 and ys == {"27.0"} and view["text"] == "\u2013"
     pts = square_view(tmp_path, {"sparkline24h": [float(i) for i in range(24)], "pace": 1, "level": "neutral"})["pts"].split(" ")
     assert pts[0].split(",")[1] == "27.0" and pts[-1].split(",")[1] == "7.0"  # the peak is the top of the line
+
+
+# ---- no identity in the card, pt-BR fallback rows (FP10) ----------------------
+
+def real_card(num=1, usage=None, active=False, disabled=False, alias="", email=FAKE_EMAIL, org=FAKE_ORG):
+    """A card exactly as desktop.py hands it to the pill, built from a fake account."""
+    if usage is None:
+        usage = UsageEntry(last_good={"five_hour": window(), "seven_day": window()}, age_s=0.0)
+    acc = AccountSnapshot(number=str(num), email=email, org_name=org, org_uuid="org-fake", is_active=active,
+                          kind="oauth", switchable=True, usage=usage, alias=alias, disabled=disabled)
+    return desktop.card_dict(acc, NOW)
+
+
+def payload_of(*cards, fleet=None):
+    return pill.pill_payload(list(cards), "right", "black", pill.window_layout("right", len(cards), AREA), fleet=fleet)
+
+
+def test_payload_sends_only_the_named_fields_to_the_page():
+    c = real_card()
+    c.update(email=FAKE_EMAIL, org_name=FAKE_ORG, budget={**budget(), "email": FAKE_EMAIL, "org": FAKE_ORG})
+    c["rows"] = [{**r, "email": FAKE_EMAIL} for r in c["rows"]]
+    fleet = {"sparkline24h": [1.0] * 24, "pace": 86, "level": "neutral", "email": FAKE_EMAIL}
+    payload = payload_of(c, fleet=fleet)
+    item = payload["items"][0]
+    assert set(item) == {"num", "active", "disabled", "five", "week", "rank", "alert", "message", "budget", "rows"}
+    assert set(item["budget"]) == set(budget())
+    assert all(set(r) == {"label", "pct", "reset", "age"} for r in item["rows"])
+    assert set(payload["fleet"]) == {"sparkline24h", "pace", "level"}
+
+
+def test_payload_drops_an_alias_that_is_not_a_valid_alias():
+    def alias_sent(alias):
+        c = real_card()
+        c["budget"] = budget(alias=alias)
+        return payload_of(c)["items"][0]["budget"]["alias"]
+
+    assert alias_sent(FAKE_EMAIL) is None
+    assert alias_sent(f"x {FAKE_ORG}") is None
+    assert alias_sent("trabalho") == "trabalho"
+    assert alias_sent(None) is None
+
+
+def every_card_branch():
+    """Each reading state of desktop.py, with and without budget, active and paused; every identity field is fake."""
+    good = {"five_hour": window(), "seven_day": window()}
+    no_pct = {"five_hour": window(pct=None), "seven_day": window(pct=None)}
+    usages = [
+        UsageEntry(last_good=good, age_s=0.0),
+        UsageEntry(last_good=good, age_s=600.0),
+        UsageEntry(last_good=no_pct, age_s=0.0),
+        UsageEntry(last_good=good, age_s=3 * 3600.0, last_error="http-500"),  # alert: old reading
+        UsageEntry(last_error="oauth_not_allowed_for_organization"),  # alert and no reading
+        UsageEntry(),  # "no usage yet"
+        UsageEntry(sentinel="no credentials"),  # the one sentinel with no note of its own
+        *(UsageEntry(sentinel=s) for s in SENTINEL_NOTES),
+    ]
+    cards = []
+    for usage, active, disabled, has_budget in itertools.product(usages, *[(False, True)] * 3):
+        n = len(cards) + 1
+        alias = "" if n % 2 else "leakalias"  # the title is "#n  alias-or-email"
+        c = real_card(n, usage, active, disabled, alias=alias)
+        c.update(email=FAKE_EMAIL, org_name=FAKE_ORG)
+        if has_budget:
+            c["budget"] = budget(alias=FAKE_EMAIL)
+        cards.append(c)
+    blank = real_card(len(cards) + 1)
+    blank.update(rows=[], message=None, alert=None)  # no reading and no message
+    return cards + [blank]
+
+
+# A DOM that records each string the page writes: innerHTML, textContent, title, className, style, attributes
+_PRE_DOM = """
+  var __wrote = [];
+  const __node = () => {
+    const set = {};
+    return new Proxy(function () {}, {
+      get: (t, k) => k === Symbol.toPrimitive ? () => 0 : k === Symbol.iterator ? function* () {} : k in set ? set[k] : __node(),
+      set: (t, k, v) => { if (typeof v === 'string') __wrote.push(v); set[k] = v; return true; },
+      apply: (t, self, args) => { for (const a of args) if (typeof a === 'string') __wrote.push(a); return __node(); } });
+  };
+  document = __node();
+"""
+
+
+@needs_node
+def test_no_identity_reaches_the_payload_or_any_html_of_the_page(tmp_path):
+    cards = every_card_branch()
+    payload = payload_of(*cards, fleet={"sparkline24h": [1.0] * 24, "pace": 86, "level": "neutral"})
+    sent = json.dumps(payload)
+    out = run_page(tmp_path, "(p => (render(p), p.items.forEach((it, i) => showCard(i)),"
+                   " {html: p.items.map(cardHtml), wrote: __wrote}))(%s)" % sent, _PRE_DOM)
+    assert len(out["html"]) == len(cards) == 97
+    for html in out["html"]:
+        assert html + "<div class=arrow></div>" in out["wrote"]  # the recorder saw each card the page drew
+    everything = [sent, *out["html"], *out["wrote"]]
+    for leak in ("@", "leakalias", "Organization", "org-fake"):
+        assert [text for text in everything if leak in text][:1] == [], leak
+
+
+@needs_node
+@pytest.mark.parametrize("active,disabled,head", [
+    (False, False, "#4"),
+    (True, False, "#4 · conta ativa"),
+    (False, True, "#4 · pausada"),
+    (True, True, "#4 · conta ativa · pausada"),
+])
+@pytest.mark.parametrize("read", [True, False])
+def test_card_without_budget_head_is_the_number_and_the_state_only(tmp_path, active, disabled, head, read):
+    c = real_card(4, None if read else UsageEntry(), active, disabled, alias="leakalias")
+    html = card_html(tmp_path, payload_of(c)["items"][0])
+    assert html.startswith(f"<div class=head><div class=t1>{head}</div></div>"), html
+    assert "class=t2" not in html
+
+
+def fallback_texts(tmp_path, usage):
+    """(5-hour reset text, weekly reset text, 5-hour used line) of a card without budget."""
+    html = card_html(tmp_path, payload_of(real_card(usage=usage))["items"][0])
+    five, week = re.findall(r"<div class=top><span>[^<]*</span><span>([^<]*)</span>", html)
+    used = re.sub(r"<[^>]+>", "", re.search(r"<div class=used>(.*?)</div>", html).group(1))
+    return five, week, used
+
+
+@needs_node
+@pytest.mark.parametrize("win,source,rest", [
+    (window(-60), "resets now", "agora"),
+    (window(0), "resets now", "agora"),
+    (window(0.5), "resets 0s", "em 0s"),
+    (window(45), "resets 45s", "em 45s"),
+    (window(720), "resets 12m", "em 12m"),
+    (window(7980), "resets 2h 13m", "em 2h 13m"),
+    (window(7200), "resets 2h", "em 2h"),
+    (window(273600), "resets 3d 4h", "em 3d 4h"),
+    (window(259200), "resets 3d", "em 3d"),
+    ({"pct": 50.0}, None, None),  # no reset time: no text (the old code did this already)
+    ({"pct": 50.0, "resets_at": "not a date"}, None, None),
+])
+def test_fallback_reset_is_pt_br_for_each_form_of_window_reset_text(tmp_path, win, source, rest):
+    good = {"five_hour": win, "seven_day": win}
+    assert data.window_reset_text(good, "five_hour", NOW) == source
+    five, week, _ = fallback_texts(tmp_path, UsageEntry(last_good=good, age_s=0.0))
+    assert (five, week) == ((f"volta {rest}", f"renova {rest}") if rest else ("", ""))
+
+
+@needs_node
+@pytest.mark.parametrize("age_s,source,used", [
+    (None, None, "50% usado"),  # fresh: no age (the old code did this already)
+    (179, None, "50% usado"),
+    (180, "· 3m ago", "50% usado · há 3m"),
+    (600, "· 10m ago", "50% usado · há 10m"),
+    (7980, "· 2h 13m ago", "50% usado · há 2h 13m"),
+    (7200, "· 2h ago", "50% usado · há 2h"),
+    (273600, "· 3d 4h ago", "50% usado · há 3d 4h"),
+    (259200, "· 3d ago", "50% usado · há 3d"),
+])
+def test_fallback_age_is_pt_br_for_each_form_of_format_age(tmp_path, age_s, source, used):
+    good = {"five_hour": window(), "seven_day": window()}
+    assert data.format_age(age_s) == source
+    assert fallback_texts(tmp_path, UsageEntry(last_good=good, age_s=age_s))[2] == used
