@@ -110,3 +110,44 @@ def test_row_state_is_written_in_the_text():
     assert tray.mode_label("balanced") == "Balanced"
     assert tray.mode_label("best") == "Simple"
     assert tray.mode_label("other") == "other"
+
+
+# ---- pill square and card budget (fleet panel, FP3, FP10, FP12) -------------
+
+def test_pill_payload_has_fleet_and_card_budget():
+    from datetime import datetime, timezone
+
+    from claude_swap import pill
+
+    now = datetime(2026, 11, 21, 22, 0, 0, tzinfo=timezone.utc).timestamp()
+    cards = [card(1, "#1  a", rows=(("5h", 10.0), ("7d", 20.0))),
+             card(4, "#4  b", active=True, rows=(("5h", 33.0), ("7d", 95.0)))]
+    for c in cards:
+        c["num"] = str(c["num"])  # desktop.card_dict gives the slot number as text
+    budget = {
+        "fleet": {"paceRatio": 1.06, "weekUsedPct": 58.2, "weekElapsedPct": 66.9, "usableNow": 2, "accounts": 2},
+        "accounts": [
+            {"id": 1, "plan": "max", "fetchedAt": "2026-11-21T21:58:00Z",
+             "sevenDay": {"resetsAt": "2026-11-25T05:00:00Z", "tokensPerPercent": 250000}},
+            {"id": 4, "plan": "pro", "fetchedAt": "2026-11-21T21:59:00Z",
+             "fiveHour": {"pct": 33.0, "resetsAt": "2026-11-22T00:29:00Z"},
+             "sevenDay": {"resetsAt": "2026-11-22T05:59:00Z", "elapsedPct": 66.0, "projectedEndPct": 100.0,
+                          "tokensPerPercent": 1200000}},
+        ],
+    }
+    bucket = str(int((now - 600) // 300 * 300))
+    history = {"buckets": {bucket: {"m": {"claude-opus-5-5": 2_520_000.0}, "p": {"guilda": 2_520_000.0}}}}
+    shown, fleet = tray.pill_inputs(cards, budget, {"4": "work"}, history, now)
+    payload = pill.pill_payload(shown, "right", "black", pill.window_layout("right", 2, (0, 0, 1920, 1080)),
+                                fleet=fleet)
+    assert payload["fleet"]["pace"] == 106 and payload["fleet"]["level"] == "critical"
+    assert len(payload["fleet"]["sparkline24h"]) == 24 and payload["fleet"]["sparkline24h"][-1] > 0
+    one, four = payload["items"]
+    assert one["budget"]["plan"] == "max" and one["budget"]["nowPerMin"] is None
+    assert four["budget"] == {"plan": "pro", "fiveResetAt": "2026-11-22T00:29:00Z",
+                              "weekResetAt": "2026-11-22T05:59:00Z", "weekElapsedPct": 66.0,
+                              "projectedEndPct": 100.0, "tokensPerPercent": 1200000,
+                              "nowPerMin": 42000.0, "alias": "work", "readAgeS": 60.0}
+    # without a history yet: a flat square, the cards still get their budget
+    shown, fleet = tray.pill_inputs(cards, budget, {}, None, now)
+    assert fleet["sparkline24h"] == [0.0] * 24 and shown[1]["budget"]["nowPerMin"] == 0.0

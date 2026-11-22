@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import threading
+import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
@@ -206,6 +207,21 @@ def show_account_rows(*, pill_available: bool, pill_enabled: bool) -> bool:
     return not (pill_available and pill_enabled)
 
 
+# ---- pill square and card budget (fleet panel, FP3, FP10, FP12) ----------------
+
+def pill_inputs(cards: list[dict], budget: dict, aliases: dict, history: dict | None, now: float):
+    """What the refresh loop hands the pill: the cards with their ``budget`` field, and the square.
+
+    A card's budget joins the budget account whose ``str(id)`` is the card's ``num``. Without a
+    usage history yet, the square is a flat line.
+    """
+    from claude_swap import fleet_page, fleet_view
+
+    history = history if isinstance(history, dict) else {}
+    shown = fleet_page.with_budget(cards, budget, aliases, fleet_page.now_per_min(history, now), now)
+    return shown, fleet_view.square(budget, history, now)
+
+
 # ---- start with Windows ----------------------------------------------------
 
 def startup_command(python: str | None = None) -> str:
@@ -369,13 +385,25 @@ def run(switcher) -> int:
     cards: list[dict] = []
     wake = threading.Event()
 
+    def aliases() -> dict:
+        """The switcher's alias of each account (the email of the same rows is dropped here)."""
+        try:
+            return {num: alias for num, alias, _email in switcher.list_aliases()}
+        except Exception:  # noqa: BLE001 - a card without alias is fine
+            return {}
+
     def refresh_loop():
         while not quitting.is_set():
             snap = api.snapshot()
             if "accounts" in snap:
                 cards[:] = snap["accounts"]
                 if pill is not None:
-                    pill.update(cards)
+                    from claude_swap.budget_source import current_budget
+
+                    now = time.time()
+                    latest["budget"] = current_budget(now)
+                    shown, square = pill_inputs(cards, latest["budget"], aliases(), history.data(), now)
+                    pill.update(shown, fleet=square)
                 icon.title = tooltip(cards)
                 icon.update_menu()
             wake.wait(REFRESH_INTERVAL_S)
@@ -442,14 +470,90 @@ def run(switcher) -> int:
     api.app_options = AppOptions()
 
     pill = None
+    history = None  # the usage history (FP11), Linux only
+    latest: dict = {}  # the last budget of the refresh loop, for the panel
+    panel_window = None
+    panel_open = threading.Event()
     if sys.platform == "linux":
+        from claude_swap import fleet_page
         from claude_swap.desktop_notify import send_notification
         from claude_swap.pill import EDGES, THEMES, PillController
+        from claude_swap.usage_log import claude_projects_dir
 
         def say(title, body):
             threading.Thread(target=send_notification, args=(title, body), daemon=True).start()
 
-        pill = PillController(webview, api, settings, wake.set, say)
+        root = Path(switcher.backup_dir)
+        history = fleet_page.FleetHistory(root, claude_projects_dir())
+
+        def panel_budget():
+            if latest.get("budget") is None:
+                from claude_swap.budget_source import current_budget
+
+                latest["budget"] = current_budget()
+            return latest["budget"]
+
+        # Like the threshold window: driven through GTK, not through pywebview's show/hide.
+        def panel_gtk(fn):
+            from gi.repository import GLib
+            from webview.platforms import gtk as wgtk
+
+            def run():
+                view = wgtk.BrowserView.instances.get(panel_window.uid)
+                if view is not None:
+                    fn(view)
+                return False
+
+            GLib.idle_add(run)
+
+        def panel_js(script):
+            panel_gtk(lambda view: view.webview.run_javascript(script, None, None, None))
+
+        def close_panel():
+            panel_open.clear()
+            panel_gtk(lambda view: view.window.hide())
+
+        def open_panel():
+            x, y = fleet_page.panel_position(pill.panel_anchor())
+            panel_open.set()
+
+            def show(view):
+                view.window.show_all()
+                view.window.deiconify()
+                view.window.present()  # the keyboard focus, so Esc closes it
+                view.window.move(x, y)  # after mapping, which can recentre the window
+                view.webview.run_javascript("window.fleetOpen&&window.fleetOpen()", None, None, None)
+
+            panel_gtk(show)
+
+            def update_then_reload():  # FP11: an open also updates the usage history
+                history.refresh()
+                if panel_open.is_set():
+                    panel_js("window.fleetReload&&window.fleetReload()")
+
+            threading.Thread(target=update_then_reload, daemon=True).start()
+
+        def toggle_panel():
+            """The pill square: the first click opens the panel, the second closes it."""
+            close_panel() if panel_open.is_set() else open_panel()
+
+        panel_window = webview.create_window(
+            fleet_page.PANEL_TITLE, html=fleet_page.FLEET_PAGE,
+            js_api=fleet_page.FleetPanelApi(history, panel_budget, lambda: fleet_page.read_decisions(root),
+                                            close_panel),
+            width=fleet_page.PANEL_W, height=fleet_page.PANEL_H, resizable=False,
+            background_color="#000000", hidden=True,
+        )
+
+        def on_panel_closing():
+            if quitting.is_set():
+                return None
+            close_panel()
+            return False
+
+        panel_window.events.closing += on_panel_closing
+
+        pill = PillController(webview, api, settings, wake.set, say, on_fleet=toggle_panel)
         pill.create()
 
     def set_pill_option(field, value):
@@ -476,6 +580,8 @@ def run(switcher) -> int:
         if pill is not None:
             pill.destroy()
         threshold_window.destroy()
+        if panel_window is not None:
+            panel_window.destroy()
         window.destroy()
 
     def core_settings():
@@ -612,6 +718,8 @@ def run(switcher) -> int:
         if settings.auto_switch:
             api.auto(True)
         icon.run_detached()
+        if history is not None:  # FP11: built at start, then updated every 5 minutes
+            threading.Thread(target=history.run, args=(quitting,), daemon=True).start()
         threading.Thread(target=refresh_loop, daemon=True).start()
         if pill is not None:
             threading.Thread(target=pill.start, daemon=True).start()
