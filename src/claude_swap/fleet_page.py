@@ -142,17 +142,65 @@ def now_per_min(history: dict, now: float) -> float:
 
 # ---- decision events -----------------------------------------------------------
 
+def _parse(line: str):
+    """One decision-log line as a dict, or None for a line that is not a JSON object."""
+    try:
+        event = json.loads(line)
+    except (ValueError, RecursionError):
+        return None
+    return event if isinstance(event, dict) else None
+
+
+class DecisionCache:
+    """The decision-log events of ``decision_log.tail(root, POLL_LINES)``, parsed once per file.
+
+    Each log file (the current one and its rotated copies) is parsed again only when its
+    (path, mtime, size) changes, so a period change of the panel reuses the parsed events.
+    """
+
+    def __init__(self, backup_root: Path):
+        self._root = Path(backup_root)
+        self._lock = threading.Lock()
+        self._files: dict[str, tuple[tuple, list]] = {}
+
+    def _paths(self) -> list[Path]:
+        base = decision_log.log_path(self._root)
+        rotated = [base.with_name(f"{decision_log.LOG_FILENAME}.{i}") for i in range(decision_log.BACKUPS, 0, -1)]
+        return rotated + [base]  # oldest first, as decision_log.tail reads them
+
+    def _lines(self, path: Path) -> list:
+        """The parsed non-empty lines of one file (None for a bad line); [] for a missing file."""
+        try:
+            st = path.stat()
+        except OSError:
+            self._files.pop(str(path), None)
+            return []
+        key = (st.st_mtime_ns, st.st_size)
+        cached = self._files.get(str(path))
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            with path.open(encoding="utf-8") as f:
+                parsed = [_parse(line.rstrip("\n")) for line in f if line.strip()]
+        except (OSError, ValueError):
+            self._files.pop(str(path), None)
+            return []
+        self._files[str(path)] = (key, parsed)
+        return parsed
+
+    def events(self) -> list[dict]:
+        """The events of the last ``POLL_LINES`` log lines, oldest first; bad lines dropped."""
+        with self._lock:
+            lines: list = []
+            for path in self._paths():
+                lines.extend(self._lines(path))
+            limit = budget_calibrate.POLL_LINES
+            return [e for e in lines[-limit:] if e is not None]
+
+
 def read_decisions(backup_root: Path) -> list[dict]:
     """The decision-log events as dicts; a line that is not a JSON object is dropped."""
-    out = []
-    for line in decision_log.tail(backup_root, lines=budget_calibrate.POLL_LINES):
-        try:
-            event = json.loads(line)
-        except (ValueError, RecursionError):
-            continue
-        if isinstance(event, dict):
-            out.append(event)
-    return out
+    return DecisionCache(backup_root).events()
 
 
 # ---- the usage history worker (FP11) --------------------------------------------
@@ -167,19 +215,25 @@ class FleetHistory:
         self._clock = clock
         self._lock = threading.Lock()
         self._data: dict | None = None
+        self.failed = False  # no history at all: the update and the stored file both failed
 
     def data(self) -> dict | None:
         return self._data
 
-    def refresh(self) -> dict:
-        """Read the new log lines. A failure logs its exception type name only."""
+    def refresh(self) -> dict | None:
+        """Read the new log lines. A failure logs its exception type name only and never raises."""
         with self._lock:
             try:
                 self._data = self._update(self._root, self._projects, self._clock())
+                self.failed = False
             except Exception as e:  # noqa: BLE001 - the tray must keep running
                 _logger.warning("usage history update failed: %s", type(e).__name__)
                 if self._data is None:
-                    self._data = usage_history.load(self._root)
+                    try:
+                        self._data = usage_history.load(self._root)
+                    except Exception as e2:  # noqa: BLE001 - e.g. RecursionError on a deep file
+                        _logger.warning("usage history load failed: %s", type(e2).__name__)
+                        self.failed = True
             return self._data
 
     def run(self, stop: threading.Event, interval: float = HISTORY_UPDATE_S) -> None:
@@ -207,12 +261,15 @@ class FleetPanelApi:
             period = DEFAULT_PERIOD
         data = self._history.data()
         if data is None:
-            return {"loading": True}
+            return {"error": True} if self._history.failed else {"loading": True}
         try:
-            return fleet_view.build_fleet(self._budget(), data, self._decisions(), self._clock(), period)
+            payload = fleet_view.build_fleet(self._budget(), data, self._decisions(), self._clock(), period)
         except Exception as e:  # noqa: BLE001 - the page shows an empty panel, the log has the type only
             _logger.warning("fleet panel payload failed: %s", type(e).__name__)
             return {"error": True}
+        # item 7 of the T4 review: the page does not use the model id, so it does not get it
+        payload["models"] = [{k: v for k, v in m.items() if k != "id"} for m in payload["models"]]
+        return payload
 
     def close(self) -> dict:
         self._on_close()
@@ -450,10 +507,14 @@ function focusModel(i){if(!bar||!segs.length)return;
  const si=i==null?0:+segs[i].dataset.s, ti=Math.max(si,0.30);
  segs.forEach((g,j)=>{const sj=+g.dataset.s;g.style.flexGrow=i==null?Math.max(sj,0.004):j===i?ti:Math.max(sj*(1-ti)/Math.max(1e-6,1-si),0.004);g.classList.toggle('on',j===i);});
  document.querySelectorAll('#models .ml').forEach(r=>r.classList.toggle('on',i!=null&&+r.dataset.i===i));}
-function models(p){
- let rows=(p.models||[]).map(m=>({label:m.label,tokens:m.tokens,share:m.share}));
- // at most six rows: the tail folds into "outros (n)", like the project rows
+// FP6: six models or fewer, one row each; more, the top five and "outros (n)"
+function modelRows(models){
+ let rows=(models||[]).map(m=>({label:m.label,tokens:m.tokens,share:m.share}));
  if(rows.length>MODEL_ROWS){const rest=rows.slice(MODEL_ROWS-1);rows=rows.slice(0,MODEL_ROWS-1).concat([{label:`outros (${rest.length})`,tokens:rest.reduce((a,m)=>a+m.tokens,0),share:rest.reduce((a,m)=>a+m.share,0)}]);}
+ return rows;
+}
+function models(p){
+ const rows=modelRows(p.models);
  const col=i=>STEPS[Math.min(i,STEPS.length-1)];
  const segHtml=rows.length?rows.map((m,i)=>`<i data-i=${i} data-s=${m.share/100} style="--d:${i*60}ms;flex:${Math.max(m.share/100,0.004)};background:${col(i)}"><em style="color:${LIGHT.has(i)?'#000000':'#FFFFFF'}">${share(m.share)}</em></i>`).join('')
   :`<i class=empty style="flex:1;background:var(--raised)"><em style="color:var(--muted)">sem uso</em></i>`;

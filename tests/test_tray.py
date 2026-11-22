@@ -141,7 +141,8 @@ def test_pill_payload_has_fleet_and_card_budget():
     payload = pill.pill_payload(shown, "right", "black", pill.window_layout("right", 2, (0, 0, 1920, 1080)),
                                 fleet=fleet)
     assert payload["fleet"]["pace"] == 106 and payload["fleet"]["level"] == "critical"
-    assert len(payload["fleet"]["sparkline24h"]) == 24 and payload["fleet"]["sparkline24h"][-1] > 0
+    # 23 empty hours, then the last hour: 2 520 000 weighted tokens over 60 minutes
+    assert payload["fleet"]["sparkline24h"] == [0.0] * 23 + [42000.0]
     one, four = payload["items"]
     assert one["budget"]["plan"] == "max" and one["budget"]["nowPerMin"] is None
     assert four["budget"] == {"plan": "pro", "fiveResetAt": "2026-11-22T00:29:00Z",
@@ -151,3 +152,43 @@ def test_pill_payload_has_fleet_and_card_budget():
     # without a history yet: a flat square, the cards still get their budget
     shown, fleet = tray.pill_inputs(cards, budget, {}, None, now)
     assert fleet["sparkline24h"] == [0.0] * 24 and shown[1]["budget"]["nowPerMin"] == 0.0
+
+
+SECRET_PATH = "/" + "/".join(("home", "u", "secret"))  # a fake path, built so no path literal sits in the file
+
+
+def test_refresh_pill_survives_a_failure_and_logs_the_type_only(caplog, monkeypatch):
+    import logging
+
+    class FakePill:
+        def __init__(self):
+            self.calls = []
+
+        def update(self, cards, fleet=None):
+            self.calls.append((cards, fleet))
+
+    cards = [card(1, "#1  me@example.com", rows=(("5h", 10.0),))]
+    cards[0]["num"] = "1"
+
+    def bad_budget(_now):
+        raise ValueError(SECRET_PATH + " me@example.com")
+
+    pill, latest = FakePill(), {}
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        tray.refresh_pill(pill, cards, bad_budget, {}, None, 1_000_000.0, latest)
+    assert pill.calls == [(cards, None)]  # the pill keeps today's rows; the loop goes on
+
+    def bad_inputs(*_a):
+        raise RecursionError(SECRET_PATH)
+
+    monkeypatch.setattr(tray, "pill_inputs", bad_inputs)
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        tray.refresh_pill(pill, cards, lambda _now: {"accounts": []}, {}, None, 1_000_000.0, latest)
+    assert pill.calls[-1] == (cards, None) and latest["budget"] == {"accounts": []}
+    assert "ValueError" in caplog.text and "RecursionError" in caplog.text
+    assert "secret" not in caplog.text and "@" not in caplog.text
+
+    monkeypatch.undo()
+    tray.refresh_pill(pill, cards, lambda _now: {"accounts": [{"id": 1, "plan": "pro"}]}, {}, None, 1_000_000.0, latest)
+    shown, square = pill.calls[-1]
+    assert shown[0]["budget"]["plan"] == "pro" and square["sparkline24h"] == [0.0] * 24

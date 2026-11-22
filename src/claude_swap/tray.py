@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import sys
 import threading
@@ -23,6 +24,8 @@ from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
+
+_logger = logging.getLogger("claude-swap")
 
 REFRESH_INTERVAL_S = 60
 TOOLTIP_MAX = 127  # Windows truncates NOTIFYICONDATA.szTip at 127 chars
@@ -222,6 +225,17 @@ def pill_inputs(cards: list[dict], budget: dict, aliases: dict, history: dict | 
     return shown, fleet_view.square(budget, history, now)
 
 
+def refresh_pill(pill, cards: list[dict], budget_fn, aliases: dict, history, now: float, latest: dict) -> None:
+    """One refresh of the pill. A failure logs its exception type name only; the pill still gets the cards."""
+    shown, square = cards, None
+    try:
+        latest["budget"] = budget_fn(now)
+        shown, square = pill_inputs(cards, latest["budget"], aliases, history, now)
+    except Exception as e:  # noqa: BLE001 - the refresh loop must go on
+        _logger.warning("pill refresh failed: %s", type(e).__name__)
+    pill.update(shown, fleet=square)
+
+
 # ---- start with Windows ----------------------------------------------------
 
 def startup_command(python: str | None = None) -> str:
@@ -400,10 +414,7 @@ def run(switcher) -> int:
                 if pill is not None:
                     from claude_swap.budget_source import current_budget
 
-                    now = time.time()
-                    latest["budget"] = current_budget(now)
-                    shown, square = pill_inputs(cards, latest["budget"], aliases(), history.data(), now)
-                    pill.update(shown, fleet=square)
+                    refresh_pill(pill, cards, current_budget, aliases(), history.data(), time.time(), latest)
                 icon.title = tooltip(cards)
                 icon.update_menu()
             wake.wait(REFRESH_INTERVAL_S)
@@ -485,6 +496,7 @@ def run(switcher) -> int:
 
         root = Path(switcher.backup_dir)
         history = fleet_page.FleetHistory(root, claude_projects_dir())
+        decisions = fleet_page.DecisionCache(root)  # parsed once per log file, reused on a period change
 
         def panel_budget():
             if latest.get("budget") is None:
@@ -539,8 +551,7 @@ def run(switcher) -> int:
 
         panel_window = webview.create_window(
             fleet_page.PANEL_TITLE, html=fleet_page.FLEET_PAGE,
-            js_api=fleet_page.FleetPanelApi(history, panel_budget, lambda: fleet_page.read_decisions(root),
-                                            close_panel),
+            js_api=fleet_page.FleetPanelApi(history, panel_budget, decisions.events, close_panel),
             width=fleet_page.PANEL_W, height=fleet_page.PANEL_H, resizable=False,
             background_color="#000000", hidden=True,
         )

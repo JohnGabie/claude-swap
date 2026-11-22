@@ -79,13 +79,46 @@ def test_page_defines_sections_and_keys():
     script = page_script()
     assert re.search(r"window\.__sections\s*=", script)
     # Esc and the close button call close(); the period selector has the seven keys, 7 dias by default
-    assert "Escape" in script and "api.close()" in script
+    assert ("document.addEventListener('keydown',e=>{if(e.key==='Escape'&&window.pywebview&&pywebview.api)"
+            "pywebview.api.close();});") in script
+    assert "$('close').onclick=()=>{if(window.pywebview&&pywebview.api)pywebview.api.close();};" in script
     for key in fleet_view.PERIODS:
         assert re.search(rf"data-r={key}[ >]", fleet_page.FLEET_PAGE), key
     assert "data-r=7d class=on>7 dias<" in fleet_page.FLEET_PAGE
-    assert "carregando" in fleet_page.FLEET_PAGE
+    # until the first history build the status line says "carregando…"
+    assert '<div class="status neutral" id=status><i>–</i>carregando…</div>' in fleet_page.FLEET_PAGE
     # the subscription marker of the 72-hour strip is out of scope (FP0)
     assert "assinatura" not in fleet_page.FLEET_PAGE
+
+
+_DRIVER = """
+const vm = require('vm'), fs = require('fs');
+const stub = () => new Proxy(function () {}, {
+  get: (t, k) => k === Symbol.toPrimitive ? () => 0 : stub(), apply: () => stub(), set: () => true });
+const ctx = vm.createContext({ document: stub(), window: { addEventListener() {} }, setTimeout() {}, Date, Math, JSON });
+vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), ctx);
+process.stdout.write(JSON.stringify(vm.runInContext(process.argv[3], ctx)));
+"""
+
+
+def run_page(tmp_path, expr: str):
+    (tmp_path / "panel.js").write_text(page_script(), encoding="utf-8")
+    (tmp_path / "driver.js").write_text(_DRIVER, encoding="utf-8")
+    run = subprocess.run(["node", str(tmp_path / "driver.js"), str(tmp_path / "panel.js"), expr],
+                         capture_output=True, text=True, timeout=30)
+    assert run.returncode == 0, run.stderr
+    return json.loads(run.stdout)
+
+
+@needs_node
+def test_model_rows_six_each_seven_fold_into_outros(tmp_path):
+    six = [{"label": f"M{i}", "tokens": 600 - 100 * i, "share": 10.0 + i} for i in range(6)]
+    rows = run_page(tmp_path, "modelRows(%s)" % json.dumps(six))
+    assert [r["label"] for r in rows] == ["M0", "M1", "M2", "M3", "M4", "M5"]
+    seven = six + [{"label": "M6", "tokens": 5, "share": 0.5}]
+    rows = run_page(tmp_path, "modelRows(%s)" % json.dumps(seven))
+    assert [r["label"] for r in rows] == ["M0", "M1", "M2", "M3", "M4", "outros (2)"]
+    assert rows[-1]["tokens"] == 100 + 5 and rows[-1]["share"] == 15.0 + 0.5
 
 
 # ---- placement ---------------------------------------------------------------
@@ -175,6 +208,38 @@ def test_read_decisions_drops_bad_lines(tmp_path):
         {"event": "switch", "ts": "2026-11-21T10:00:00Z"}, {"event": "poll", "ts": "2026-11-21T10:01:00Z"}]
 
 
+def test_decision_cache_reuses_unchanged_files(tmp_path, monkeypatch):
+    import os
+
+    base = decision_log.log_path(tmp_path)
+    older = base.with_name(decision_log.LOG_FILENAME + ".1")
+    older.write_text('{"event": "poll", "ts": "a"}\nbad\n', encoding="utf-8")
+    base.write_text('{"event": "switch", "ts": "b"}\n', encoding="utf-8")
+    cache = fleet_page.DecisionCache(tmp_path)
+    first = cache.events()
+    assert first == fleet_page.read_decisions(tmp_path) == [{"event": "poll", "ts": "a"}, {"event": "switch", "ts": "b"}]
+    parsed = []
+    real = fleet_page.json.loads
+    monkeypatch.setattr(fleet_page.json, "loads", lambda text: parsed.append(text) or real(text))
+    assert cache.events() == first and parsed == []  # a period change parses nothing again
+    with base.open("a", encoding="utf-8") as f:
+        f.write('{"event": "switch", "ts": "c"}\n')
+    assert cache.events()[-1] == {"event": "switch", "ts": "c"}
+    assert len(parsed) == 2  # only the changed file is parsed again
+    st = older.stat()
+    older.write_text('{"event": "poll", "ts": "z"}\nbad\n', encoding="utf-8")  # same size
+    os.utime(older, ns=(st.st_atime_ns, st.st_mtime_ns + 10**9))
+    assert cache.events()[0] == {"event": "poll", "ts": "z"}  # a new mtime is a new file
+    older.unlink()
+    assert cache.events() == [{"event": "switch", "ts": "b"}, {"event": "switch", "ts": "c"}]
+
+
+def test_decision_cache_keeps_the_last_poll_lines(tmp_path, monkeypatch):
+    monkeypatch.setattr(fleet_page.budget_calibrate, "POLL_LINES", 2)
+    decision_log.log_path(tmp_path).write_text("\n".join('{"n": %d}' % i for i in range(4)) + "\n", encoding="utf-8")
+    assert fleet_page.DecisionCache(tmp_path).events() == [{"n": 2}, {"n": 3}]
+
+
 # ---- history worker and panel API ------------------------------------------
 
 
@@ -218,6 +283,8 @@ def test_history_to_panel_join(fake_home):
     haiku = token_model.weighted_tokens("claude-haiku-4-5-20251001", {"input_tokens": 10, "output_tokens": 1000})
     assert p["tiles"]["nowPerMin"] == pytest.approx((opus + haiku) / 60)
     assert sum(p["series"]["past"]) * p["series"]["step"] / 60 == pytest.approx(opus + haiku)
+    # the page has no use for the model id: it does not reach the page
+    assert all(set(m) == {"label", "tokens", "share"} for m in p["models"])
     # an unknown period falls back to the default one
     assert panel.get("2y")["period"] == fleet_page.DEFAULT_PERIOD
     assert panel.get(["7d"])["period"] == fleet_page.DEFAULT_PERIOD
@@ -234,6 +301,23 @@ def test_worker_error_logs_only_the_type_name(tmp_path, caplog):
     text = caplog.text
     assert "ValueError" in text
     assert "secret" not in text and "@" not in text and str(tmp_path) not in text
+
+
+def test_history_fallback_failure_leaves_the_panel_on_no_data(tmp_path, caplog, monkeypatch):
+    def boom(*_a, **_k):
+        raise ValueError(f"{tmp_path}/secret")
+
+    def deep(_root):
+        raise RecursionError(f"{tmp_path} me@example.com")
+
+    monkeypatch.setattr(fleet_page.usage_history, "load", deep)
+    history = fleet_page.FleetHistory(tmp_path / "root", tmp_path / "projects", update=boom)
+    panel = fleet_page.FleetPanelApi(history, dict, list, lambda: None)
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        assert history.refresh() is None  # the worker goes on
+    assert panel.get("7d") == {"error": True}  # the page shows "sem dados agora", not "carregando…"
+    assert "ValueError" in caplog.text and "RecursionError" in caplog.text
+    assert "secret" not in caplog.text and "@" not in caplog.text and str(tmp_path) not in caplog.text
 
 
 def test_history_worker_updates_until_stopped(tmp_path):
