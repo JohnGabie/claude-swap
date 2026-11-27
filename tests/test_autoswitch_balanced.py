@@ -1083,14 +1083,15 @@ class TestBalancedWorkDays:
 
     def test_auto_work_days_flag(self, temp_home, utc_zone):
         h = self._tick(temp_home, work_days="tue-sun")
-        assert h.engine.balanced_rank[0] == 2
+        assert h.engine.balanced_rank == (2, 3, 1)
         assert [s.trigger for s in _switches(h)] == ["balanced"]
         assert h.active_number() == 2
 
     def test_all_days_keeps_the_wall_clock(self, temp_home, utc_zone):
         h = self._tick(temp_home)
-        assert h.engine.balanced_rank[0] != 2
-        assert h.active_number() != 2
+        assert h.engine.balanced_rank == (3, 2, 1)
+        assert [s.trigger for s in _switches(h)] == ["balanced"]
+        assert h.active_number() == 3
 
     def test_a_bad_work_days_text_counts_all_days(self, temp_home, utc_zone):
         assert self._tick(temp_home, work_days="fri-mon").engine.balanced_rank == (
@@ -1103,3 +1104,38 @@ class TestBalancedWorkDays:
         assert h.active_number() == 2
         # A forced switch below 100%: the engine's "proactive" trigger.
         assert [s.trigger for s in _switches(h)] == ["proactive"]
+
+    # Active Pro 1 is over its 5-hour line: a forced switch. Accounts 2, 4
+    # and 3 reset at 21:46, 22:46 and 00:46 (Tuesday). With Monday a rest
+    # day, 2 and 4 have no work time left and 3 has 0.8 h for a need of
+    # about 1.8 h: three guard accounts, the earliest reset first. With all
+    # days none is a guard account (needs below 2.3 h, 8 to 11 h left), and
+    # the deficits put 3 before 4.
+    FORCED = {
+        "1": _u(95, 40, 100), "2": _u(10, 88, 8), "4": _u(10, 89, 9),
+        "3": _u(10, 85, 11),
+    }
+
+    def _forced_attempts(self, temp_home, margin, **kw):
+        h = _balanced(temp_home, plans={1: "pro", 2: "pro", 3: "pro", 4: "pro"},
+                      balanced_margin=margin, **kw)
+        with _failing_freshen(h) as attempts:
+            outcome = h.tick_with_usage(self.FORCED)
+        assert outcome is TickOutcome.ERROR
+        return attempts
+
+    def test_the_forced_fallback_list_ranks_on_work_days(self, temp_home, utc_zone):
+        # Margin 0: the fallback list is the ranking at the margin.
+        assert self._forced_attempts(temp_home, 0.0, work_days="tue-sun") == [
+            "2", "4", "3"]
+
+    def test_the_margin_zero_fallback_list_ranks_on_work_days(
+        self, temp_home, utc_zone
+    ):
+        # Margin 5: every candidate (85-89% under the line 90) is inside the
+        # margin, so the list is the ranking at margin 0.
+        assert self._forced_attempts(temp_home, 5.0, work_days="tue-sun") == [
+            "2", "4", "3"]
+
+    def test_the_forced_fallback_list_with_all_days(self, temp_home, utc_zone):
+        assert self._forced_attempts(temp_home, 0.0) == ["3", "2", "4"]

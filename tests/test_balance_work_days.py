@@ -17,6 +17,21 @@ WEEK_S = 168 * H
 MON_FRI = frozenset({0, 1, 2, 3, 4})
 
 
+@pytest.fixture(autouse=True)
+def utc_process_zone(monkeypatch):
+    """The process zone is UTC, not the -03:00 of ``TZ``: a ``tz`` that
+    falls back to the local zone gives other day borders and fails."""
+    import time
+
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is POSIX only")
+    monkeypatch.setenv("TZ", "UTC0")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
 def at(*args) -> float:
     return datetime(*args, tzinfo=TZ).timestamp()
 
@@ -272,7 +287,15 @@ def test_decide_reads_the_work_rate_and_the_work_line():
 def test_engine_numbers_pass_through_decide_and_rank():
     """decide and rank take the same work days as the ranking helpers."""
     accounts = fleet(FRI)
-    wall = balance.rank(accounts, FRI, threshold=99.0)
-    work = balance.rank(accounts, FRI, threshold=99.0, work_days=MON_FRI, tz=TZ)
-    assert work[:3] == [3, 4, 5]
-    assert wall != work
+    assert balance.rank(accounts, FRI, threshold=99.0, work_days=MON_FRI,
+                        tz=TZ) == [3, 4, 5, 2, 1, 6]
+    # Wall clock: #3 has 14.9 h left, more than 1.25 times its need, so no
+    # account is a guard account, and the deficits lead.
+    assert not any(s.guard for s in balance._ranked(
+        accounts, FRI, threshold=99.0, weekly_threshold=None, candidate_margin=0.0))
+    assert balance.rank(accounts, FRI, threshold=99.0) == [2, 1, 5, 4, 6, 3]
+    # decide from the active #6: on work days to the first guard account;
+    # on the wall clock the lead of #2 is inside DEFICIT_MARGIN_PTS.
+    assert _decide(accounts, 6) == SwitchTo(3, "proactive")
+    assert balance.decide(accounts, 6, FRI, None, None, False,
+                          threshold=99.0) == Stay()
