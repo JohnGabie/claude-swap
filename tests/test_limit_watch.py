@@ -158,7 +158,8 @@ def test_future_lines_are_ignored(projects):
 
 
 def test_limit_hit_logs_no_text_or_path(projects, caplog):
-    caplog.set_level(logging.DEBUG)
+    # A Switcher built by an earlier test leaves the "claude-swap" logger at INFO, so set its level here.
+    caplog.set_level(logging.DEBUG, logger="claude-swap")
     log = projects / "-proj" / "s.jsonl"
     log.write_text("", encoding="utf-8")
     watch = started(projects)

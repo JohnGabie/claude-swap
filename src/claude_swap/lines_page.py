@@ -186,6 +186,8 @@ class LinesWindowApi:
         if key == "reset":
             return {FIVE_KEY: RESET_THRESHOLD, WEEK_KEY: None}
         if key == "workDays":
+            if value is None:  # a missing value reads as all days when stored, but a write needs a text
+                return None
             try:
                 return {DAYS_KEY: worktime.format_days(worktime.parse_days(value))}
             except ValueError:
