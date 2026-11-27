@@ -61,6 +61,17 @@ def test_parse_and_format_days():
         assert parse(fmt(days)) == days
 
 
+def test_parse_days_none_is_all_days():
+    # A missing setting reads as all days (WD2 default).
+    assert worktime.parse_days(None) is None
+
+
+@pytest.mark.parametrize("value", [5, True, 1.5, ["mon"], b"mon", frozenset({0})])
+def test_parse_days_refuses_a_non_text(value):
+    with pytest.raises(ValueError):
+        worktime.parse_days(value)
+
+
 def test_week_work_hours():
     assert worktime.week_work_hours(None) == 168.0
     assert worktime.week_work_hours(MON_FRI) == 120.0

@@ -37,16 +37,21 @@ def _day(word: str, text: str) -> int:
         raise ValueError(f"unknown day {word.strip()!r} in {text!r}") from None
 
 
-def parse_days(text: str) -> frozenset[int] | None:
-    """Read a work-days text. ``None`` means all days.
+def parse_days(text: str | None) -> frozenset[int] | None:
+    """Read a work-days text. ``None`` (a missing setting) means all days.
 
     Forms: ``all``, a range ``mon-fri``, a list ``mon,wed,fri`` or a mix
     ``mon-wed,fri``; case and spaces around words are ignored. A range runs
     forward from Monday to Sunday and does not wrap (``fri-mon`` is refused).
     The one exception is the whole text ``sun-sat``, the week in Sunday-first
     order; inside a list it wraps like any other range. Seven days read as
-    ``None``. A bad text raises ``ValueError``.
+    ``None``. A bad text, or a value that is neither a text nor ``None``,
+    raises ``ValueError``.
     """
+    if text is None:
+        return None
+    if not isinstance(text, str):
+        raise ValueError(f"work days must be a text, got {type(text).__name__}")
     lowered = text.strip().lower()
     if lowered == ALL_DAYS:
         return None
