@@ -135,6 +135,8 @@ def test_work_share_is_clipped():
     now = at(2026, 11, 27, 19, 6)
     # A reset more than a week away: no work time of its week has passed.
     assert worktime.work_share(now + 200 * H, now, MON_FRI, TZ) == 0.0
+    # A reset that has passed: the whole week has passed, and no more.
+    assert worktime.work_share(now - 24 * H, now, MON_FRI, TZ) == 1.0
 
 
 def test_local_zone_is_read_per_call(monkeypatch):

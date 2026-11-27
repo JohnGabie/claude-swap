@@ -813,13 +813,15 @@ def _priority_command(argv: list[str]) -> None:
 
 
 def _work_days_arg(text: str) -> str:
-    """argparse type of ``--work-days``: the normal form, or a usage error."""
+    """argparse type of ``--work-days``: a bad text is a usage error.
+    ``merged_with_cli`` turns the text into its normal form."""
     from claude_swap.settings import normalize_work_days
 
     try:
-        return normalize_work_days(text)
+        normalize_work_days(text)
     except ValueError as e:
         raise argparse.ArgumentTypeError(str(e)) from None
+    return text
 
 
 def _auto_command(argv: list[str]) -> None:
