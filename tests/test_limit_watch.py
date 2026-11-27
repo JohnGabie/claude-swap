@@ -33,16 +33,17 @@ def iso(ts: float) -> str:
 
 
 def hit_line(text=S1_TEXT, ts=S1_TS_TEXT, *, kind="assistant", is_error=True,
-             error="rate_limit", api_error="usage_limit_reached", newline=True) -> str:
+             error="rate_limit", api_error="usage_limit_reached", newline=True, usage=True) -> str:
     row = {
         "type": kind,
         "timestamp": ts,
         "message": {
             "model": "<synthetic>",
             "content": [{"type": "text", "text": text}],
-            "usage": {"input_tokens": 0, "output_tokens": 0},
         },
     }
+    if usage:
+        row["message"]["usage"] = {"input_tokens": 0, "output_tokens": 0}
     if is_error is not None:
         row["isApiErrorMessage"] = is_error
     if error is not None:
@@ -219,6 +220,11 @@ def test_other_api_errors_ignored(projects):
         hit_line(kind="user"),
         hit_line(ts="not a time"),
         hit_line(ts=None),
+        hit_line(ts="not a time", usage=False),
+        hit_line(ts=None, usage=False),
+        # A usage that is not an object, with its own message key.
+        json.dumps({"type": "assistant", "timestamp": iso(NOW - 5),
+                    "message": {"id": "m_bad", "model": "claude-opus-5-5", "usage": "bad"}}) + "\n",
         "not json\n",
         "[1, 2]\n",
         json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
@@ -235,6 +241,7 @@ def test_other_api_errors_ignored(projects):
     ]
     append(log, "".join(ignored))
     assert watch.poll() == []
+    assert watch.tokens_since(0) == 0
     append(log, "".join(ignored) + hit_line())
     assert windows(watch.poll()) == ["5h"]
 
@@ -323,6 +330,19 @@ def test_tokens_since_keeps_six_hours(projects):
     clock.now += 6 * 3600
     assert watch.tokens_since(0) == 0
     assert len(watch._entries) == 0
+
+
+def test_old_lines_add_no_tokens(projects, monkeypatch):
+    log = projects / "-proj" / "s.jsonl"
+    log.write_text("", encoding="utf-8")
+    watch = started(projects)
+    # With the trim off, only the read itself can drop the old line.
+    monkeypatch.setattr(watch, "_trim", lambda: None)
+    append(log, usage_line(NOW - 6 * 3600 - 1, "claude-opus-5-5", mid="m_old", rid="r_old", output_tokens=1000))
+    append(log, usage_line(NOW - 6 * 3600, "claude-opus-5-5", mid="m_six", rid="r_six", output_tokens=100))
+    watch.poll()
+    assert watch._entries == [(pytest.approx(NOW - 6 * 3600), pytest.approx(500.0))]
+    assert list(watch._seen) == ["m_six|r_six"]
 
 
 def test_unreadable_entries_are_skipped(projects):
