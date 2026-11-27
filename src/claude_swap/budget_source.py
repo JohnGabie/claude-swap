@@ -70,6 +70,17 @@ def token_rates(root: Path, pace: dict, now: float) -> dict:
     return budget_calibrate.rates(store, _plans(pace))
 
 
+def work_days(root: Path) -> frozenset[int] | None:
+    """The days of ``autoswitch.workDays``; a missing or bad value gives None (all days)."""
+    from claude_swap import worktime
+
+    try:
+        data = json.loads((Path(root) / "settings.json").read_text(encoding="utf-8"))
+        return worktime.parse_days(data["autoswitch"]["workDays"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def current_budget(now: float | None = None, horizon_hours: tuple | None = None,
                    refresh_calibration: bool = True) -> dict:
     """The budget of the fleet now. Never raises: a failure gives advice ``unknown``.
@@ -97,6 +108,8 @@ def current_budget(now: float | None = None, horizon_hours: tuple | None = None,
             token_meta=token_model.meta(),
             horizon_hours=horizon_hours,
             account_lines=account_lines(root, settings.threshold, settings.weekly_threshold),
+            work_days=work_days(root),
+            tz=None,  # the local zone, read at each call (WD3)
         )
     except Exception:  # noqa: BLE001 - a planner must get an answer, not a traceback
         return budget.build_budget({}, now)

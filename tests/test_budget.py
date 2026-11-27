@@ -1,7 +1,7 @@
 """Fleet budget: per-account quota, fleet sums, resets and the advice."""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -613,3 +613,75 @@ def test_budget_source_store_error_falls_back(monkeypatch, tmp_path):
     b = src.current_budget(NOW, refresh_calibration=False)
     assert b["accounts"][0]["lines"]["own"] is False
     assert b["accounts"][0]["usableNow"] is True
+
+
+# ---- work days (spec work-days WD5, S6, S8) --------------------------------
+
+SP = timezone(timedelta(hours=-3))
+MON_FRI = frozenset(range(5))
+FRI = datetime(2026, 11, 27, 19, 6, tzinfo=SP).timestamp()
+SAT_10 = datetime(2026, 11, 28, 10, 0, tzinfo=SP).timestamp()
+
+
+def sp_acc(num, week, reset, now=FRI, five=0.0):
+    return {
+        "id": num, "plan": "pro", "status": "ok", "fetchedAt": iso(now - 60),
+        "fiveHour": {"pct": five, "resetsAt": iso(now + 3600)},
+        "sevenDay": {"pct": week, "resetsAt": iso(reset)},
+    }
+
+
+def sp_build(*accounts, now=FRI, **kw):
+    return budget.build_budget({"schemaVersion": 1, "accounts": list(accounts)}, now, **kw)
+
+
+def test_budget_projection_uses_work_share():
+    b = sp_build(sp_acc(3, 77.0, SAT_10), work_days=MON_FRI, tz=SP)
+    seven = b["accounts"][0]["sevenDay"]
+    assert seven["elapsedPct"] == 95.92
+    assert seven["projectedEndPct"] == 80.28
+    assert b["fleet"]["paceRatio"] == 0.803  # 0.77 / 0.959167, from the unrounded share
+    assert b["fleet"]["weekElapsedPct"] == 95.92
+    assert b["fleet"]["workDays"] == "mon-fri"
+
+
+def test_budget_all_days_unchanged():
+    plain = build(acc(1, week=39.5))
+    explicit = build(acc(1, week=39.5), work_days=None, tz=SP)
+    assert plain == explicit
+    assert plain["fleet"]["workDays"] == "all"
+    assert plain["accounts"][0]["sevenDay"]["elapsedPct"] == 50.0
+    assert plain["accounts"][0]["sevenDay"]["projectedEndPct"] == 79.0
+
+
+def test_budget_work_days_field_is_the_normal_form():
+    one = sp_acc(1, 10.0, SAT_10)
+    assert sp_build(one, work_days=frozenset({0, 2, 4}), tz=SP)["fleet"]["workDays"] == "mon,wed,fri"
+    assert sp_build(one, work_days=frozenset(range(7)), tz=SP)["fleet"]["workDays"] == "all"
+
+
+def test_budget_minimum_elapsed_is_on_the_work_share():
+    # Reset Wed 2026-12-02 10:00, work days Sat and Sun: on Fri 10:00 the wall share is 0.29
+    # but the work share is 0, so there is no projection and no pace.
+    reset = datetime(2026, 12, 2, 10, 0, tzinfo=SP).timestamp()
+    now = datetime(2026, 11, 27, 10, 0, tzinfo=SP).timestamp()
+    b = sp_build(sp_acc(1, 5.0, reset, now=now), now=now, work_days=frozenset({5, 6}), tz=SP)
+    seven = b["accounts"][0]["sevenDay"]
+    assert seven["elapsedPct"] == 0.0
+    assert seven["projectedEndPct"] is None
+    assert b["fleet"]["paceRatio"] is None
+
+
+@pytest.mark.parametrize("week,pace,advice", [
+    (39.5, 0.79, "can_speed_up"),
+    (47.4, 0.948, "can_speed_up"),
+    (47.5, 0.95, "ok"),          # the border itself is not below it
+    (48.0, 0.96, "ok"),
+    (52.5, 1.05, "ok"),
+    (53.0, 1.06, "slow_down"),
+])
+def test_pace_words_95(week, pace, advice):
+    b = build(acc(1, week=week))  # the week is half elapsed: pace = week / 50
+    assert b["fleet"]["paceRatio"] == pace
+    assert b["advice"] == advice
+    assert budget.SPEED_UP_RATIO == 0.95
