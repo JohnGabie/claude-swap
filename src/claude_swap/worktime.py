@@ -42,12 +42,15 @@ def parse_days(text: str) -> frozenset[int] | None:
 
     Forms: ``all``, a range ``mon-fri``, a list ``mon,wed,fri`` or a mix
     ``mon-wed,fri``; case and spaces around words are ignored. A range runs
-    forward from Monday to Sunday and does not wrap (``fri-mon`` is refused);
-    ``sun-sat``, the whole week in Sunday-first order, is the one exception.
-    Seven days read as ``None``. A bad text raises ``ValueError``.
+    forward from Monday to Sunday and does not wrap (``fri-mon`` is refused).
+    The one exception is the whole text ``sun-sat``, the week in Sunday-first
+    order; inside a list it wraps like any other range. Seven days read as
+    ``None``. A bad text raises ``ValueError``.
     """
     lowered = text.strip().lower()
     if lowered == ALL_DAYS:
+        return None
+    if [end.strip() for end in lowered.split("-")] == ["sun", "sat"]:
         return None
     days: set[int] = set()
     for part in lowered.split(","):
@@ -56,8 +59,6 @@ def parse_days(text: str) -> frozenset[int] | None:
             days.add(_day(ends[0], text))
         elif len(ends) == 2:
             first, last = _day(ends[0], text), _day(ends[1], text)
-            if (first, last) == (6, 5):
-                return None
             if first > last:
                 raise ValueError(f"the range {part.strip()!r} wraps the week")
             days.update(range(first, last + 1))
@@ -89,8 +90,9 @@ def format_days(days: frozenset[int] | None) -> str:
 
 
 def week_work_hours(days: frozenset[int] | None) -> float:
-    """Work hours of one full week: 168 for all days, 120 for mon-fri."""
-    return len(DAY_WORDS) * DAY_H if days is None else len(days) * DAY_H
+    """Work hours of one full week: 168 for all days (``None`` or no day),
+    120 for mon-fri."""
+    return len(days) * DAY_H if days else len(DAY_WORDS) * DAY_H
 
 
 def _next_midnight(t: float, tz: tzinfo | None) -> tuple[float, int]:
@@ -106,11 +108,12 @@ def work_seconds(start: float, end: float, days: frozenset[int] | None,
                  tz: tzinfo | None) -> float:
     """The seconds of ``[start, end)`` that fall on a local day in ``days``.
 
-    ``end - start`` for ``days`` None; 0.0 when ``end <= start``.
+    ``end - start`` for ``days`` None or no day (no day reads as all days);
+    0.0 when ``end <= start``.
     """
     if end <= start:
         return 0.0
-    if days is None:
+    if not days:
         return end - start
     total = 0.0
     cur = start
@@ -128,12 +131,12 @@ def work_share(reset: float, now: float, days: frozenset[int] | None,
     """The share of the week before ``reset`` that has passed at ``now``,
     in work time, clipped to 0..1.
 
-    ``reset`` is the next weekly reset. For ``days`` None this is
+    ``reset`` is the next weekly reset. For ``days`` None or no day this is
     ``1 - (reset - now) / 168 h``, the wall-clock share. When no work time
     is left before the reset, the share is 1: the passed part and the whole
     week sum the same day pieces.
     """
-    if days is None:
+    if not days:
         return max(0.0, min(1.0, 1.0 - (reset - now) / WEEK_S))
     week = work_seconds(reset - WEEK_S, reset, days, tz)
     passed = work_seconds(reset - WEEK_S, now, days, tz)

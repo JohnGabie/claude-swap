@@ -37,7 +37,9 @@ def test_parse_and_format_days():
     assert parse("mon-sun") is None
     assert parse("sun-sat") is None
     for bad in ("workdays", "fri-mon", "", ",", "mon,,tue", "mon-", "-fri",
-                "mon-tue-wed", "sun-fri", "monday"):
+                "mon-tue-wed", "sun-fri", "monday",
+                # "sun-sat" is all days only as the whole text.
+                "sun-sat,xyz", "sun-sat,fri-mon", "mon,sun-sat", "sun-sat,"):
         with pytest.raises(ValueError):
             parse(bad)
 
@@ -63,6 +65,16 @@ def test_week_work_hours():
     assert worktime.week_work_hours(None) == 168.0
     assert worktime.week_work_hours(MON_FRI) == 120.0
     assert worktime.week_work_hours(frozenset({5})) == 24.0
+
+
+def test_no_day_reads_as_all_days():
+    none = frozenset()
+    assert worktime.week_work_hours(none) == 168.0
+    now = at(2026, 11, 28, 15, 0)  # a Saturday
+    assert worktime.work_seconds(now, now + 10 * H, none, TZ) == 10 * H
+    for reset in (now + 19 * H, now - H):
+        assert worktime.work_share(reset, now, none, TZ) == worktime.work_share(
+            reset, now, None, TZ)
 
 
 # --- work seconds and the work share ---------------------------------------
@@ -169,3 +181,30 @@ def test_a_23_hour_day_counts_its_real_seconds():
     assert mon - sun == 23 * H
     assert worktime.work_seconds(sun - H, mon + H, frozenset({6}), tz) == 23 * H
     assert worktime.work_seconds(sun - H, mon + H, frozenset({0}), tz) == H
+
+
+def test_a_23_hour_day_in_the_local_zone(monkeypatch):
+    """tz None reads the offset of each instant, not one offset for all."""
+    import time
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is POSIX only")
+    zoneinfo = pytest.importorskip("zoneinfo")
+    try:
+        berlin = zoneinfo.ZoneInfo("Europe/Berlin")
+    except zoneinfo.ZoneInfoNotFoundError:
+        pytest.skip("no time zone data")
+    sun = datetime(2026, 3, 29, tzinfo=berlin).timestamp()
+    mon = datetime(2026, 3, 30, tzinfo=berlin).timestamp()
+    try:
+        monkeypatch.setenv("TZ", "Europe/Berlin")
+        time.tzset()
+        # The process zone took the rules (+01:00 before, +02:00 after).
+        if (datetime.fromtimestamp(sun).astimezone().utcoffset(),
+                datetime.fromtimestamp(mon).astimezone().utcoffset()) != (
+                timedelta(hours=1), timedelta(hours=2)):
+            pytest.skip("the C library has no Europe/Berlin rules")
+        assert worktime.work_seconds(sun - H, mon + H, frozenset({6}), None) == 23 * H
+        assert worktime.work_seconds(sun - H, mon + H, frozenset({0}), None) == H
+    finally:
+        monkeypatch.undo()
+        time.tzset()
