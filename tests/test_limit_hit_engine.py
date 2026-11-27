@@ -558,3 +558,85 @@ def test_marks_hold_after_the_balanced_refetch(temp_home, pro_plans):
     out = h.tick_with_usage({"2": _usage7(0, 90, week), "1": _usage7(0, 0, week), "3": _usage7(0, 10, week)})
     assert out is TickOutcome.SWITCHED
     assert _switches(h) == [("balanced", 2, 3)]
+
+
+# ---- review fixes ---------------------------------------------------------------------
+
+
+def test_weekly_mark_sets_only_the_seven_day_window(temp_home):
+    h = _harness(temp_home)
+    h.engine._limit_marks["1"] = {"7d": h.clock.now + HOUR_S}
+    out = h.engine._with_limit_marks({"1": _usage7(20, 40), "2": _usage7(5, 5)})
+    assert out["1"]["seven_day"]["pct"] == 100.0
+    assert out["1"]["five_hour"] == {"pct": 20}
+    assert out["2"] == _usage7(5, 5)
+
+
+def test_corrupt_calibration_store_does_not_stop_the_tick(temp_home, pro_plans, caplog):
+    # A store row that is not a dict makes budget_calibrate.rates raise
+    # AttributeError: the tick goes on with no estimate.
+    h = _harness(temp_home)
+    store = {"schemaVersion": budget_calibrate.STORE_VERSION, "lastPoll": None,
+             "accounts": {"1": ["not", "a", "row"]}}
+    (h.switcher.backup_dir / CALIBRATION_FILENAME).write_text(json.dumps(store))
+    h.watch.tokens = S4_TOKENS
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        assert h.tick_with_usage({"1": _usage(10), "2": _usage(0)}) is TickOutcome.NO_ACTION
+    assert h.watch.since, "the estimate was tried"
+    assert not any(e.kind == "error" for e in h.events)
+    rate_lines = {r.getMessage() for r in caplog.records if "token rate" in r.getMessage()}
+    assert rate_lines == {"limit-watch: no token rate (AttributeError)"}
+    assert str(temp_home) not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_estimate_switch_sees_the_cooldown_under_the_lock(temp_home, pro_plans):
+    # Engine A decides an estimate switch on a state with no cooldown. Before
+    # A takes the switch lock, engine B switches: A must see B's cooldown.
+    h = _harness(temp_home, (1, 2, 3))
+    _calibrate(h, 1, week_points=150.0)
+    h.watch.tokens = S4_TOKENS
+    other = h._make_engine(limit_watch=FakeLimitWatch())
+    real_freshen = h.engine._freshen_target
+
+    def freshen(num, email):
+        if not h.state():
+            other._perform("3", "c@example.com", "proactive", (None, float("inf")))
+        return real_freshen(num, email)
+
+    with patch.object(h.engine, "_freshen_target", side_effect=freshen):
+        out = h.tick_with_usage({"1": _usage(0), "2": _usage(0), "3": _usage(0)})
+    assert out is TickOutcome.NO_ACTION
+    assert _switches(h) == [("proactive", 1, 3)]  # B's switch only
+    assert [e.reason for e in h.events if e.kind == "no-switch"][-1] == "cooldown"
+
+
+@pytest.mark.parametrize("reading", ["unknown", "distrusted"])
+def test_hit_on_an_unread_active_account_switches_at_once(temp_home, reading):
+    h = _harness(temp_home)
+    h.watch.hits = [LimitHit(ts=h.clock.now, window="5h")]
+    usage = {"1": None if reading == "unknown" else _usage(50), "2": _usage(0)}
+    with patch.object(h.switcher, "usage_entries_by_account",
+                      return_value=_entries({"1": _usage(50)}, h.clock.now)):
+        assert h.engine._poll_limit_watch() is True
+    verdict = "distrust" if reading == "distrusted" else None
+    with patch.object(h.engine, "_endpoint_trouble_verdict", return_value=verdict):
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+    assert _switches(h) == [("limit-hit", 1, 2)]
+    assert not any(e.kind == "no-switch" and e.reason == "active-usage-unknown" for e in h.events)
+
+
+def test_estimate_starts_at_zero_after_the_window_reset(temp_home, pro_plans):
+    # The reading says 95% but its 5-hour window reset since: the estimate
+    # counts from 0 and only the tokens after the reset.
+    h = _harness(temp_home)
+    _calibrate(h, 1, week_points=150.0)
+    now = h.clock.now
+    fetched, reset = now - 120, now - 60
+    h.watch.tokens = 10.0 * S4_RATE  # 10 points: far under the line from 0
+    entries = {
+        "1": UsageEntry(last_good=_usage(95, _iso_at(reset)), fetched_at=fetched, age_s=120.0),
+        "2": UsageEntry(last_good=_usage(0), fetched_at=now, age_s=0.0),
+    }
+    assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+    assert _switches(h) == []
+    assert reset in h.watch.since
