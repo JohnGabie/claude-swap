@@ -57,6 +57,30 @@ It fails safe: if a usage check errors it keeps trusting the last-known numbers,
 
 An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 
+## Limit-hit watcher
+
+Usage readings are stored between fetches, so the engine can decide on old numbers while agents fill a window. The limit-hit watcher closes that gap with the error that Claude Code writes in its own transcripts.
+
+- Every 5 seconds (`LIMIT_WATCH_S`) it reads the new lines of the transcript files under `~/.claude/projects/` (any depth, subagent transcripts included). It reads only the error fields and the usage fields of a line. It logs no text and no path.
+- A limit hit is an assistant line with `isApiErrorMessage` true and `apiError` `usage_limit_reached`, or `error` `rate_limit` with "limit" in the text. The text names the window: "5-hour" is the 5-hour window, "weekly" or "week" is the 7-day window, other text is the window with the highest percent in the last reading.
+- At the first start it begins at the end of each file. It does not replay old hits, and it keeps its offsets in memory only.
+- A hit counts for the active account only when its timestamp is 10 seconds (`LIMIT_SLACK_S`) or more after the last switch to that account. An older hit belongs to the previous account.
+
+### Forced switch on a hit
+
+A counted hit records that window of the active account as 100% used until its `resetsAt` (5 hours or 7 days from the hit when no reset is known). The engine then runs a tick at once with the trigger `limit-hit`. The switch has no cooldown and no hysteresis margin, as at the threshold. The next tick asks for one fresh reading of the old account, inside the urgent-mode budget. When no account is usable, the all-exhausted handling applies.
+
+An agent that already stopped on the error does not restart. The switch only sends later requests to a usable account.
+
+### Estimate between readings
+
+Between two readings the engine estimates the active account's 5-hour percent: the last percent plus the weighted tokens since the fetch time, divided by the `tokensPerPercent` of that window. It uses the estimate only when the confidence of that calibration is `medium` or `high`.
+
+1. When the estimate is within the escalation margin of the line, the engine starts urgent mode (one fresh reading at once, inside its budget).
+2. When the estimate reaches the line, the engine switches with the trigger `estimate`.
+
+The budget and the menu bar pill show the stored reading, not the estimate.
+
 ## Running alongside Claude Code
 
 Runs safely alongside Claude Code: switches take the same credential locks Claude Code uses, so a swap never collides with a token refresh.

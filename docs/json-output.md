@@ -49,3 +49,17 @@ The two projections stay `--json`-only, since a linear projection is too rough t
 ## `cswap auto --json`
 
 `cswap auto --json` emits an event stream instead: one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}`) with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`. The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
+
+### The `limit-hit` event
+
+When the limit-hit watcher counts a hit (see [auto-switch.md](auto-switch.md#limit-hit-watcher)), the decision log and the event stream get one event before the switch event:
+
+```json
+{"event": "limit-hit", "ts": 1795818082.437, "account": 4, "window": "5h"}
+```
+
+`account` is the number of the active account. `window` is `"5h"` or `"7d"`. The event holds no transcript text and no path.
+
+### Triggers `limit-hit` and `estimate`
+
+The `trigger` of a `switch` event can be `limit-hit` (Claude Code reported the limit of the active account) or `estimate` (the token estimate reached the switch line). Scripts must accept unknown trigger values.
