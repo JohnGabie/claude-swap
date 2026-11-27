@@ -11,6 +11,7 @@ import math
 from datetime import datetime, time, timedelta, timezone, tzinfo
 
 from . import budget as budget_mod
+from . import worktime
 
 # key: (span s, chart step s, forward horizon s, project column s)
 PERIODS = {
@@ -180,13 +181,21 @@ def _status(pace) -> tuple[str, str]:
     if pace > budget_mod.SLOW_DOWN_RATIO:
         return "Acaba antes do reset", "critical"
     if pace < budget_mod.SPEED_UP_RATIO:
-        return "Vai sobrar cota", "warning"
+        return f"Vai sobrar ~{_half_up(100 - pace * 100)}%", "warning"
     return "No ritmo", "neutral"
 
 
 def _fleet(budget: dict) -> dict:
     fleet = budget.get("fleet") if isinstance(budget, dict) else None
     return fleet if isinstance(fleet, dict) else {}
+
+
+def _work_days(budget: dict) -> frozenset[int] | None:
+    """The work days of the budget fleet; a missing or bad value reads as all days (None)."""
+    try:
+        return worktime.parse_days(_fleet(budget).get("workDays"))
+    except ValueError:
+        return None
 
 
 def _accounts(budget: dict) -> list[dict]:
@@ -223,15 +232,22 @@ def _week_inputs(budget: dict) -> list[tuple[float, float, float]]:
     return out
 
 
-def _sustainable_at(inputs, now: float, at: float) -> float:
-    """Before an account's weekly reset: what is left spread over the time to the reset
-    (measured from ``now``); after it: a whole new week, ``100 * tokensPerPercent / 10080``."""
+def _sustainable_at(inputs, now: float, at: float, days: frozenset[int] | None = None,
+                    tz: tzinfo | None = None) -> float:
+    """Before an account's weekly reset: what is left spread over the work minutes to the reset
+    (measured from ``now``; with none left, over the wall minutes), at least one minute.
+    After it: a whole new week, ``100 * tokensPerPercent / (week work hours * 60)``.
+    ``days`` None counts all days: the wall minutes and 10080 minutes."""
     total = 0.0
+    week_minutes = worktime.week_work_hours(days) * 60.0 if days is not None else WEEK_MINUTES
     for remaining, per_pct, reset in inputs:
         if at < reset:
-            total += remaining / max((reset - now) / 60.0, 1.0)
+            minutes = worktime.work_seconds(now, reset, days, tz) / 60.0
+            if minutes <= 0:
+                minutes = (reset - now) / 60.0
+            total += remaining / max(minutes, 1.0)
         else:
-            total += 100.0 * per_pct / WEEK_MINUTES
+            total += 100.0 * per_pct / week_minutes
     return total
 
 
@@ -427,12 +443,14 @@ def build_fleet(budget: dict, history: dict, decisions: list[dict], now: float,
     pace = _num(fleet.get("paceRatio"))
     word, level = _status(pace)
     used, elapsed = _num(fleet.get("weekUsedPct")), _num(fleet.get("weekElapsedPct"))
+    days = _work_days(budget)
     caption = "Onde a semana da frota fecha nesse ritmo"
     if used is not None and elapsed is not None:
-        caption += f" · {_half_up(used)}% usado com {_half_up(elapsed)}% do tempo"
+        unit = "do tempo" if days is None else "do tempo de trabalho"
+        caption += f" · {_half_up(used)}% usado com {_half_up(elapsed)}% {unit}"
 
     inputs = _week_inputs(budget)
-    sustainable = _sustainable_at(inputs, now, now)
+    sustainable = _sustainable_at(inputs, now, now, days, tz)
     now_per_min = sum(
         _bucket_total(b) for s, b in _buckets(history) if now - NOW_WINDOW_S < s <= now
     ) / 60.0
@@ -453,7 +471,7 @@ def build_fleet(budget: dict, history: dict, decisions: list[dict], now: float,
         "step": step,
         "now": _iso(now),
         "past": _series(history, start, now, step),
-        "future": [_sustainable_at(inputs, now, now + i * step) for i in range(forward // step)],
+        "future": [_sustainable_at(inputs, now, now + i * step, days, tz) for i in range(forward // step)],
         "sustainable": sustainable,
         "fuel": _fuel(budget, forward),
     }
@@ -464,6 +482,7 @@ def build_fleet(budget: dict, history: dict, decisions: list[dict], now: float,
         "pace": None if pace is None else _half_up(pace * 100),
         "status": {"word": word, "level": level},
         "caption": caption,
+        "workDays": worktime.format_days(days),
         "tiles": tiles,
         "series": series,
         "models": _models(history, start, now),

@@ -10,6 +10,7 @@ in tokens, so every token figure is an estimate and says so.
 
 Advice. ``paceRatio`` is the used share of the fleet week divided by the
 elapsed share (both weighted by capacity). 1.0 uses the whole week exactly.
+The elapsed share is the work share when work days are set (all days: wall time).
 
     blocked        no account is usable now
     slow_down      paceRatio > SLOW_DOWN_RATIO: the fleet ends before its resets
@@ -22,13 +23,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 
-from claude_swap import balance, lines
+from claude_swap import balance, lines, worktime
 
 SCHEMA_VERSION = 1
 SLOW_DOWN_RATIO = 1.05
-SPEED_UP_RATIO = 0.75
+SPEED_UP_RATIO = 0.95
 # Below this elapsed share a projection divides by almost nothing.
 MIN_ELAPSED_FOR_PROJECTION = 0.05
 DATA_STATUSES = frozenset({"ok", "stale"})
@@ -91,12 +92,17 @@ def _account(
     threshold: float,
     weekly_threshold: float,
     own_lines: tuple[float, float | None] | None = None,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
 ) -> dict:
     """One account of the budget. ``measured`` is False with no usable reading.
 
     ``threshold`` and ``weekly_threshold`` are the general lines. ``own_lines``
     is the ``(5-hour line, weekly line or None)`` of an account that has a line
-    of its own: the account is then judged on those, and ``lines`` says so."""
+    of its own: the account is then judged on those, and ``lines`` says so.
+
+    ``work_days`` and ``tz`` (see ``worktime``): the elapsed share is the work share.
+    ``work_days`` None keeps the wall-clock share of ``balance._weekly``."""
     plan = raw.get("plan") if isinstance(raw.get("plan"), str) else "unknown"
     capacity = balance.plan_capacity(plan)
     out: dict = {
@@ -133,6 +139,8 @@ def _account(
     no_five = balance._plan_key(plan) in balance.NO_FIVE_HOUR_LIMIT_PLANS
     pct5, reset5 = balance._window(account.five_hour, now)
     reset7 = balance._next_weekly_reset(account.seven_day, now)
+    if work_days is not None and counted and reset7 is not None:
+        elapsed = worktime.work_share(reset7, now, work_days, tz)
 
     blocked_by, usable_at = None, None
     if pct7 >= weekly_threshold:
@@ -250,6 +258,8 @@ def build_budget(
     token_meta: dict | None = None,
     horizon_hours: tuple | None = None,
     account_lines: Mapping[str, tuple[float, float | None]] | None = None,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
 ) -> dict:
     """The budget of the fleet at ``now``, from one ``cswap pace`` payload.
 
@@ -265,12 +275,15 @@ def build_budget(
     None)`` of an account that has a line of its own. That account is judged
     on them (``usableNow``, ``fiveHour.headroomPct``); every other account
     uses the general lines. The fleet fields keep the general lines.
+
+    ``work_days`` (None = all days) and ``tz`` (None = the local zone): the elapsed
+    share, the projection and the pace count only work time.
     """
     own = account_lines if isinstance(account_lines, Mapping) else {}
     weekly_line = threshold if weekly_threshold is None else weekly_threshold
     raw_accounts = pace.get("accounts") if isinstance(pace, dict) else None
     accounts = [
-        _account(raw, now, threshold, weekly_line, own.get(str(raw.get("id"))))
+        _account(raw, now, threshold, weekly_line, own.get(str(raw.get("id"))), work_days, tz)
         for raw in (raw_accounts if isinstance(raw_accounts, list) else [])
         if isinstance(raw, dict)
     ]
@@ -397,6 +410,7 @@ def build_budget(
             "expectedLossUnits": _round(expected_loss, 3),
             "thresholdPct": threshold,
             "weeklyThresholdPct": weekly_line,
+            "workDays": worktime.format_days(work_days),
         },
         "accounts": accounts,
         "resets": resets,

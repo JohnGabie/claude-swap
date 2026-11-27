@@ -48,10 +48,14 @@ def account(num, plan="pro", week_reset=None, remaining=None, tpp=None, remainin
     return out
 
 
-def budget(accounts=(), pace=0.87, used=58.2, elapsed=66.9, usable=1, usable_tokens=None, horizons=None):
+def budget(accounts=(), pace=0.97, used=58.2, elapsed=66.9, usable=1, usable_tokens=None, horizons=None,
+           work_days=None):
+    fleet_part = {"paceRatio": pace, "weekUsedPct": used, "weekElapsedPct": elapsed,
+                  "usableNow": usable, "accounts": len(accounts)}
+    if work_days is not None:
+        fleet_part["workDays"] = work_days
     return {
-        "fleet": {"paceRatio": pace, "weekUsedPct": used, "weekElapsedPct": elapsed,
-                  "usableNow": usable, "accounts": len(accounts)},
+        "fleet": fleet_part,
         "accounts": list(accounts),
         "horizons": horizons or [],
         "tokens": None if usable_tokens is None else {"usableNowTokens": usable_tokens},
@@ -63,20 +67,23 @@ def fleet(b=None, h=EMPTY, decisions=(), period="7d", now=NOW):
 
 
 def test_pace_and_status_in_rhythm():
-    out = fleet(budget(pace=0.87, used=58.2, elapsed=66.9))
-    assert out["pace"] == 87
+    out = fleet(budget(pace=0.97, used=58.2, elapsed=66.9))
+    assert out["pace"] == 97
     assert out["status"] == {"word": "No ritmo", "level": "neutral"}
     assert out["caption"] == "Onde a semana da frota fecha nesse ritmo · 58% usado com 67% do tempo"
 
 
 @pytest.mark.parametrize("pace,word,level", [
     (1.06, "Acaba antes do reset", "critical"),
-    (0.74, "Vai sobrar cota", "warning"),
+    (0.79, "Vai sobrar ~21%", "warning"),
+    (0.96, "No ritmo", "neutral"),
+    (0.74, "Vai sobrar ~26%", "warning"),
     (None, "Semana nova", "neutral"),
     (1.05, "No ritmo", "neutral"),
-    (0.75, "No ritmo", "neutral"),
+    (0.95, "No ritmo", "neutral"),
     (1.054, "Acaba antes do reset", "critical"),  # rounded 105 would read neutral
-    (0.746, "Vai sobrar cota", "warning"),  # rounded 75 would read neutral
+    (0.946, "Vai sobrar ~5%", "warning"),  # rounded 95 would read neutral
+    (0.904, "Vai sobrar ~10%", "warning"),  # 9.6 rounds up; truncating would say 9
 ])
 def test_status_borders(pace, word, level):
     out = fleet(budget(pace=pace))
@@ -131,8 +138,8 @@ def test_spark24h_hourly_per_minute():
 
 def test_square():
     h = history((NOW - 300, "m", "a", 600_000))
-    s = square(budget(pace=0.86), h, NOW)
-    assert (s["pace"], s["level"]) == (86, "neutral")
+    s = square(budget(pace=0.96), h, NOW)
+    assert (s["pace"], s["level"]) == (96, "neutral")
     assert len(s["sparkline24h"]) == 24 and s["sparkline24h"][-1] == 10000.0
     assert square(budget(pace=1.2), h, NOW)["level"] == "critical"
     assert square(budget(pace=0.5), h, NOW)["level"] == "warning"
@@ -393,7 +400,7 @@ def test_prices_table():
 
 def test_payload_keys_and_unknown_period():
     out = fleet()
-    assert set(out) == {"period", "pace", "status", "caption", "tiles", "series", "models",
+    assert set(out) == {"period", "pace", "status", "caption", "workDays", "tiles", "series", "models",
                         "projects", "events72h", "switches", "unused"}
     assert out["period"] == "7d"
     with pytest.raises(ValueError):
@@ -420,3 +427,65 @@ def test_unused_ignores_malformed_windows():
     ]
     u = fleet(unused_budget(), decisions=dec, period="7d")["unused"]
     assert [i["account"] for i in u["items"]] == [2, 3] and u["items"][1]["pct"] == 5
+
+
+# ---- work days (spec work-days WD5) ------------------------------------------
+
+FRI = datetime(2026, 11, 27, 19, 6, tzinfo=SP).timestamp()
+SAT_15 = datetime(2026, 11, 28, 15, 0, tzinfo=SP).timestamp()
+
+
+def test_pace_words_95():
+    assert fleet(budget(pace=0.79))["status"] == {"word": "Vai sobrar ~21%", "level": "warning"}
+    assert fleet(budget(pace=0.96))["status"] == {"word": "No ritmo", "level": "neutral"}
+    assert fleet(budget(pace=1.06))["status"] == {"word": "Acaba antes do reset", "level": "critical"}
+    assert square(budget(pace=0.79), EMPTY, NOW)["level"] == "warning"
+    assert square(budget(pace=0.96), EMPTY, NOW)["level"] == "neutral"
+
+
+def test_fleet_work_days_field():
+    assert fleet(budget(work_days="mon-fri"))["workDays"] == "mon-fri"
+    assert fleet(budget(work_days="mon,wed,fri"))["workDays"] == "mon,wed,fri"
+    assert fleet(budget())["workDays"] == "all"
+    assert fleet(budget(work_days="fri-mon"))["workDays"] == "all"  # a bad value reads as all days
+
+
+def test_caption_names_the_work_time_only_with_work_days():
+    base = "Onde a semana da frota fecha nesse ritmo"
+    assert fleet(budget(work_days="mon-fri"))["caption"] == f"{base} · 58% usado com 67% do tempo de trabalho"
+    assert fleet(budget(work_days="all"))["caption"] == f"{base} · 58% usado com 67% do tempo"
+    assert fleet(budget())["caption"] == f"{base} · 58% usado com 67% do tempo"
+
+
+def _sustainable(accounts, now, days="mon-fri", period="1h"):
+    return fleet(budget(accounts, work_days=days), period=period, now=now)["series"]
+
+
+def test_sustainable_rate_work_minutes():
+    # Fri 19:06 to Mon 10:00 (-03), work days Mon-Fri: 4 h 54 min + 10 h = 894 work minutes.
+    reset = datetime(2026, 11, 30, 10, 0, tzinfo=SP).timestamp()
+    acc = account(1, week_reset=reset, remaining=894_000, tpp=250000)
+    assert _sustainable([acc], FRI)["sustainable"] == pytest.approx(1000.0)
+    # Over the 3774 wall minutes the same tokens would give about 237.
+    assert _sustainable([acc], FRI, days="all")["sustainable"] == pytest.approx(894_000 / 3774)
+
+
+def test_sustainable_rate_zero_work_minutes_uses_wall_minutes():
+    # Sat 15:00 to Sun 15:00: no work minute left, so 1440 wall minutes.
+    acc = account(1, week_reset=SAT_15 + 24 * H, remaining=1_440_000, tpp=250000)
+    assert _sustainable([acc], SAT_15)["sustainable"] == pytest.approx(1000.0)
+
+
+def test_sustainable_rate_after_reset_uses_the_week_work_hours():
+    acc = account(1, week_reset=FRI + 3600, remaining=600_000, tpp=7200)
+    future = _sustainable([acc], FRI, period="1d")["future"]
+    assert future[0] == pytest.approx(600_000 / 60.0)  # before the reset: 60 work minutes left
+    assert set(future[2:]) == {100.0 * 7200 / (120 * 60)}  # 120 work hours in Mon-Fri
+    all_days = _sustainable([acc], FRI, days="all", period="1d")["future"]
+    assert set(all_days[2:]) == {100.0 * 7200 / 10080}
+
+
+def test_sustainable_rate_keeps_the_one_minute_floor_in_work_minutes():
+    # 10 s of work time left: the floor of one minute applies.
+    acc = account(1, week_reset=FRI + 10, remaining=5000, tpp=100)
+    assert _sustainable([acc], FRI)["sustainable"] == pytest.approx(5000.0)
