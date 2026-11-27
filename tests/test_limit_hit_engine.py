@@ -365,6 +365,29 @@ def test_hit_asks_a_reading_of_the_old_account_on_the_next_tick(temp_home):
     assert {"1"} not in again  # one reading, not one each tick
 
 
+@pytest.mark.parametrize("case", ["no hit", "idle hold"])
+def test_old_account_reading_only_after_a_hit_and_outside_an_idle_hold(temp_home, case):
+    h = _harness(temp_home)
+    later = h.clock.now + 300
+    if case == "no hit":
+        entries = _entries({"1": _usage(100), "2": _usage(0)}, h.clock.now, next_poll_at=later)
+    else:
+        entries = _entries({"1": _usage(50), "2": _usage(0)}, h.clock.now, next_poll_at=later)
+        h.watch.hits = [LimitHit(ts=h.clock.now, window="5h")]
+    with patch.object(h.switcher, "usage_entries_by_account", return_value=entries) as fetch:
+        h.engine._poll_limit_watch()
+        assert h.engine.tick() is TickOutcome.SWITCHED
+        fetch.reset_mock()
+        h.clock.advance(60)
+        if case == "idle hold":
+            # Account 2 is in an idle hold: no candidate is read.
+            _write_state(h, **h.state(), idleHoldSince=h.clock.now - 30,
+                         healthAccount="2", healthTickAt=h.clock.now - 30)
+        h.engine.tick()
+        plans = [call.kwargs.get("fetch") for call in fetch.call_args_list]
+    assert {"1"} not in plans
+
+
 def test_limit_hit_departure_is_recoverable(temp_home):
     # After its window reset, an account left on a hit is recovered like one left at its limit.
     h = _harness(temp_home)
