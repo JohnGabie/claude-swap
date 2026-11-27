@@ -30,6 +30,11 @@ _WHY = {
 }
 
 
+def clock_text(dt: datetime) -> str:
+    """A clock time as 'h:mm AM' or 'h:mm PM' (CK1): hour 1-12, no leading zero."""
+    return f"{dt.hour % 12 or 12}:{dt.minute:02d} {'AM' if dt.hour < 12 else 'PM'}"
+
+
 def local_time(iso: str | None) -> str | None:
     """'2026-10-12T09:00:00Z' -> '14:30' (local), or 'Oct 13 14:30' if not today."""
     if not iso:
@@ -38,7 +43,9 @@ def local_time(iso: str | None) -> str | None:
         dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00")).astimezone()
     except ValueError:
         return None
-    return dt.strftime("%H:%M" if dt.date() == datetime.now().astimezone().date() else "%b %d %H:%M")
+    if dt.date() == datetime.now().astimezone().date():
+        return clock_text(dt)
+    return f"{dt:%b %d} {clock_text(dt)}"
 
 
 def notification_for(ev) -> tuple[str, str, str] | None:

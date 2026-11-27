@@ -303,8 +303,8 @@ def card_text(tmp_path, item):
 @needs_node
 def test_card_shows_the_fields_of_the_new_card(tmp_path):
     html = card_text(tmp_path, item_for())
-    for text in ("#4", "conta ativa", "Pro", "lido agora", "Sessão de 5 h", "33% usado", "volta dom 00:29",
-                 "Semana", "95% usado", "fecha em 100%", "renova dom 05:59", "Acaba antes de renovar",
+    for text in ("#4", "conta ativa", "Pro", "lido agora", "Sessão de 5 h", "33% usado", "volta dom 12:29 AM",
+                 "Semana", "95% usado", "fecha em 100%", "renova dom 5:59 AM", "Acaba antes de renovar",
                  "Consumo agora", "42K", "1% desta conta ≈", "1,2M"):
         assert text in html, text
     assert "@" not in card_html(tmp_path, item_for())  # never the email (FP-D4)
@@ -531,6 +531,18 @@ _PRE_CELLS = """
   const fakePill = { querySelectorAll: sel => [...(sel.includes('.pill-square') ? [sq] : []), ...(sel.includes('.item') ? cells : [])] };
   document = { getElementById: id => id === 'pill' ? fakePill : { addEventListener() {} }, addEventListener() {}, documentElement: {}, body: {} };
 """
+
+
+
+_CLOCK_CASES = [((0, 5), "12:05 AM", "12 AM"), ((9, 39), "9:39 AM", "9 AM"),
+                ((12, 0), "12:00 PM", "12 PM"), ((21, 39), "9:39 PM", "9 PM"), ((0, 0), "12:00 AM", "12 AM")]
+
+
+@needs_node
+def test_clock_12h_edges(tmp_path):
+    for (h, m), text, hour in _CLOCK_CASES:
+        got = run_page(tmp_path, "[clock(new Date(2026, 10, 27, %d, %d)), clockHour(new Date(2026, 10, 27, %d, %d))]" % (h, m, h, m))
+        assert got == [text, hour], (h, m, got)
 
 
 @needs_node

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from claude_swap.autoswitch import (
     AllExhaustedEvent,
     ConfigWarningEvent,
@@ -114,3 +116,29 @@ def test_muted_kind_does_not_notify():
     n.muted = {"all-exhausted"}
     ev = SimpleNamespace(kind="all-exhausted", earliest_reset_at=None)
     assert n.handle(ev) is False and sent == []
+
+
+def test_clock_text_12h():
+    from claude_swap.desktop_notify import clock_text
+    cases = [((0, 5), "12:05 AM"), ((9, 39), "9:39 AM"), ((12, 0), "12:00 PM"), ((21, 39), "9:39 PM")]
+    for (h, m), text in cases:
+        assert clock_text(datetime(2026, 11, 27, h, m)) == text
+
+
+def test_local_time_uses_12h_clock():
+    from claude_swap.desktop_notify import local_time
+    now = datetime.now().astimezone().replace(hour=21, minute=39, second=0, microsecond=0)
+    assert local_time(now.isoformat()) == "9:39 PM"
+    other = (now.replace(day=1) if now.day != 1 else now.replace(day=2)).replace(hour=0, minute=5)
+    assert local_time(other.isoformat()) == other.strftime("%b %d") + " 12:05 AM"
+
+
+def test_no_24h_clock_left():
+    from pathlib import Path
+    import claude_swap
+    root = Path(claude_swap.__file__).parent
+    for name in ("pill.py", "fleet_page.py", "desktop_notify.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "%H:%M" not in text, name
+        assert "getHours()).padStart" not in text, name
+        assert "pad(d.getHours())" not in text, name
