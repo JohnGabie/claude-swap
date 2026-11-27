@@ -131,12 +131,12 @@ def account(num, use5=12.0, use_week=40.0, five=90.0, week=95.0, own5=False, own
             "use5": use5, "useWeek": use_week}
 
 
-def data(five=90.0, week=95.0, auto=True, accounts=None):
+def data(five=90.0, week=95.0, auto=True, accounts=None, days="mon-fri"):
     if accounts is None:
         accounts = [account(1), account(2, use5=None, use_week=None),
                     account(5, 48.0, 81.0, five=80.0, week=90.0, own5=True, own_week=True),
                     account(6, 44.0, 51.0, week=85.0, own_week=True)]
-    return {"five": five, "week": week, "autoSwitch": auto, "accounts": accounts}
+    return {"five": five, "week": week, "autoSwitch": auto, "workDays": days, "accounts": accounts}
 
 
 def drive(tmp_path, steps: str, d=None, pre: str = ""):
@@ -348,7 +348,7 @@ def make_api(core=CORE, policies=None, cards=None, auto=True, save=None, closed=
 def test_lines_window_get_shape():
     got = make_api().get()
     assert got == {
-        "five": 90.0, "week": 97.0, "autoSwitch": True,
+        "five": 90.0, "week": 97.0, "autoSwitch": True, "workDays": "all",
         "accounts": [
             {"num": "1", "five": 90.0, "week": 97.0, "own5": False, "ownWeek": False, "use5": 12.0, "useWeek": 40.0},
             {"num": "2", "five": 85.0, "week": 97.0, "own5": True, "ownWeek": False, "use5": None, "useWeek": None},
@@ -484,3 +484,158 @@ def test_week_slider_holds_and_pointercancel_releases(tmp_path):
                    % (json.dumps(first), json.dumps(second)))
     assert out == {"during": "90%", "applied": "85%", "free": "70%", "after": "70%"}
 
+
+
+# ---- the work-days row (WD6, WD8) ----------------------------------------------------------
+
+DAY_LABELS = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
+DAY_NAMES = ["Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira", "Sábado", "Domingo"]
+# the API behind the stub keeps what the page wrote, as the real one does
+_STORE = ("answers.set = (k, v) => { if (k === 'workDays') DATA = Object.assign({}, DATA, {workDays: v});"
+          " return sync({ok: true, error: null}); };")
+_BOXES = "[0,1,2,3,4,5,6].map(i => state()['wd' + i].checked)"
+
+
+def with_days(days):
+    """The core settings with a stored workDays text (the field comes from the settings module at the merge)."""
+    core = AutoSwitchSettings(threshold=90.0, weekly_threshold=97.0)
+    object.__setattr__(core, "work_days", days)
+    return core
+
+
+def test_lines_window_work_days():
+    # get() shows the normal form; a bad or missing stored value reads as "all"
+    for stored, shown in [("mon-fri", "mon-fri"), ("Fri,Mon,Tue,Wed,Thu", "mon-fri"),
+                          ("mon,tue,wed,thu,fri,sat,sun", "all"), ("mon,wed,fri", "mon,wed,fri"),
+                          ("mon-tue", "mon,tue"), ("all", "all"), ("fri-mon", "all"), ("", "all"),
+                          (None, "all"), (5, "all")]:
+        assert make_api(core=with_days(stored)).get()["workDays"] == shown, stored
+    assert make_api().get()["workDays"] == "all"  # a core without the field
+    # set() validates with parse_days and writes the normal form
+    seen, saved = [], []
+    api = make_api(save=lambda core, app: seen.append((core, app)) or {"ok": True}, saved=saved)
+    assert api.set("workDays", "mon-sat") == OK
+    assert api.set("workDays", "Mon,Tue,Wed,Thu,Fri,Sat") == OK  # the raw list is stored as mon-sat
+    assert api.set("workDays", "sun-sat") == OK
+    assert api.set("workDays", "MON,wed,Fri") == OK
+    assert seen == [({"autoswitch.workDays": "mon-sat"}, {}), ({"autoswitch.workDays": "mon-sat"}, {}),
+                    ({"autoswitch.workDays": "all"}, {}), ({"autoswitch.workDays": "mon,wed,fri"}, {})]
+    assert saved == [1] * 4
+
+
+@pytest.mark.parametrize("value", ["fri-mon", "", "  ", "xyz", "mon-", "mon,,fri", "workdays", "mon-fri-sun",
+                                   5, None, True, ["mon"]])
+def test_lines_window_set_work_days_refuses_a_bad_text(value, caplog):
+    seen, saved = [], []
+    api = make_api(save=lambda core, app: seen.append(core) or {"ok": True}, saved=saved)
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        assert api.set("workDays", value) == {"ok": False, "error": lines_page.WRITE_FAILED}
+    assert seen == [] and saved == []  # a bad text writes nothing
+    assert caplog.records == []
+
+
+def test_lines_window_work_days_save_failure():
+    assert make_api(save=lambda c, a: {"ok": False}).set("workDays", "mon-fri") == {
+        "ok": False, "error": lines_page.WRITE_FAILED}
+
+
+def test_lines_window_reset_does_not_write_work_days():
+    seen = []
+    make_api(save=lambda core, app: seen.append(core) or {"ok": True}).set("reset")
+    assert seen == [{"autoswitch.threshold": 90.0, "autoswitch.weeklyThreshold": None}]
+
+
+def test_work_days_row_copy_and_layout():
+    page = lines_page.LINES_PAGE
+    order = [">Semana<", ">Igual à de 5 h<", ">Dias de trabalho<",
+             ">O ritmo conta só esses dias. Uso fora deles é exceção.<", ">Por conta<"]
+    at = [page.index(s) for s in order]
+    assert at == sorted(at)
+    for i, (label, name) in enumerate(zip(DAY_LABELS, DAY_NAMES)):
+        assert f'<label class=day title="{name}"><input type=checkbox id=wd{i}><u>{label}</u></label>' in page
+    assert page.count("type=checkbox id=wd") == 7
+    assert "html,body{margin:0;width:320px;height:520px;overflow:hidden;background:#000000}" in page
+    assert ".accs{flex:1;min-height:0;overflow-y:auto" in page  # the list gives its height to the row and scrolls
+
+
+@needs_node
+def test_work_days_row_paints_get(tmp_path):
+    def boxes(days):
+        s = drive(tmp_path, "return state();", data(days=days))
+        return [s[f"wd{i}"]["checked"] for i in range(7)]
+
+    assert boxes("mon-fri") == [True] * 5 + [False] * 2
+    assert boxes("mon,wed,fri") == [True, False, True, False, True, False, False]
+    assert boxes("all") == [True] * 7
+    assert boxes("sat-sun") == [False] * 5 + [True] * 2
+    assert boxes("mon-wed,fri") == [True, True, True, False, True, False, False]
+    s = drive(tmp_path, "const first = state(); DATA = Object.assign({}, DATA, {workDays: 'sun'});"
+                        " fire(winL, 'pywebviewready'); return [first.wd0.checked, state().wd0.checked, state().wd6.checked];")
+    assert s == [True, False, True]  # a later read repaints the row
+    d = data()
+    del d["workDays"]  # no workDays in the read: every day on
+    assert drive(tmp_path, "return state().wd3.checked;", d) is True
+
+
+@needs_node
+def test_work_days_row_toggles(tmp_path):
+    out = drive(tmp_path, _STORE + " calls.length = 0;"
+                " el('wd5').checked = true; fire(el('wd5').L, 'change', {}); const first = calls.slice();"
+                " const sat = state().wd5.checked; calls.length = 0;"
+                " el('wd5').checked = false; fire(el('wd5').L, 'change', {}); const second = calls.slice();"
+                " calls.length = 0; el('wd2').checked = false; fire(el('wd2').L, 'change', {}); const third = calls.slice();"
+                " return {first, sat, second, third, boxes: " + _BOXES + "};")
+    assert out["first"] == [["set", "workDays", "mon-sat"], ["get"]]
+    assert out["sat"] is True
+    assert out["second"] == [["set", "workDays", "mon-fri"], ["get"]]
+    assert out["third"] == [["set", "workDays", "mon,tue,thu,fri"], ["get"]]  # runs of 2 are single words
+    assert out["boxes"] == [True, True, False, True, True, False, False]
+
+
+@needs_node
+def test_work_days_row_writes_the_normal_form(tmp_path):
+    def written(on):
+        sets = "".join(f"el('wd{i}').checked = {str(i in on).lower()};" for i in range(7))
+        steps = (_STORE + " calls.length = 0; " + sets + " fire(el('wd%d').L, 'change', {});"
+                 " return calls.filter(c => c[0] === 'set');" % max(on))
+        return drive(tmp_path, steps, data(days="sun"))
+
+    assert written({0, 1, 2, 3, 4, 5, 6}) == [["set", "workDays", "all"]]
+    assert written({0, 2, 3, 4}) == [["set", "workDays", "mon,wed-fri"]]
+    assert written({0, 1, 2, 4}) == [["set", "workDays", "mon-wed,fri"]]
+    assert written({5, 6}) == [["set", "workDays", "sat,sun"]]
+    assert written({4, 5, 6}) == [["set", "workDays", "fri-sun"]]
+
+
+@needs_node
+def test_last_day_cannot_turn_off(tmp_path):
+    out = drive(tmp_path, _STORE + " calls.length = 0; el('wd4').checked = false; fire(el('wd4').L, 'change', {});"
+                " return {calls, on: state().wd4.checked, err: el('err').textContent};", data(days="fri"))
+    assert out["calls"] == []  # no write
+    assert out["on"] is True  # the toggle springs back
+    assert out["err"] == ""
+    # with two days on, the first can go; the second then stays
+    out = drive(tmp_path, _STORE + " calls.length = 0;"
+                " el('wd5').checked = false; fire(el('wd5').L, 'change', {}); const a = calls.filter(c => c[0] === 'set');"
+                " el('wd6').checked = false; fire(el('wd6').L, 'change', {});"
+                " return {a, b: calls.filter(c => c[0] === 'set').length, on: state().wd6.checked};",
+                data(days="sat-sun"))
+    assert out == {"a": [["set", "workDays", "sun"]], "b": 1, "on": True}
+
+
+@needs_node
+def test_reset_keeps_work_days(tmp_path):
+    out = drive(tmp_path, _STORE + " calls.length = 0; fire(el('reset').L, 'click', ev());"
+                " return {calls, boxes: " + _BOXES + "};")
+    assert out["calls"] == [["set", "reset", None], ["get"]]  # no workDays write
+    assert out["boxes"] == [True] * 5 + [False] * 2
+
+
+@needs_node
+def test_work_days_write_error_shows_the_error_line(tmp_path):
+    out = drive(tmp_path, "answers.set = () => sync({ok: false, error: 'Falhou aqui.'}); el('wd5').checked = true;"
+                " fire(el('wd5').L, 'change', {}); return state().err.textContent;")
+    assert out == "Falhou aqui."
+    out = drive(tmp_path, "answers.set = () => reject(); el('wd5').checked = true; fire(el('wd5').L, 'change', {});"
+                          " return state().err.textContent;")
+    assert out == lines_page.WRITE_FAILED
