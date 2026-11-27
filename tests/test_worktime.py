@@ -72,7 +72,10 @@ def test_no_day_reads_as_all_days():
     assert worktime.week_work_hours(none) == 168.0
     now = at(2026, 11, 28, 15, 0)  # a Saturday
     assert worktime.work_seconds(now, now + 10 * H, none, TZ) == 10 * H
-    for reset in (now + 19 * H, now - H):
+    # The share is the wall-clock one, float for float.
+    rng = random.Random(3)
+    for _ in range(500):
+        reset = now + rng.uniform(-10 * H, 200 * H)
         assert worktime.work_share(reset, now, none, TZ) == worktime.work_share(
             reset, now, None, TZ)
 
