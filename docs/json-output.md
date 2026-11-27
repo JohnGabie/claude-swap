@@ -46,6 +46,20 @@ Weekly windows (`sevenDay` and per-model `scoped` entries, never `fiveHour`) add
 
 The two projections stay `--json`-only, since a linear projection is too rough to present as fact in the UI.
 
+## Budget (CLI budget command, MCP `get_budget`)
+
+The budget payload carries `schemaVersion` `1`. The pace fields count work time, so a rest day does not move them.
+
+| Field | Meaning |
+|---|---|
+| `fleet.workDays` | The work days in normal form (`all`, `mon-fri`, `mon,wed,fri`, ...). Added; absent from older payloads. |
+| `accounts[].sevenDay.elapsedPct` | The work share of the account week, in percent: the share of the work time of its week that has passed. With `all` it equals the wall-clock share. |
+| `accounts[].sevenDay.projectedEndPct` | `min(100, pct / work share)`, with the work share unrounded. |
+| `fleet.paceRatio` | Used share divided by work share over the fleet, weighted by capacity. |
+| `advice` | `can_speed_up` when `paceRatio` is below `SPEED_UP_RATIO` (0.95). `slow_down` when it is above `SLOW_DOWN_RATIO` (1.05). `ok` between the two. |
+
+The types of the fields do not change. Only their meaning becomes "of the work time", so `schemaVersion` stays `1`. The token horizons (`reachableTokens`) keep wall-clock time.
+
 ## `cswap auto --json`
 
 `cswap auto --json` emits an event stream instead: one JSON object per line (`{"schemaVersion":1,"event":"switch","ts":…, …}`) with kinds like `poll`, `switch`, `no-switch`, `account-quarantined`, `all-exhausted`, `error`. The contract is additive: new kinds and fields may appear, so scripts should ignore unknown ones.
