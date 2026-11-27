@@ -51,10 +51,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import balance, oauth, pace_feed, poll_policy, worktime
+from claude_swap import balance, budget_calibrate, oauth, pace_feed, poll_policy, worktime
 from claude_swap.decision_log import DecisionLog
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
+from claude_swap.limit_watch import WINDOW_5H, WINDOW_7D, LimitHit, LimitWatch
 from claude_swap.lines import (
     BindingWindow,
     binding_window,
@@ -105,7 +106,21 @@ BURN_LOOKAHEAD_MAX_PTS = 40.0  # the line is never lowered by more than this
 ALL_EXHAUSTED_REPEAT_S = 900
 # E3b: an account left by one of these can be "recovered" inside the bar once
 # its window reset. An account left by `failover` (or an unknown trigger) never.
-_RECOVERABLE_LEFT_TRIGGERS = ("at-limit", "proactive", "consume-first", "balanced")
+_RECOVERABLE_LEFT_TRIGGERS = (
+    "at-limit", "proactive", "consume-first", "balanced", "limit-hit", "estimate",
+)
+# Limit hits (LH1, LH2). The loop sleeps in steps of at most LIMIT_WATCH_S and
+# reads the new transcript lines after each step. A hit stamped before the last
+# switch to the active account plus LIMIT_SLACK_S belongs to the account before
+# it. A counted hit marks its window full until the reset of the last reading,
+# or for LIMIT_FALLBACK_S after the hit when no reset is known.
+LIMIT_WATCH_S = 5
+LIMIT_SLACK_S = 10
+LIMIT_FALLBACK_S = {WINDOW_5H: 5 * 3600.0, WINDOW_7D: 7 * 86400.0}
+_LIMIT_USAGE_KEYS = {WINDOW_5H: "five_hour", WINDOW_7D: "seven_day"}
+# The estimate between readings (LH3) is used only with these confidences of
+# the account's calibrated rate (``budget_calibrate.rates``).
+ESTIMATE_CONFIDENCE = ("medium", "high")
 
 _logger = logging.getLogger("claude-swap")
 
@@ -417,8 +432,10 @@ class PollEvent(AutoSwitchEvent):
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
     # "proactive" | "at-limit" | "failover" | "consume-first" | "priority" |
-    # "balanced". "balanced" is a proactive switch of the balanced strategy
-    # (additive).
+    # "balanced" | "limit-hit" | "estimate". "balanced" is a proactive switch
+    # of the balanced strategy; "limit-hit" a switch on a limit error of
+    # Claude Code; "estimate" a switch on the token estimate between readings
+    # (all additive).
     trigger: str
     from_ref: dict | None
     to_ref: dict | None
@@ -445,6 +462,22 @@ class SwitchEvent(AutoSwitchEvent):
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
         return f"{prefix} {src} -> {dst} ({self.trigger})"
+
+
+@dataclass(frozen=True)
+class LimitHitEvent(AutoSwitchEvent):
+    """Claude Code wrote a limit error for the active account (LH2). The
+    account NUMBER and the window only: no text, no path, no email."""
+
+    kind: ClassVar[str] = "limit-hit"
+    account: int
+    window: str  # "5h" | "7d"
+
+    def _fields(self) -> dict:
+        return {"account": self.account, "window": self.window}
+
+    def human(self) -> str:
+        return f"limit hit on Account-{self.account} ({self.window} window)"
 
 
 @dataclass(frozen=True)
@@ -607,6 +640,13 @@ def _project_five_hour(
         return out
     out[current] = {**value, "five_hour": {**five, "pct": min(100.0, float(five["pct"]) + points)}}
     return out
+
+
+def _five_hour_pct(value: dict | str | None, models: tuple[str, ...] = ()) -> float | None:
+    """The 5-hour percent of one usage row, or None when it has none."""
+    return _window_pcts(value if isinstance(value, dict) else None, models).get(
+        oauth.FIVE_HOUR_LABEL
+    )
 
 
 def _window_pcts(
@@ -1114,8 +1154,26 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        limit_watch: LimitWatch | None = None,
     ):
         self.switcher = switcher
+        # The limit-hit watcher of the Claude Code transcripts (LH1, LH4).
+        # Building it reads nothing: ``run_loop`` polls it between ticks.
+        self.limit_watch = (
+            limit_watch
+            if limit_watch is not None
+            else LimitWatch(Path.home() / ".claude" / "projects")
+        )
+        # Windows marked full by a counted hit: account number -> window ->
+        # epoch until which it reads 100%. Memory only.
+        self._limit_marks: dict[str, dict[str, float]] = {}
+        # The account of a counted hit whose tick has not run yet; the
+        # account left on a hit, read again on the next tick; and the moment
+        # of the last switch to the active account, for the estimate.
+        self._pending_hit: str | None = None
+        self._read_next: str | None = None
+        self._active_since: float | None = None
+        self._tick_plan: Callable[[str], str] = lambda _num: pace_feed.PLAN_UNKNOWN
         self.settings = settings
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
@@ -1608,6 +1666,14 @@ class AutoSwitchEngine:
         )
 
         current = self.switcher.current_account_number()
+        # A counted limit hit runs this tick at once and names its switch
+        # (LH2). It holds for this tick only, and only for the account hit.
+        hit_tick = current is not None and self._pending_hit == current
+        self._pending_hit = None
+        self._active_since = self._switched_to_at(state, current)
+        # One plan reader per tick: each account's plan is read at most once
+        # per tick, by the balanced strategy and the estimate together.
+        self._tick_plan = self._tick_plan_reader()
         # A tick with no managed active account keeps the current context;
         # a different account reseeds from the state file so its counts are
         # never inherited from the previous one.
@@ -1706,8 +1772,28 @@ class AutoSwitchEngine:
                 five_hour_lookahead=round(lookahead, 2) if lookahead > 0.0 else None,
             )
         )
-        raw_usage = usage
-        usage = _project_five_hour(usage, current, lookahead)
+        # The poll event above logs the readings as stored. The decision reads
+        # each window that a limit hit marked as full (LH2), and the active
+        # account's 5-hour percent raised to the token estimate when the
+        # estimate alone reaches its line (LH3).
+        raw_usage = self._with_limit_marks(usage)
+        headroom = _headroom_by_account(raw_usage, self._models)
+        usage = _project_five_hour(raw_usage, current, lookahead)
+        estimate_switch = False
+        estimate = self._five_hour_estimate(
+            current, entries.get(current), raw_usage.get(current)
+        )
+        if estimate is not None and estimate >= window_line(
+            oauth.FIVE_HOUR_LABEL, thresholds[current], weekly_lines[current]
+        ):
+            projected = self._binding(
+                usage.get(current), settings, thresholds[current],
+                weekly_lines[current],
+            )
+            if projected is not None and not projected.over:
+                read = _five_hour_pct(raw_usage.get(current), self._models)
+                usage = _project_five_hour(raw_usage, current, estimate - read)
+                estimate_switch = True
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -1746,7 +1832,7 @@ class AutoSwitchEngine:
                 # trigger is provisional: "balanced" while the active account
                 # is under its lines (the 5h line does not count for Ultra),
                 # else the engine's own over-the-line trigger.
-                plan_of = self._tick_plan_reader()
+                plan_of = self._tick_plan
                 balanced_at_threshold = _balance_active_at_threshold(
                     current,
                     usage.get(current),
@@ -2062,9 +2148,9 @@ class AutoSwitchEngine:
                 entries = self.switcher.usage_entries_by_account(
                     fetch={current, *candidates}
                 )
-                usage = {
+                usage = self._with_limit_marks({
                     num: entry.decision_value() for num, entry in entries.items()
-                }
+                })
                 headroom = _headroom_by_account(usage, self._models)
                 raw_usage = usage
                 usage = _project_five_hour(usage, current, lookahead)
@@ -2147,7 +2233,9 @@ class AutoSwitchEngine:
             entries = self.switcher.usage_entries_by_account(
                 fetch={current, *candidates}
             )
-            usage = {num: entry.decision_value() for num, entry in entries.items()}
+            usage = self._with_limit_marks(
+                {num: entry.decision_value() for num, entry in entries.items()}
+            )
             headroom = _headroom_by_account(usage, self._models)
             raw_usage = usage
             usage = _project_five_hour(usage, current, lookahead)
@@ -2316,6 +2404,15 @@ class AutoSwitchEngine:
         )
         transient_failure = False
         systemic = ""
+        # The trigger the switch reports: the ranking above ran on the
+        # engine's own trigger, which a limit hit (at-limit, the window full)
+        # and the estimate (over the line) never change.
+        if hit_tick:
+            trigger_shown = "limit-hit"
+        elif estimate_switch:
+            trigger_shown = "estimate"
+        else:
+            trigger_shown = trigger
         for num in ordered:
             email = self.switcher.account_email(num)
             if trigger in ("consume-first", "balanced") or (
@@ -2348,7 +2445,7 @@ class AutoSwitchEngine:
             if self.dry_run:
                 # Dry-run stops at the decision: no token refresh, no
                 # quarantine writes — freshening is a mutation.
-                return self._perform(num, email, trigger, left_snapshot)
+                return self._perform(num, email, trigger_shown, left_snapshot)
             status = self._freshen_target(num, email)
             if status == "identity-conflict":
                 # The slot's credential is alive but belongs to a different
@@ -2379,7 +2476,7 @@ class AutoSwitchEngine:
                 continue
             if status == "skip-live-session":
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            return self._perform(num, email, trigger_shown, left_snapshot)
 
         if systemic or transient_failure:
             self._emit(
@@ -3368,6 +3465,11 @@ class AutoSwitchEngine:
             # nomination preserves a valid future plan under the store lock.
             scheduled=not stale_candidate_plan,
         )
+        # LH2: one reading of the account left on a limit hit, inside the
+        # store's budget (due, or older than the serve TTL).
+        left_on_hit, self._read_next = self._read_next, None
+        if self._idle_hold_since is None and left_on_hit in candidates:
+            entries = self.switcher.usage_entries_by_account(fetch={left_on_hit})
         usage = {num: entry.decision_value() for num, entry in entries.items()}
         # F4 needs the tick's lines before the first read of `usage[current]`.
         if threshold is None:
@@ -3399,6 +3501,8 @@ class AutoSwitchEngine:
             for label, pct, _ in oauth.relevant_windows(
                 active_value if isinstance(active_value, dict) else None, self._models
             )
+        ) or self._watch_near_line(
+            current, entries.get(current), active_value, threshold, weekly_threshold
         )
         escalate = bool(candidates) and (
             (
@@ -3523,6 +3627,9 @@ class AutoSwitchEngine:
         self._last_seen_active = number
         # F1: the new active account starts with no unreadable ticks.
         self._unhealthy_ticks = 0
+        if trigger == "limit-hit" and state["lastSwitchFrom"] is not None:
+            # LH2: the next tick reads the account left on the hit once more.
+            self._read_next = str(state["lastSwitchFrom"])
 
         # A switch changes which account reads the live store: read the plan
         # of both ends again on their next use.
@@ -3912,6 +4019,173 @@ class AutoSwitchEngine:
         horizon = min(max(ahead, age + BURN_MIN_GAP_S), age + BURN_MAX_GAP_S)
         return min(BURN_LOOKAHEAD_MAX_PTS, self._burn_rate * horizon)
 
+    # -- limit hits and the estimate (LH2, LH3) ---------------------------------
+
+    @staticmethod
+    def _switched_to_at(state: dict, current: str | None) -> float | None:
+        """The moment of the last switch to ``current``: the engine's own
+        switch to it or the last manual switch, whichever is later; None when
+        the state records neither."""
+        stamps = [_state_ts(state, "lastManualSwitchAt")]
+        if current is not None and str(state.get("lastSwitchTo")) == str(current):
+            stamps.append(_state_ts(state, "lastSwitchAt"))
+        known = [ts for ts in stamps if ts is not None]
+        return max(known) if known else None
+
+    def _with_limit_marks(
+        self, usage: Mapping[str, dict | str | None]
+    ) -> dict[str, dict | str | None]:
+        """``usage`` with each window that a limit hit marked at 100% until
+        its mark ends. Ended marks are dropped. A row that is not a reading
+        (unknown or a sentinel) is left as it is; nothing is mutated. With
+        no mark the clock is not read."""
+        if not self._limit_marks:
+            return dict(usage)
+        now = self.clock()
+        self._limit_marks = {
+            num: live
+            for num, windows in self._limit_marks.items()
+            if (live := {w: until for w, until in windows.items() if now < until})
+        }
+        out = dict(usage)
+        for num, windows in self._limit_marks.items():
+            value = out.get(num)
+            if not isinstance(value, dict):
+                continue
+            value = dict(value)
+            for window in windows:
+                key = _LIMIT_USAGE_KEYS[window]
+                old = value.get(key)
+                value[key] = {**(old if isinstance(old, dict) else {}), "pct": 100.0}
+            out[num] = value
+        return out
+
+    def _watch_near_line(
+        self,
+        current: str,
+        entry: UsageEntry | None,
+        value: dict | str | None,
+        threshold: float,
+        weekly_threshold: float | None,
+    ) -> bool:
+        """A switch is near: a limit hit marked the active account, or its
+        5-hour estimate is within ``ESCALATION_MARGIN_PCT`` of its line."""
+        marks = self._limit_marks.get(current)
+        if marks and any(self.clock() < until for until in marks.values()):
+            return True
+        estimate = self._five_hour_estimate(current, entry, value)
+        return estimate is not None and estimate >= (
+            window_line(oauth.FIVE_HOUR_LABEL, threshold, weekly_threshold)
+            - ESCALATION_MARGIN_PCT
+        )
+
+    def _five_hour_rate(self, current: str) -> float | None:
+        """Weighted tokens per 5-hour percent point of ``current``, from the
+        calibration store as it is (``budget_calibrate.rates``), or None
+        unless the confidence of that rate is in ``ESTIMATE_CONFIDENCE``."""
+        try:
+            plan = self._tick_plan(current)
+            store = budget_calibrate.load_store(self.switcher.backup_dir)
+            rate = budget_calibrate.rates(store, {current: plan})[current]
+            if rate["confidence"] not in ESTIMATE_CONFIDENCE:
+                return None
+            return float(rate["fivePerPct"])
+        except Exception as e:  # noqa: BLE001 - no estimate, never a failed tick
+            _logger.warning("limit-watch: no token rate (%s)", type(e).__name__)
+            return None
+
+    def _five_hour_estimate(
+        self, current: str, entry: UsageEntry | None, value: dict | str | None
+    ) -> float | None:
+        """The active account's 5-hour percent now (LH3): the reading's
+        percent plus the weighted tokens since the reading, or since the
+        switch to the account when that came later, over its 5-hour rate.
+        None with no reading, no fetch time, no new tokens or no trusted
+        rate."""
+        read = _five_hour_pct(value, self._models)
+        fetched = getattr(entry, "fetched_at", None)
+        if read is None or not isinstance(fetched, (int, float)):
+            return None
+        since = fetched if self._active_since is None else max(fetched, self._active_since)
+        try:
+            tokens = float(self.limit_watch.tokens_since(since))
+        except Exception as e:  # noqa: BLE001 - no estimate, never a failed tick
+            _logger.warning("limit-watch: token count failed (%s)", type(e).__name__)
+            return None
+        if tokens <= 0.0:
+            # No load since the reading: the reading itself decides, and the
+            # plan and the calibration store are not read.
+            return None
+        rate = self._five_hour_rate(current)
+        if rate is None:
+            return None
+        return read + tokens / rate
+
+    def _poll_limit_watch(self) -> bool:
+        """Read the new transcript lines once. True when a counted hit asks
+        for a tick now. Never raises: an error logs its type name only."""
+        try:
+            return self._count_limit_hits(self.limit_watch.poll())
+        except Exception as e:  # noqa: BLE001 - the loop must keep running
+            _logger.warning("limit-watch: poll failed (%s)", type(e).__name__)
+            return False
+
+    def _count_limit_hits(self, hits: Sequence[LimitHit]) -> bool:
+        """Mark and report the hits that belong to the active account (LH2).
+
+        A hit counts when its time is at or after the last switch to the
+        active account plus ``LIMIT_SLACK_S``. A hit with no window takes the
+        window with the highest percent of the last reading. The mark lasts
+        until that window's reset in the last reading, or for
+        ``LIMIT_FALLBACK_S`` after the hit. One event per window."""
+        if not hits:
+            return False
+        current = self.switcher.current_account_number()
+        if current is None:
+            return False
+        since = self._switched_to_at(self._read_state(), current)
+        counted = [h for h in hits if since is None or h.ts >= since + LIMIT_SLACK_S]
+        if not counted:
+            return False
+        entry = self.switcher.usage_entries_by_account(fetch=set()).get(current)
+        reading = {
+            label: (pct, resets_at)
+            for label, pct, resets_at in oauth.relevant_windows(
+                getattr(entry, "last_good", None), self._models
+            )
+            if label in _LIMIT_USAGE_KEYS
+        }
+        marks = self._limit_marks.setdefault(current, {})
+        reported: list[str] = []
+        for hit in counted:
+            window = hit.window or max(
+                reading, key=lambda w: reading[w][0], default=WINDOW_5H
+            )
+            reset = _parse_reset_ts(reading.get(window, (None, None))[1])
+            marks[window] = (
+                reset if reset is not None and reset > hit.ts
+                else hit.ts + LIMIT_FALLBACK_S[window]
+            )
+            if window not in reported:
+                reported.append(window)
+        for window in reported:
+            self._emit(LimitHitEvent(account=int(current), window=window))
+        self._pending_hit = current
+        return True
+
+    def _wait_watching(self, delay: float) -> None:
+        """Sleep ``delay`` seconds in steps of at most ``LIMIT_WATCH_S`` and
+        poll the watcher after each step. Ends early on :meth:`wake` or
+        :meth:`stop`, and after a counted hit."""
+        remaining = delay
+        while remaining > 0:
+            step = min(LIMIT_WATCH_S, remaining)
+            if self._wake.wait(step):
+                return
+            remaining -= step
+            if self._poll_limit_watch():
+                return
+
     def _emit(self, event: AutoSwitchEvent) -> None:
         # Decision log first: a frontend that raises must not lose the line.
         self._decision_log.write(event)
@@ -4025,4 +4299,4 @@ class AutoSwitchEngine:
                         ),
                     )
                 )
-            self._wake.wait(delay)
+            self._wait_watching(delay)
