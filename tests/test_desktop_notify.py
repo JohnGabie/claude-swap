@@ -35,6 +35,15 @@ def test_proactive_switch_says_running_low():
     assert notification_for(_switch("proactive"))[2] == "work@example.com was running low."
 
 
+def test_why_names_limit_hit_and_estimate():
+    assert notification_for(_switch("limit-hit"))[2] == (
+        "work@example.com hit its limit (reported by Claude Code)."
+    )
+    assert notification_for(_switch("estimate"))[2] == (
+        "work@example.com reached the switch line by token estimate."
+    )
+
+
 def test_dry_run_switch_is_silent():
     assert notification_for(_switch(dry_run=True)) is None
 

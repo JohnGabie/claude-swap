@@ -27,6 +27,8 @@ _WHY = {
     "proactive": "was running low",
     "failover": "stopped working",
     "consume-first": "using the window that resets soonest first",
+    "limit-hit": "hit its limit (reported by Claude Code)",
+    "estimate": "reached the switch line by token estimate",
 }
 
 
