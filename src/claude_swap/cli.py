@@ -812,6 +812,18 @@ def _priority_command(argv: list[str]) -> None:
         sys.exit(130)
 
 
+def _work_days_arg(text: str) -> str:
+    """argparse type of ``--work-days``: a bad text is a usage error.
+    ``merged_with_cli`` turns the text into its normal form."""
+    from claude_swap.settings import normalize_work_days
+
+    try:
+        normalize_work_days(text)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
+    return text
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -926,6 +938,16 @@ Defaults live in settings.json in the backup root; flags override them.
             "priority, then soonest weekly reset; only targets below all switch lines), "
             "or 'balanced' (use the weekly quota that resets soonest, Pro "
             "accounts before Max; can switch below the threshold)"
+        ),
+    )
+    parser.add_argument(
+        "--work-days",
+        type=_work_days_arg,
+        metavar="DAYS",
+        help=(
+            "Balanced strategy: the days you work for this session "
+            "(all, mon-fri, mon,wed,fri); only their time counts toward "
+            "each week (default: autoswitch.workDays)"
         ),
     )
     parser.add_argument(

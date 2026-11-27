@@ -51,6 +51,7 @@ class TestConfigList:
             "autoswitch.model",
             "autoswitch.balancedCooldownSeconds",
             "autoswitch.balancedMargin",
+            "autoswitch.workDays",
             "ui.theme",
             "ui.orgTag",
             "run.shareHistory",
@@ -59,7 +60,7 @@ class TestConfigList:
             "usage.fableProbe",
         ):
             assert key in out
-        assert out.count("(default)") == 17
+        assert out.count("(default)") == 18
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -86,7 +87,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 17
+        assert len(by_key) == 18
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         # An unset weekly line reports null, not the threshold it falls back
@@ -529,3 +530,46 @@ class TestAutoStrategyFlag:
         assert "invalid choice" in err
         for allowed in ("best", "consume-first", "balanced"):
             assert allowed in err
+
+    def test_auto_work_days_flag(self, temp_home, capsys):
+        """`cswap auto --work-days` replaces the setting for one session, in
+        the normal form; a bad text is a usage error (exit 2)."""
+        _run(["set", "autoswitch.workDays", "mon-fri"], capsys)
+        assert self._run_auto([], capsys, temp_home)["settings"].work_days == "mon-fri"
+        captured = self._run_auto(["--work-days", "Mon,Tue,Wed,Sat"], capsys, temp_home)
+        assert captured["settings"].work_days == "mon-wed,sat"
+        # The stored value does not change.
+        code, out, _ = _run(["get", "autoswitch.workDays"], capsys)
+        assert out.strip() == "mon-fri"
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", "--once",
+                                        "--work-days", "fri-mon"]):
+            with pytest.raises(SystemExit) as exc:
+                cli.main()
+        assert exc.value.code == 2
+        assert "--work-days" in capsys.readouterr().err
+
+
+class TestWorkDaysSetting:
+    def test_work_days_setting(self, temp_home, capsys):
+        """S7: the normal form is stored; a bad text is refused with exit 1
+        and leaves the stored value."""
+        def stored():
+            raw = json.loads(_settings_file(capsys).read_text())
+            return raw["autoswitch"]["workDays"]
+
+        code, out, _ = _run(["set", "autoswitch.workDays", "mon-fri"], capsys)
+        assert (code, stored()) == (0, "mon-fri")
+        assert "autoswitch.workDays = mon-fri" in out
+        code, _, err = _run(["set", "autoswitch.workDays", "workdays"], capsys)
+        assert code == 1 and "workDays" in err
+        assert stored() == "mon-fri"
+        code, _, _ = _run(["set", "autoswitch.workDays", "sun-sat"], capsys)
+        assert (code, stored()) == (0, "all")
+        code, _, _ = _run(["set", "autoswitch.workDays", "Mon,Wed,Fri"], capsys)
+        assert (code, stored()) == (0, "mon,wed,fri")
+        code, _, err = _run(["set", "autoswitch.workDays", "fri-mon"], capsys)
+        assert code == 1 and "wraps" in err
+        assert stored() == "mon,wed,fri"
+        code, out, _ = _run(["get", "autoswitch.workDays"], capsys)
+        assert (code, out.strip()) == (0, "mon,wed,fri")

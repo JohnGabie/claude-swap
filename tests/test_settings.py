@@ -845,3 +845,41 @@ class TestBalancedSettings:
     def test_cli_strategy_balanced_merges(self):
         merged = merged_with_cli(AutoSwitchSettings(), _args(strategy="balanced"))
         assert merged.strategy == "balanced"
+
+
+class TestWorkDays:
+    """``autoswitch.workDays`` (WD2): stored and shown in the normal form."""
+
+    def test_default_is_all(self, tmp_path: Path):
+        assert AutoSwitchSettings().work_days == "all"
+        assert load_settings(tmp_path).work_days == "all"
+        assert SETTING_SPECS["autoswitch.workDays"].default == "all"
+
+    def test_stored_value_reads_in_normal_form(self, tmp_path: Path):
+        for stored, read in (("Mon-Fri", "mon-fri"), ("mon,tue,wed,fri", "mon-wed,fri"),
+                             ("sun-sat", "all"), ("mon-sun", "all")):
+            settings_path(tmp_path).write_text(
+                json.dumps({"autoswitch": {"workDays": stored}})
+            )
+            assert load_settings(tmp_path).work_days == read
+
+    def test_bad_or_empty_stored_value_reads_as_all(self, tmp_path: Path):
+        for stored in ("fri-mon", "workdays", "", 5, None, ["mon"]):
+            settings_path(tmp_path).write_text(
+                json.dumps({"autoswitch": {"workDays": stored}})
+            )
+            assert load_settings(tmp_path).work_days == "all"
+
+    def test_set_stores_the_normal_form(self, tmp_path: Path):
+        assert set_setting(tmp_path, "autoswitch.workDays", "MON,Tue,wed") == "mon-wed"
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw["autoswitch"]["workDays"] == "mon-wed"
+        with pytest.raises(ConfigError, match="workDays"):
+            set_setting(tmp_path, "autoswitch.workDays", "fri-mon")
+        assert json.loads(settings_path(tmp_path).read_text()) == raw
+
+    def test_cli_override(self):
+        merged = merged_with_cli(AutoSwitchSettings(), _args(work_days="Mon-Fri"))
+        assert merged.work_days == "mon-fri"
+        base = AutoSwitchSettings(work_days="mon-fri")
+        assert merged_with_cli(base, _args()) is base

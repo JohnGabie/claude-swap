@@ -38,6 +38,13 @@ so that the weekly percent used is about the same on every account.
        f   = clip(F_BOOST * sum(c_i * u_i) / sum(c_i * e_i), F_MIN, 1)
        deficit_i = f * e_i * 100 - weekly percent
 
+   Work days (``work_days``, see ``worktime``): with a set of days, ``e_i``
+   is the work share, the part of the account's week before its next reset
+   ``R`` that has passed, counted in work time only:
+   ``worktime.work_share(R, now, work_days, tz)``. ``work_days`` None (all
+   days) keeps the two wall-clock forms above, float for float. ``tz`` None
+   is the machine's local zone.
+
    ``f`` is the height of the line: the share of its quota that each account
    aims at by its own reset. It is the use of the fleet so far divided by
    what the full line would be so far. When ``sum(c_i * e_i)`` is below
@@ -46,9 +53,20 @@ so that the weekly percent used is about the same on every account.
    weekly percent.
 3. Order of the usable accounts: the largest deficit first. Ties: less
    weekly percent used, then the lower id.
-   Loss guard: when ``f >= GUARD_F``, the usable accounts whose next weekly
-   reset is within ``GUARD_HOURS`` go first, the earliest reset first. The
-   others follow by deficit.
+   Loss guard, at any ``f``. The fleet pace is
+   ``rho = sum(c_i * u_i) / sum(c_i * e_i)`` over the accounts of the sums.
+   The fleet work rate is ``R_w = max(rho, RATE_FLOOR) * sum(c_i) / W_h``
+   capacity units per work hour, where ``W_h`` is the work hours of one
+   full week (``worktime.week_work_hours``). The need of an account is
+   ``c_i * (weekly line - weekly percent) / 100 / R_w`` work hours (the
+   real weekly line, without the candidate margin). A usable account is a
+   guard account when its remaining work time to its next weekly reset is
+   at most ``GUARD_MARGIN`` times its need and below ``GUARD_CAP_WORK_H``
+   work hours. An account with no work time left before its reset (a reset
+   on a rest day) is then always a guard account, so use on a rest day goes
+   first to quota that expires before the next work day. Guard accounts go
+   first, the earliest next reset first, ties by deficit. The others follow
+   by deficit.
 4. ``decide`` says when to leave the active account, in this order:
    a. A forced switch comes first: the caller passes the threshold, or the
       active account is blocked, gated or at a switch line. It moves to the
@@ -63,7 +81,8 @@ so that the weekly percent used is about the same on every account.
       the active one. It moves only when that deficit exceeds the deficit of
       the active account by more than ``DEFICIT_MARGIN_PTS``, or when that
       account is a loss-guard account and the active account is not. A
-      loss-guard active account stays. Then the cooldowns apply
+      loss-guard active account stays, unless that account is a loss-guard
+      account with an earlier next weekly reset. Then the cooldowns apply
       (``cooldown_s`` after the last proactive switch and after the last
       manual switch): a running cooldown gives ``Hold``.
 
@@ -75,7 +94,10 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import tzinfo
 from typing import Literal
+
+from claude_swap import worktime
 
 # --- Tuning table --------------------------------------------------------
 # Every number of the strategy lives here. Source of the scaled-line values:
@@ -93,10 +115,17 @@ F_MIN = 0.1
 # Round 5 (`SCALED_STATELESS_FLOOR`): below this value of sum(c_i * e_i)
 # the ratio is not reliable (every account has just reset); f is F_MIN.
 F_FLOOR = 0.01
-# Round 3 (`guard_f`): the loss guard works only at or above this f.
-GUARD_F = 0.9
-# Round 4: a guard of 12 hours scored better than 24 hours.
-GUARD_HOURS = 12.0
+# Work-days spec (2026-11-27, WD4): the lowest fleet pace the loss guard
+# assumes, so that a slow week does not make every account a guard account.
+RATE_FLOOR = 0.5
+# WD4: an account is a guard account when its remaining work time is at
+# most this many times the work time it needs...
+GUARD_MARGIN = 1.25
+# ...and below this many work hours: the guard acts only in the last work
+# day before a reset. Without the cap, at a slow pace or early in the week
+# the need of a Max is longer than the whole week, the Max is a guard
+# account all week and the strategy stops spreading use.
+GUARD_CAP_WORK_H = 24.0
 # Rounds 3 and 4, and the user's decision: a proactive switch needs the
 # best deficit to exceed the active deficit by more than this many points.
 DEFICIT_MARGIN_PTS = 4.0
@@ -256,7 +285,12 @@ def clamp_margin(candidate_margin: float) -> float:
     return max(0.0, min(MAX_CANDIDATE_MARGIN, float(candidate_margin)))
 
 
-def _weekly(account: Account, now: float) -> tuple[float, float, bool] | None:
+def _weekly(
+    account: Account,
+    now: float,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
+) -> tuple[float, float, bool] | None:
     """``(weekly percent, elapsed share e, counts in the fleet sums)``.
 
     ``None`` for an unmeasured account (a missing window or a non-finite
@@ -264,7 +298,8 @@ def _weekly(account: Account, now: float) -> tuple[float, float, bool] | None:
     When the weekly reset has passed, a new week started at that reset: the
     percent is 0 and ``e`` is the share of the new week that has elapsed.
     ``e`` is 0 with no weekly reset time, and such an account does not count
-    in the sums.
+    in the sums. With ``work_days``, ``e`` is the work share of the week
+    before the next weekly reset.
     """
     pct7, _ = _window(account.seven_day, now)
     if pct7 is None:
@@ -275,7 +310,10 @@ def _weekly(account: Account, now: float) -> tuple[float, float, bool] | None:
     reset = account.seven_day.resets_at
     if reset is None:
         return pct7, 0.0, False
-    if reset <= now:
+    if work_days is not None:
+        next7 = _next_weekly_reset(account.seven_day, now)
+        elapsed = worktime.work_share(next7, now, work_days, tz)
+    elif reset <= now:
         elapsed = ((now - reset) % WEEK_S) / WEEK_S
     else:
         elapsed = max(0.0, min(1.0, 1.0 - (reset - now) / WEEK_S))
@@ -294,32 +332,100 @@ def _next_weekly_reset(window: Window, now: float) -> float | None:
     return reset + (math.floor((now - reset) / WEEK_S) + 1) * WEEK_S
 
 
-def line_height(accounts: Sequence[Account], now: float) -> float:
-    """The height ``f`` of the line, from the current readings only.
-
-    ``f = clip(F_BOOST * sum(c_i * u_i) / sum(c_i * e_i), F_MIN, 1.0)`` over
-    the measured, not blocked accounts. ``f`` is ``F_MIN`` when the
-    denominator is below ``F_FLOOR``.
-    """
-    used = line = 0.0
+def _fleet_sums(
+    accounts: Sequence[Account],
+    now: float,
+    work_days: frozenset[int] | None,
+    tz: tzinfo | None,
+) -> tuple[float, float, float]:
+    """``(sum(c_i * u_i), sum(c_i * e_i), sum(c_i))`` over the measured, not
+    blocked accounts that count (``_weekly``)."""
+    used = line = capacity_sum = 0.0
     for account in accounts:
         if account.blocked:
             continue
-        weekly = _weekly(account, now)
+        weekly = _weekly(account, now, work_days, tz)
         if weekly is None or not weekly[2]:
             continue
         pct7, elapsed, _ = weekly
         capacity = plan_capacity(account.plan)
         used += capacity * pct7 / 100.0
         line += capacity * elapsed
+        capacity_sum += capacity
+    return used, line, capacity_sum
+
+
+def line_height(
+    accounts: Sequence[Account],
+    now: float,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
+) -> float:
+    """The height ``f`` of the line, from the current readings only.
+
+    ``f = clip(F_BOOST * sum(c_i * u_i) / sum(c_i * e_i), F_MIN, 1.0)`` over
+    the measured, not blocked accounts. ``f`` is ``F_MIN`` when the
+    denominator is below ``F_FLOOR``.
+    """
+    used, line, _ = _fleet_sums(accounts, now, work_days, tz)
     if line < F_FLOOR:
         return F_MIN
     return max(F_MIN, min(1.0, F_BOOST * used / line))
 
 
-def deficit(account: Account, now: float, f: float) -> float:
+def fleet_pace(
+    accounts: Sequence[Account],
+    now: float,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
+) -> float | None:
+    """``rho = sum(c_i * u_i) / sum(c_i * e_i)``; ``None`` when the
+    denominator is below ``F_FLOOR`` (every week has just started)."""
+    used, line, _ = _fleet_sums(accounts, now, work_days, tz)
+    if line < F_FLOOR:
+        return None
+    return used / line
+
+
+def work_rate(
+    accounts: Sequence[Account],
+    now: float,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
+) -> float:
+    """The fleet work rate ``R_w``: capacity units per work hour at the pace
+    of this week, ``max(rho, RATE_FLOOR) * sum(c_i) / W_h``. 0.0 when no
+    account counts."""
+    used, line, capacity_sum = _fleet_sums(accounts, now, work_days, tz)
+    rho = used / line if line >= F_FLOOR else 0.0
+    return max(rho, RATE_FLOOR) * capacity_sum / worktime.week_work_hours(work_days)
+
+
+def remaining_work_hours(
+    account: Account,
+    now: float,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
+) -> float | None:
+    """Work hours from ``now`` to the next weekly reset; ``None`` with no
+    weekly window or no reset time."""
+    if account.seven_day is None:
+        return None
+    next7 = _next_weekly_reset(account.seven_day, now)
+    if next7 is None:
+        return None
+    return worktime.work_seconds(now, next7, work_days, tz) / HOUR_S
+
+
+def deficit(
+    account: Account,
+    now: float,
+    f: float,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
+) -> float:
     """``f * e_i * 100 - weekly percent``; 0.0 for an unmeasured account."""
-    weekly = _weekly(account, now)
+    weekly = _weekly(account, now, work_days, tz)
     if weekly is None:
         return 0.0
     pct7, elapsed, _ = weekly
@@ -335,6 +441,9 @@ def score_account(
     candidate_margin: float = DEFAULT_CANDIDATE_MARGIN,
     f: float = 1.0,
     min_headroom: bool = True,
+    work_rate: float | None = None,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
 ) -> Score:
     """Score one account. ``usable`` is False at or over a switch line.
 
@@ -349,9 +458,14 @@ def score_account(
     ``min_headroom=False`` drops the ``MIN_HEADROOM_5H`` / ``MIN_HEADROOM_7D``
     gates: the account then only needs to be below its lines. The forced
     switch uses it as its last fallback.
+
+    ``work_rate`` is the fleet work rate ``R_w`` (``work_rate``) for the
+    loss guard; with ``None`` or 0 there is no guard. ``work_days`` and
+    ``tz`` select the work time (``_weekly``).
     """
     margin = clamp_margin(candidate_margin)
-    line7 = (weekly_threshold if weekly_threshold is not None else threshold) - margin
+    real_line7 = weekly_threshold if weekly_threshold is not None else threshold
+    line7 = real_line7 - margin
     line5 = threshold - margin
     if account.blocked:
         return Score(account.id, False, 0.0, "blocked")
@@ -377,17 +491,19 @@ def score_account(
             return Score(account.id, False, 0.0, "5h threshold",
                          headroom_7d=head7, blocked_until=reset5)
 
-    # Loss guard: the week ends within GUARD_HOURS, at a high f. A reset
+    # Loss guard: the remaining work time is close to the work time the
+    # fleet needs to spend this account's quota up to its real weekly line.
+    # A usable account is below that line, so its need is above 0. A reset
     # time that has passed counts by its next weekly reset.
     next7 = _next_weekly_reset(account.seven_day, now)
-    guard = (
-        f >= GUARD_F
-        and next7 is not None
-        and next7 - now <= GUARD_HOURS * HOUR_S
-    )
+    left_h = remaining_work_hours(account, now, work_days, tz)
+    guard = False
+    if left_h is not None and work_rate:
+        need_h = plan_capacity(account.plan) * (real_line7 - pct7) / 100.0 / work_rate
+        guard = left_h <= GUARD_MARGIN * need_h and left_h < GUARD_CAP_WORK_H
     reason = "loss guard" if guard else "deficit"
-    return Score(account.id, True, deficit(account, now, f), reason, guard,
-                 head7, reset_7d=next7)
+    return Score(account.id, True, deficit(account, now, f, work_days, tz),
+                 reason, guard, head7, reset_7d=next7)
 
 
 def _rank_key(s: Score) -> tuple:
@@ -401,18 +517,25 @@ def _ranked(accounts: Sequence[Account], now: float, *, threshold: float,
             weekly_threshold: float | None,
             candidate_margin: float, f: float | None = None,
             min_headroom: bool = True,
-            lines: AccountLines | None = None) -> list[Score]:
+            lines: AccountLines | None = None,
+            rate: float | None = None,
+            work_days: frozenset[int] | None = None,
+            tz: tzinfo | None = None) -> list[Score]:
     """Usable accounts, best first (see ``_rank_key``). Each account is
-    scored on its own lines (``_lines_of``)."""
+    scored on its own lines (``_lines_of``). ``f`` and the fleet work rate
+    ``rate`` come from ``accounts`` when they are ``None``."""
     if f is None:
-        f = line_height(accounts, now)
+        f = line_height(accounts, now, work_days, tz)
+    if rate is None:
+        rate = work_rate(accounts, now, work_days, tz)
     scores = []
     for a in accounts:
         five, weekly = _lines_of(a.id, threshold, weekly_threshold, lines)
         scores.append(
             score_account(a, now, threshold=five, weekly_threshold=weekly,
                           candidate_margin=candidate_margin, f=f,
-                          min_headroom=min_headroom)
+                          min_headroom=min_headroom, work_rate=rate,
+                          work_days=work_days, tz=tz)
         )
     return sorted((s for s in scores if s.usable), key=_rank_key)
 
@@ -425,6 +548,8 @@ def rank(
     weekly_threshold: float | None = None,
     candidate_margin: float = DEFAULT_CANDIDATE_MARGIN,
     lines: AccountLines | None = None,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
 ) -> list[int]:
     """Return the ids of usable accounts, best first.
 
@@ -435,10 +560,13 @@ def rank(
 
     ``lines`` gives an account its own ``(threshold, weekly_threshold)``; an
     account missing from it uses ``threshold`` and ``weekly_threshold``.
+    ``work_days`` and ``tz`` select the work time (``None``: all days, the
+    local zone).
     """
     ranked = _ranked(accounts, now, threshold=threshold,
                      weekly_threshold=weekly_threshold,
-                     candidate_margin=candidate_margin, lines=lines)
+                     candidate_margin=candidate_margin, lines=lines,
+                     work_days=work_days, tz=tz)
     return [s.id for s in ranked]
 
 
@@ -452,7 +580,10 @@ def _cooldown_running(last_ts: float | None, now: float, cooldown_s: float) -> b
 def _active_score(accounts: Sequence[Account], active_id: int | None,
                   now: float, *, threshold: float,
                   weekly_threshold: float | None, f: float,
-                  lines: AccountLines | None = None) -> Score | None:
+                  lines: AccountLines | None = None,
+                  rate: float | None = None,
+                  work_days: frozenset[int] | None = None,
+                  tz: tzinfo | None = None) -> Score | None:
     """Score of the active account, or ``None`` when it is not in the list."""
     # The active account is judged against the user's lines only: the
     # MIN_HEADROOM gates keep a move from landing on an almost full account,
@@ -463,7 +594,8 @@ def _active_score(accounts: Sequence[Account], active_id: int | None,
             five, weekly = _lines_of(a.id, threshold, weekly_threshold, lines)
             return score_account(a, now, threshold=five,
                                  weekly_threshold=weekly, f=f,
-                                 min_headroom=False)
+                                 min_headroom=False, work_rate=rate,
+                                 work_days=work_days, tz=tz)
     return None
 
 
@@ -490,6 +622,8 @@ def decide(
     candidate_margin: float = DEFAULT_CANDIDATE_MARGIN,
     burn_rate: float = 0.0,
     lines: AccountLines | None = None,
+    work_days: frozenset[int] | None = None,
+    tz: tzinfo | None = None,
 ) -> Decision:
     """Decide whether to leave the active account, and for which account.
 
@@ -509,7 +643,9 @@ def decide(
        the active account. With a usable active account (measured, not
        blocked, not gated, below its real lines):
 
-       * an active account that the loss guard protects returns ``Stay``;
+       * an active account that the loss guard protects returns ``Stay``,
+         unless ``best`` is a loss-guard account with an earlier next weekly
+         reset: then it moves to ``best``;
        * a ``best`` that the loss guard protects moves without the margin;
        * else the move needs ``deficit(best) - deficit(active)`` above
          ``DEFICIT_MARGIN_PTS``.
@@ -540,14 +676,19 @@ def decide(
     Every rule above, the runway rule included, reads each account's own
     lines.
 
+    ``work_days`` and ``tz`` select the work time of every rule (``None``:
+    all days, the local zone).
+
     With no usable target this returns ``Stay``; the caller handles the case
     where every account is blocked.
     """
     own = lines
+    # One line height and one fleet work rate for the whole decision: they
+    # do not depend on the margin.
+    f = line_height(accounts, now, work_days, tz)
     lines = {"threshold": threshold, "weekly_threshold": weekly_threshold,
-             "lines": own}
-    # One line height for the whole decision: it does not depend on the margin.
-    f = line_height(accounts, now)
+             "lines": own, "work_days": work_days, "tz": tz,
+             "rate": work_rate(accounts, now, work_days, tz)}
     ranked = _ranked(accounts, now, **lines, candidate_margin=candidate_margin,
                      f=f)
     # The active account is judged at the real lines (margin 0).
@@ -609,10 +750,12 @@ def decide(
     # same Score as its entry in ``ranked``.
     active = active_score if active_score is not None and active_score.usable else None
     if active is not None:
-        # A loss-guard active account keeps spending its expiring quota.
+        # A loss-guard active account keeps spending its expiring quota,
+        # unless another guard account's quota expires sooner.
         if active.guard:
-            return Stay()
-        if not best.guard and not best.score - active.score > DEFICIT_MARGIN_PTS:
+            if not (best.guard and best.reset_7d < active.reset_7d):
+                return Stay()
+        elif not best.guard and not best.score - active.score > DEFICIT_MARGIN_PTS:
             return Stay()
 
     if _cooldown_running(last_proactive_ts, now, cooldown_s) or _cooldown_running(
