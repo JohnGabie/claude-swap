@@ -15,7 +15,7 @@ import logging
 import math
 import threading
 
-from claude_swap import fleet_page, lines
+from claude_swap import fleet_page, lines, worktime
 from claude_swap.models import AccountPolicy
 from claude_swap.settings import AutoSwitchSettings
 from claude_swap.tray import THRESHOLD_MAX, THRESHOLD_MIN
@@ -27,10 +27,21 @@ LINES_W, LINES_H = 320, 520
 RELOAD_S = 30  # the page reads its data again this often while the window is open
 RESET_THRESHOLD = AutoSwitchSettings().threshold  # "Restaurar padrão" (SL3)
 FIVE_KEY, WEEK_KEY = "autoswitch.threshold", "autoswitch.weeklyThreshold"
+DAYS_KEY = "autoswitch.workDays"
+DAY_BOXES = (("Seg", "Segunda-feira"), ("Ter", "Terça-feira"), ("Qua", "Quarta-feira"), ("Qui", "Quinta-feira"),
+             ("Sex", "Sexta-feira"), ("Sáb", "Sábado"), ("Dom", "Domingo"))
 
 WRITE_FAILED = "Não foi possível salvar o limite."
 READ_FAILED = "Não foi possível ler os limites."
 CLOSE_FAILED = "Não foi possível fechar a janela."
+
+
+def _days_text(value) -> str:
+    """The normal form of a stored work-days text; a missing or bad one reads as ``all`` (WD2)."""
+    try:
+        return worktime.format_days(worktime.parse_days(value))
+    except ValueError:
+        return "all"
 
 
 def _number(value) -> bool:
@@ -141,7 +152,8 @@ class LinesWindowApi:
                 accounts.append({"num": num, **fields, "use5": _use(card, "5h"), "useWeek": _use(card, "7d")})
             return {"five": float(core.threshold),
                     "week": None if core.weekly_threshold is None else float(core.weekly_threshold),
-                    "autoSwitch": self._auto() is True, "accounts": accounts}
+                    "autoSwitch": self._auto() is True,
+                    "workDays": _days_text(getattr(core, "work_days", "all")), "accounts": accounts}
         except Exception as e:  # noqa: BLE001 - the page keeps its last data
             _logger.warning("lines window read failed: %s", type(e).__name__)
             return {"ok": False, "error": READ_FAILED}
@@ -173,6 +185,11 @@ class LinesWindowApi:
         """The core settings one ``set`` writes, or None for a bad input."""
         if key == "reset":
             return {FIVE_KEY: RESET_THRESHOLD, WEEK_KEY: None}
+        if key == "workDays":
+            try:
+                return {DAYS_KEY: worktime.format_days(worktime.parse_days(value))}
+            except ValueError:
+                return None
         if key == "week" and value is None:
             return {WEEK_KEY: None}
         if key not in ("five", "week") or not _number(value) or not THRESHOLD_MIN <= value <= THRESHOLD_MAX:
@@ -235,6 +252,12 @@ input[type=range]:disabled::-webkit-slider-thumb{background:#5A6466;cursor:defau
 .tg u::after{content:"";position:absolute;left:2px;top:2px;width:11px;height:11px;border-radius:50%;background:var(--muted)}
 .tg input:checked+u{background:var(--spent)}
 .tg input:checked+u::after{left:13px;background:var(--ink)}
+.days{display:flex;gap:4px}
+.day{flex:1;cursor:pointer}
+.day input{display:none}
+.day u{display:block;text-decoration:none;text-align:center;font-size:11.5px;line-height:1;padding:6px 0;border-radius:6px;
+ background:var(--raised);color:var(--muted)}
+.day input:checked+u{background:var(--spent);color:var(--ink)}
 .sec{border-top:1px solid var(--grid);padding-top:10px;flex:1;min-height:0;display:flex;flex-direction:column}
 .sec>b{display:block;font:600 11px/1 system-ui,sans-serif;color:var(--muted);letter-spacing:.05em;text-transform:uppercase;
  margin-bottom:6px}
@@ -264,6 +287,11 @@ input[type=range]:disabled::-webkit-slider-thumb{background:#5A6466;cursor:defau
  <input id=sw class=week type=range min=__MIN__ max=__MAX__ step=1>
  <label class=tg><input type=checkbox id=same><u></u>Igual à de 5 h</label>
 </div>
+<div class=row>
+ <div class=top><i>Dias de trabalho</i></div>
+ <div class=days>__DAYS__</div>
+ <div class=hint>O ritmo conta só esses dias. Uso fora deles é exceção.</div>
+</div>
 <div class=sec><b>Por conta</b><div class=accs id=accs></div></div>
 <div class=err id=err></div>
 <div class=foot><span>Salvo ao soltar</span><a id=reset href="#">Restaurar padrão</a></div>
@@ -291,8 +319,30 @@ function paint(d){
  const wk=d.week==null?d.five:d.week;
  s5.value=slider(d.five);showFive(d.five);
  same.checked=d.week==null;sw.disabled=d.week==null;sw.value=slider(wk);showWeek(wk);
+ dayset(d.workDays).forEach((v,i)=>{wd[i].checked=v;});
  $('off').hidden=d.autoSwitch===true;
  $('accs').innerHTML=d.accounts.map(row).join('');
+}
+// The work days (WD6): seven toggles; the text is the normal form of WD2 (runs of 3 or more as a-b)
+const WD=['mon','tue','wed','thu','fri','sat','sun'],wd=WD.map((_,i)=>$('wd'+i));
+function dayset(t){
+ if(typeof t!=='string'||t==='all') return WD.map(()=>true);
+ const on=WD.map(()=>false);
+ t.split(',').forEach(p=>{const r=p.split('-'),a=WD.indexOf(r[0]),b=r.length>1?WD.indexOf(r[1]):a;
+  for(let i=a;a>=0&&i<=b;i++) on[i]=true;});
+ return on;
+}
+function dayform(on){
+ const n=on.filter(Boolean).length;
+ if(n===7) return 'all';
+ const out=[];
+ for(let i=0;i<7;i++){
+  if(!on[i]) continue;
+  let j=i;while(j+1<7&&on[j+1]) j++;
+  if(j-i>=2) out.push(WD[i]+'-'+WD[j]); else for(let k=i;k<=j;k++) out.push(WD[k]);
+  i=j;
+ }
+ return out.join(',');
 }
 const bridge=()=>window.pywebview&&pywebview.api;
 function load(){
@@ -321,11 +371,18 @@ same.addEventListener('change',()=>{
  if(same.checked){sw.value=s5.value;showWeek(Number(sw.value));write('week',null);}
  else write('week',Number(sw.value));
 });
+wd.forEach(box=>box.addEventListener('change',()=>{
+ const on=wd.map(b=>b.checked);
+ if(!on.some(Boolean)){box.checked=true;return;} // the last day on cannot be turned off
+ write('workDays',dayform(on));
+}));
 $('reset').addEventListener('click',e=>{e.preventDefault();write('reset',null);});
 $('close').addEventListener('click',close);
 document.addEventListener('keydown',e=>{if(e.key==='Escape')close();});
 window.linesOpen=()=>{load();clearInterval(timer);timer=setInterval(load,RELOAD_MS);};
 window.linesClosed=()=>clearInterval(timer);
 window.addEventListener('pywebviewready',load);
-</script>""".replace("__MIN__", str(THRESHOLD_MIN)).replace("__MAX__", str(THRESHOLD_MAX)).replace(
+</script>""".replace("__DAYS__", "".join(
+    f'<label class=day title="{name}"><input type=checkbox id=wd{i}><u>{label}</u></label>'
+    for i, (label, name) in enumerate(DAY_BOXES))).replace("__MIN__", str(THRESHOLD_MIN)).replace("__MAX__", str(THRESHOLD_MAX)).replace(
     "__RELOAD_MS__", str(RELOAD_S * 1000)).replace("__FAIL__", WRITE_FAILED)
