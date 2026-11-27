@@ -158,13 +158,44 @@ def test_hit_before_switch_slack_is_ignored(temp_home, offset, counted):
         if n == 1:
             h.watch.hits = [LimitHit(ts=S2_SWITCH_TS + offset, window="5h")]
 
-    _run_loop(h, entries, on_wait=on_wait, max_waits=3)
+    ticks: list[int] = []
+    real_tick = h.engine.tick
+
+    def tick():
+        ticks.append(h.watch.polls)
+        return real_tick()
+
+    with patch.object(h.engine, "tick", side_effect=tick):
+        _run_loop(h, entries, on_wait=on_wait, max_waits=3)
     if counted:
         assert _hits(h) == [{"account": 4, "window": "5h"}]
         assert _switches(h) == [("limit-hit", 4, 5)]
     else:
         assert _hits(h) == [] and _switches(h) == []
-        assert h.watch.polls == 2  # the loop kept waiting: no tick at once
+        assert ticks == [0]  # the loop kept waiting: no tick at once
+        assert h.watch.polls == 2
+
+
+def test_hit_after_a_switch_to_another_account_counts(temp_home):
+    # The engine's last switch went to account 5; account 4 came back by a
+    # login the state does not record, so no switch moment is known for it.
+    h = _harness(temp_home, (4, 5), now=S2_SWITCH_TS + 30)
+    _write_state(h, lastSwitchAt=S2_SWITCH_TS, lastSwitchTo="5")
+    entries = _entries({"4": _usage(79), "5": _usage(6)}, h.clock.now)
+    h.watch.hits = [LimitHit(ts=S1_TS, window="5h")]
+    with patch.object(h.switcher, "usage_entries_by_account", return_value=entries):
+        assert h.engine._poll_limit_watch() is True
+    assert _hits(h) == [{"account": 4, "window": "5h"}]
+
+
+def test_hit_with_no_active_account_is_ignored(temp_home, caplog):
+    h = _harness(temp_home)
+    h.watch.hits = [LimitHit(ts=h.clock.now, window="5h")]
+    with patch.object(h.switcher, "current_account_number", return_value=None), \
+            caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        assert h.engine._poll_limit_watch() is False
+    assert _hits(h) == []
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
 def test_hit_before_a_manual_switch_slack_is_ignored(temp_home):
@@ -195,7 +226,8 @@ def test_engine_switches_on_limit_hit(temp_home):
 
     def on_wait(n):
         if n == 1:
-            h.watch.hits = [LimitHit(ts=S2_SWITCH_TS + 30, window="5h")]
+            # Two agents stop on the same limit: one event.
+            h.watch.hits = [LimitHit(ts=S2_SWITCH_TS + 30, window="5h")] * 2
 
     with patch.object(h.engine, "tick", side_effect=tick):
         waits = _run_loop(h, entries, on_wait=on_wait, max_waits=2)
@@ -231,15 +263,16 @@ def test_hit_without_a_window_marks_the_fullest_window(temp_home, reading, windo
     assert _switches(h) == [("limit-hit", 1, 2)]
 
 
-@pytest.mark.parametrize(("window", "with_reset", "horizon"), [
-    ("5h", True, HOUR_S),
-    ("5h", False, 5 * HOUR_S),
-    ("7d", False, 7 * 24 * HOUR_S),
+@pytest.mark.parametrize(("window", "reset_in", "horizon"), [
+    ("5h", HOUR_S, HOUR_S),
+    ("5h", None, 5 * HOUR_S),
+    ("5h", -60.0, 5 * HOUR_S),  # a reset already past: the reading is old
+    ("7d", None, 7 * 24 * HOUR_S),
 ])
-def test_hit_marks_window_until_reset(temp_home, window, with_reset, horizon):
+def test_hit_marks_window_until_reset(temp_home, window, reset_in, horizon):
     h = _harness(temp_home)
     hit_ts = h.clock.now
-    reset = _iso_at(hit_ts + HOUR_S) if with_reset else None
+    reset = _iso_at(hit_ts + reset_in) if reset_in is not None else None
     left = _usage(50, reset) if window == "5h" else _usage7(10, 50)
     h.watch.hits = [LimitHit(ts=hit_ts, window=window)]
     with patch.object(h.switcher, "usage_entries_by_account", return_value=_entries({"1": left, "2": _usage(0)}, hit_ts)):
@@ -264,6 +297,52 @@ def test_hit_tick_fetches_fresh_readings(temp_home):
         h.engine._poll_limit_watch()
         h.engine.tick()
     assert {"fetch": {"1", "2"}} in [call.kwargs for call in fetch.call_args_list]
+
+
+def test_hit_names_one_tick_only(temp_home):
+    # No account is usable on the hit tick; the switch of a later tick is the
+    # engine's own one (account 1 is marked full: at its limit).
+    h = _harness(temp_home)
+    h.watch.hits = [LimitHit(ts=h.clock.now, window="5h")]
+    with patch.object(h.switcher, "usage_entries_by_account",
+                      return_value=_entries({"1": _usage(50), "2": _usage(100)}, h.clock.now)):
+        assert h.engine._poll_limit_watch() is True
+        assert h.engine.tick() is TickOutcome.BLOCKED
+    assert _hits(h) == [{"account": 1, "window": "5h"}]
+    h.clock.advance(60)
+    assert h.tick_with_usage({"1": _usage(50), "2": _usage(0)}) is TickOutcome.SWITCHED
+    assert _switches(h) == [("at-limit", 1, 2)]
+
+
+def test_hit_of_another_account_does_not_name_the_switch(temp_home):
+    h = _harness(temp_home, (1, 2, 3))
+    h.watch.hits = [LimitHit(ts=h.clock.now, window="5h")]
+    with patch.object(h.switcher, "usage_entries_by_account",
+                      return_value=_entries({"1": _usage(50)}, h.clock.now)):
+        assert h.engine._poll_limit_watch() is True
+    h.make_live("b@example.com", 2)  # the user moved to account 2 by hand
+    assert h.tick_with_usage({"2": _usage(100), "1": _usage(50), "3": _usage(0)}) is TickOutcome.SWITCHED
+    assert _switches(h) == [("at-limit", 2, 3)]
+
+
+def test_mark_on_an_unknown_reading_is_skipped(temp_home):
+    h = _harness(temp_home)
+    h.engine._limit_marks["2"] = {"5h": h.clock.now + HOUR_S}
+    assert h.tick_with_usage({"1": _usage(10), "2": None}) is TickOutcome.NO_ACTION
+    assert not any(e.kind == "error" for e in h.events)
+
+
+def test_dry_run_names_the_hit(temp_home):
+    h = _harness(temp_home)
+    h.engine = h._make_engine(limit_watch=h.watch, dry_run=True)
+    h.watch.hits = [LimitHit(ts=h.clock.now, window="5h")]
+    with patch.object(h.switcher, "usage_entries_by_account",
+                      return_value=_entries({"1": _usage(50), "2": _usage(0)}, h.clock.now)):
+        assert h.engine._poll_limit_watch() is True
+        assert h.engine.tick() is TickOutcome.SWITCHED
+    switch = next(e for e in h.events if e.kind == "switch")
+    assert switch.dry_run and switch.trigger == "limit-hit"
+    assert h.active_number() == 1
 
 
 def test_hit_asks_a_reading_of_the_old_account_on_the_next_tick(temp_home):
@@ -384,8 +463,39 @@ def test_estimate_needs_confidence(temp_home, pro_plans, week_points, switches):
     _calibrate(h, 1, week_points=week_points)
     h.watch.tokens = S4_TOKENS
     out = h.tick_with_usage({"1": _usage(0), "2": _usage(0)})
-    assert (out is TickOutcome.SWITCHED) is switches
+    assert out is (TickOutcome.SWITCHED if switches else TickOutcome.NO_ACTION)
     assert _switches(h) == ([("estimate", 1, 2)] if switches else [])
+
+
+def test_estimate_at_the_line_switches(temp_home, pro_plans):
+    h = _harness(temp_home)
+    _calibrate(h, 1, week_points=150.0)
+    h.watch.tokens = 99.0 * S4_RATE  # the estimate is the line exactly
+    assert h.tick_with_usage({"1": _usage(0), "2": _usage(0)}) is TickOutcome.SWITCHED
+    assert _switches(h) == [("estimate", 1, 2)]
+
+
+def test_estimate_does_not_name_a_switch_over_the_line(temp_home, pro_plans):
+    # The reading alone is over the line: the switch is the engine's own one.
+    h = _harness(temp_home)
+    _calibrate(h, 1, week_points=150.0)
+    h.watch.tokens = S4_TOKENS
+    assert h.tick_with_usage({"1": _usage(99.5), "2": _usage(0)}) is TickOutcome.SWITCHED
+    assert _switches(h) == [("proactive", 1, 2)]
+
+
+def test_estimate_and_balanced_read_each_plan_once_per_tick(temp_home):
+    from tests.test_autoswitch_balanced import PRO_BETTER, _balanced, _spy
+
+    h = _balanced(temp_home)
+    watch = FakeLimitWatch()
+    watch.tokens = 1.0
+    h.engine = h._make_engine(limit_watch=watch)
+    _calibrate(h, int(h.switcher.current_account_number()), week_points=150.0)
+    with _spy(h, "plan_of") as calls:
+        assert h.tick_with_usage(PRO_BETTER) is TickOutcome.SWITCHED
+    assert watch.since, "the estimate read the plan"
+    assert sorted(calls) == ["1", "2", "3", "4", "5"]
 
 
 @pytest.mark.parametrize(("points", "escalates"), [
