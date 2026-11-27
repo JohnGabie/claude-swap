@@ -408,9 +408,10 @@ const k=v=>{if(!num(v))return DASH;v=Math.max(0,v);return v>=999500?(v/1e6).toFi
 const dec1=v=>v.toFixed(1).replace('.',',');
 const pad=n=>String(n).padStart(2,'0');
 const ts=iso=>Date.parse(iso)/1000;
-const hhmm=d=>pad(d.getHours())+':'+pad(d.getMinutes());
+const clock=d=>{const h=d.getHours()%12||12;return h+':'+String(d.getMinutes()).padStart(2,'0')+' '+(d.getHours()<12?'AM':'PM');};
+const clockHour=d=>(d.getHours()%12||12)+' '+(d.getHours()<12?'AM':'PM');
 const ddmm=d=>pad(d.getDate())+'/'+pad(d.getMonth()+1);
-const when=t=>{const d=new Date(t*1000);return `${WD[d.getDay()]} ${ddmm(d)} ${hhmm(d)}`;};
+const when=t=>{const d=new Date(t*1000);return `${WD[d.getDay()]} ${ddmm(d)} ${clock(d)}`;};
 const share=s=>!num(s)||s<=0?'':s<1?'<1%':Math.round(s)+'%';
 const usd=v=>v.toFixed(2).replace('.',',');
 function setNum(el,txt){el.textContent=txt;}
@@ -450,7 +451,7 @@ function spark(tile,v,n0,s0,now){
  svg.innerHTML=`<path d="${v.map((a,i)=>(i?'L':'M')+x(i).toFixed(1)+' '+y(a).toFixed(1)).join(' ')}" fill=none stroke="var(--spent)" stroke-width=1.5 stroke-linejoin=round stroke-linecap=round /><circle class=cur cx=${x(n-1)} cy=${y(v[n-1])} r=2.5 fill="var(--spent)" />`;
  const cur=svg.querySelector('.cur');
  svg.onmousemove=e=>{const r=svg.getBoundingClientRect(),i=Math.max(0,Math.min(n-1,Math.round((e.clientX-r.left)/r.width*(n-1)))),d=new Date((now-(n-i)*3600)*1000);
-  tile.querySelector('.num').textContent=k(v[i]);tile.querySelector('.s').textContent=`${WD[d.getDay()]} ${pad(d.getHours())}h`;
+  tile.querySelector('.num').textContent=k(v[i]);tile.querySelector('.s').textContent=`${WD[d.getDay()]} ${clockHour(d)}`;
   cur.setAttribute('cx',x(i));cur.setAttribute('cy',y(v[i]));};
  svg.onmouseleave=()=>{tile.querySelector('.num').textContent=n0;tile.querySelector('.s').textContent=s0;cur.setAttribute('cx',x(n-1));cur.setAttribute('cy',y(v[n-1]));};
 }
@@ -485,7 +486,7 @@ function chart(p){
  for(let t=first;t<=t1;t+=every){
   let tt=t;if(every>=86400){const d=new Date(t*1000);d.setHours(0,0,0,0);tt=d.getTime()/1000;}
   const X=x(tt);if(X<CL||X>R||Math.abs(X-nx)<24)continue;const d=new Date(tt*1000);
-  g+=`<text x=${X} y=${CH-5} text-anchor=${X>R-18?'end':'middle'} font-size=10.5 fill="var(--muted)">${every<86400?hhmm(d):p.period==='7d'?WD[d.getDay()]:ddmm(d)}</text>`;}
+  g+=`<text x=${X} y=${CH-5} text-anchor=${X>R-18?'end':'middle'} font-size=10.5 fill="var(--muted)">${every<86400?clock(d):p.period==='7d'?WD[d.getDay()]:ddmm(d)}</text>`;}
  g+=`<line x1=${nx} x2=${nx} y1=${CT-4} y2=${B} stroke="var(--ink2)" /><text x=${nx} y=${CH-5} text-anchor=middle font-size=10.5 font-weight=600 fill="var(--ink)">agora</text>`;
  g+=`<line class=xh x1=0 x2=0 y1=${CT} y2=${B} stroke="var(--ink2)" opacity=0 /><circle class=dot r=4.5 cx=-10 cy=-10 stroke="#000000" stroke-width=2 fill="var(--spent)" />`;
  $('chart').innerHTML=`<svg id=ac width=${CW} height=${CH}>${g}</svg><div class=lg><span><i style="background:var(--spent)"></i>consumo</span><span><i style="background:var(--avail)"></i>quanto dá para gastar por minuto, até cada reset</span><span><i class=dash></i>ritmo que fecha a semana</span></div>`;
@@ -531,10 +532,10 @@ function heat(p){
  const pr=p.projects||{columns:[],rows:[]}, cols=(pr.columns||[]).map(ts), nc=Math.max(cols.length,1);
  const W=316,NM=96,END=62,gap=nc>20?1:2,cw=Math.max(1,(W-NM-END-8-gap*(nc-1))/nc);
  const dayCols=cols.length>1?cols[1]-cols[0]>=82800:false;
- const lab=j=>{const d=new Date(cols[j]*1000);return dayCols?ddmm(d):hhmm(d);};
+ const lab=j=>{const d=new Date(cols[j]*1000);return dayCols?ddmm(d):clock(d);};
  // a column label is drawn only where it has room: every other day when the columns are narrow, none at the very end
  const head=j=>{if(!cols.length||(nc-j)*(cw+gap)<26)return '';const d=new Date(cols[j]*1000);
-  if(dayCols)return nc<=8?(cw>=22||j%2===0?WD[d.getDay()]:''):(j%(nc>20?7:4)===0?ddmm(d):'');return j%(nc>12?6:3)===0?hhmm(d):'';};
+  if(dayCols)return nc<=8?(cw>=22||j%2===0?WD[d.getDay()]:''):(j%(nc>20?7:4)===0?ddmm(d):'');return j%(nc>12?6:3)===0?clock(d):'';};
  const rows=(pr.rows||[]).slice(0,HEAT_ROWS);while(rows.length<HEAT_ROWS)rows.push({key:'',cells:[],tokens:0,share:0});
  const mx=Math.max(1,...rows.flatMap(r=>r.cells||[]));
  const shade=v=>!(v>0)?'var(--raised)':`rgba(10,147,150,${(0.16+0.84*Math.pow(v/mx,0.55)).toFixed(2)})`;
@@ -574,7 +575,7 @@ function stats(p){
  const sw=p.switches||{count:0,today:0,bars:[]}, since=sw.logSince?ts(sw.logSince):null, start=ts(p.series.now)-(SPAN[p.period]||0);
  const sub=`${PLABEL[p.period]||''} · ${sw.today||0} hoje${since&&since>start?' · desde '+ddmm(new Date(since*1000)):''}`;
  const bars=sw.bars||[], nb=Math.max(bars.length,1), mx=Math.max(1,...bars.map(b=>b.count)), gap=nb>20?1:2, w=(120-gap*(nb-1))/nb;
- const short=(SPAN[p.period]||0)<=86400, lab=b=>{const d=new Date(ts(b.start)*1000);return short?hhmm(d):ddmm(d);};
+ const short=(SPAN[p.period]||0)<=86400, lab=b=>{const d=new Date(ts(b.start)*1000);return short?clock(d):ddmm(d);};
  const s=$('swst');
  s.innerHTML=`<div class=l>Trocas de conta</div><div class=v><span class=num>${sw.count||0}</span></div><div class=s>${esc(sub)}</div>`
   +`<svg width=120 height=30 class=mini>${bars.map((b,j)=>{const h=Math.max(2,26*b.count/mx);return `<rect data-j=${j} x=${(j*(w+gap)).toFixed(1)} y=${28-h} width=${w.toFixed(1)} height=${h} rx=${nb>20?1:3} />`;}).join('')}</svg>`;

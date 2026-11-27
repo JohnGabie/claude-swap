@@ -110,6 +110,26 @@ def run_page(tmp_path, expr: str):
     return json.loads(run.stdout)
 
 
+
+_CLOCK_CASES = [((0, 5), "12:05 AM", "12 AM"), ((9, 39), "9:39 AM", "9 AM"),
+                ((12, 0), "12:00 PM", "12 PM"), ((21, 39), "9:39 PM", "9 PM"), ((0, 0), "12:00 AM", "12 AM")]
+
+
+@needs_node
+def test_clock_12h_edges(tmp_path):
+    for (h, m), text, hour in _CLOCK_CASES:
+        got = run_page(tmp_path, "[clock(new Date(2026, 10, 27, %d, %d)), clockHour(new Date(2026, 10, 27, %d, %d))]" % (h, m, h, m))
+        assert got == [text, hour], (h, m, got)
+
+
+@needs_node
+def test_fleet_when_shows_date_and_12h_clock(tmp_path):
+    cases = [((21, 39), "sex 27/11 9:39 PM"), ((0, 5), "sex 27/11 12:05 AM"), ((12, 0), "sex 27/11 12:00 PM")]
+    for (h, m), text in cases:
+        got = run_page(tmp_path, "when(new Date(2026, 10, 27, %d, %d).getTime() / 1000)" % (h, m))
+        assert got == text, (h, m, got)
+
+
 @needs_node
 def test_model_rows_six_each_seven_fold_into_outros(tmp_path):
     six = [{"label": f"M{i}", "tokens": 600 - 100 * i, "share": 10.0 + i} for i in range(6)]

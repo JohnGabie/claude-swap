@@ -534,7 +534,9 @@ function showCard(i){
 }
 
 const WD=['dom','seg','ter','qua','qui','sex','s\\u00e1b'], DASH='\\u2014';
-const when=iso=>{const d=iso?new Date(iso):null; return !d||isNaN(d)?DASH:WD[d.getDay()]+' '+String(d.getHours()).padStart(2,'0')+':'+String(d.getMinutes()).padStart(2,'0');};
+const clock=d=>{const h=d.getHours()%12||12;return h+':'+String(d.getMinutes()).padStart(2,'0')+' '+(d.getHours()<12?'AM':'PM');};
+const clockHour=d=>(d.getHours()%12||12)+' '+(d.getHours()<12?'AM':'PM');
+const when=iso=>{const d=iso?new Date(iso):null; return !d||isNaN(d)?DASH:WD[d.getDay()]+' '+clock(d);};
 // {dur} of FP8: under 60 min "45 min", under 48 h "10 h", else "2 d"
 const dur=s=>s<3600?Math.max(1,Math.floor(s/60))+' min':s<172800?Math.floor(s/3600)+' h':Math.floor(s/86400)+' d';
 const readAge=s=>s==null?'':s<180?'lido agora':'lido h\\u00e1 '+dur(s);
