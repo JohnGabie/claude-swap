@@ -6,9 +6,13 @@ first ``poll`` starts at the end of each existing file, so old hits never
 replay; a file that appears later starts at 0; a shrunk file restarts at 0.
 
 Fields read: ``type``, ``isApiErrorMessage``, ``error``, ``apiError``,
-``timestamp``, ``message.usage``, ``message.model`` and the text of the first
-content item. The text is only searched; it is never stored or logged, and no
-log line holds a path.
+``timestamp``, ``requestId``, ``message.id``, ``message.model``,
+``message.usage`` and the text of the first content item. The text is only
+searched; it is never stored or logged, and no log line holds a path.
+
+A message repeats on several lines of a log, so ``tokens_since`` counts each
+``"{message.id}|{requestId}"`` once (the ``usage_history`` key); a line with
+both ids missing counts once by its timestamp.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from claude_swap import token_model, usage_log
+from claude_swap import token_model, usage_history, usage_log
 
 _logger = logging.getLogger("claude-swap")
 
@@ -73,6 +77,7 @@ class LimitWatch:
         self._offsets: dict[Path, int] = {}
         self._started = False
         self._entries: list[tuple[float, float]] = []  # (timestamp, weighted tokens)
+        self._seen: dict[str, float] = {}  # message key -> timestamp
 
     def poll(self) -> list[LimitHit]:
         """The limit hits in the whole lines appended since the last call."""
@@ -109,6 +114,7 @@ class LimitWatch:
     def _trim(self) -> None:
         cutoff = self._clock() - KEEP_S
         self._entries = [entry for entry in self._entries if entry[0] >= cutoff]
+        self._seen = {key: ts for key, ts in self._seen.items() if ts >= cutoff}
 
     def _read(self, path: Path, offset: int, hits: list[LimitHit]) -> int:
         """Read the whole lines after ``offset``; return the bytes consumed."""
@@ -138,7 +144,10 @@ class LimitWatch:
             return
         usage = message.get("usage")
         if row.get("type") == "assistant" and isinstance(usage, dict):
-            self._entries.append((ts, token_model.weighted_tokens(message.get("model"), usage)))
+            key = usage_history._message_key(message, row, row.get("timestamp"))
+            if key not in self._seen:
+                self._seen[key] = ts
+                self._entries.append((ts, token_model.weighted_tokens(message.get("model"), usage)))
         text = _first_text(message)
         if _is_hit(row, text):
             window = _window(text)

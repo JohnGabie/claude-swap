@@ -52,12 +52,16 @@ def hit_line(text=S1_TEXT, ts=S1_TS_TEXT, *, kind="assistant", is_error=True,
     return json.dumps(row) + ("\n" if newline else "")
 
 
-def usage_line(ts: float, model: str, kind: str = "assistant", **usage) -> str:
+def usage_line(ts: float, model: str, kind: str = "assistant", mid=None, rid=None, **usage) -> str:
     row = {
         "type": kind,
         "timestamp": iso(ts),
         "message": {"model": model, "content": [{"type": "text", "text": "ok"}], "usage": usage},
     }
+    if mid is not None:
+        row["message"]["id"] = mid
+    if rid is not None:
+        row["requestId"] = rid
     return json.dumps(row) + "\n"
 
 
@@ -227,6 +231,27 @@ def test_tokens_since_weights(projects):
     assert watch.tokens_since(t2 + 1) == 0
 
 
+def test_tokens_since_counts_each_message_once(projects):
+    log = projects / "-proj" / "s.jsonl"
+    log.write_text("", encoding="utf-8")
+    watch = started(projects)
+    t1, t2 = NOW - 600, NOW - 300
+    # The same message on 3 lines: 1.0 * 5 * 100 = 500, once.
+    append(log, usage_line(t1, "claude-opus-5-5", mid="msg_1", rid="req_1", output_tokens=100) * 3)
+    assert watch.poll() == []
+    assert watch.tokens_since(0) == pytest.approx(500.0)
+    # A repeat in a later poll still counts once; another request id is another message.
+    append(log, usage_line(t1, "claude-opus-5-5", mid="msg_1", rid="req_1", output_tokens=100))
+    append(log, usage_line(t1, "claude-opus-5-5", mid="msg_1", rid="req_2", output_tokens=10))
+    watch.poll()
+    assert watch.tokens_since(0) == pytest.approx(550.0)
+    # With both ids missing, a line counts once by its timestamp.
+    append(log, usage_line(t2, "claude-opus-5-5", output_tokens=1) * 2)
+    append(log, usage_line(t2 + 1, "claude-opus-5-5", output_tokens=1))
+    watch.poll()
+    assert watch.tokens_since(t2) == pytest.approx(10.0)
+
+
 def test_tokens_since_keeps_six_hours(projects):
     clock = Clock()
     log = projects / "-proj" / "s.jsonl"
@@ -241,6 +266,7 @@ def test_tokens_since_keeps_six_hours(projects):
     clock.now = NOW + 6 * 3600
     watch.poll()
     assert len(watch._entries) == 0
+    assert len(watch._seen) == 0
     # tokens_since drops them too, with no poll between.
     append(log, usage_line(clock.now - 100, "claude-opus-5-5", output_tokens=100))
     watch.poll()
