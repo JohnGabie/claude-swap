@@ -11,6 +11,31 @@ Set with `--strategy`, or `cswap config set autoswitch.strategy`.
 - `consume-first` proactively keeps you on the account whose **weekly window resets soonest** — use-it-or-lose-it — switching to a sooner-resetting account (with room to spare) even below the threshold, so perishable weekly quota isn't wasted.
 - `priority-consume-first` follows your own ranking first (see *Account priority tiers* below), then the soonest weekly reset within a tier.
 
+## Work days
+
+Set with `--work-days mon-fri`, or `cswap config set autoswitch.workDays mon-fri`. The flag replaces the setting for one session, as `--threshold` does.
+
+The `balanced` strategy counts only work time: the seconds that fall on a work day of the local calendar (the time zone of the machine). Time on the other days is rest time.
+
+- **Forms.** `all`, a range (`mon-fri`), a list (`mon,wed,fri`), or a mix (`mon-wed,fri`). The day words are `mon tue wed thu fri sat sun`. Case is ignored. A range does not wrap the week, so `fri-mon` is refused.
+- **Normal form.** The setting stores and shows `all` for 7 days. Otherwise it lists the days in the order Monday to Sunday. A run of 3 or more consecutive days is written `a-b`; other days are single words, joined by `,`. Examples: `mon-fri`, `mon-sat`, `mon,wed,fri`, `mon-wed,fri`.
+- **Default.** `all`. With `all`, the engine keeps the wall-clock figures of earlier versions.
+- **Bad values.** `cswap config set` refuses a bad value with exit code 1. A bad stored value reads as `all`. A value with no day reads as `all`.
+- **Work share.** The work share of an account is the share of the work time of its week that has passed. The week of an account is the 168 hours before its next weekly reset. The balanced strategy uses the work share in place of the wall-clock share. When the remaining work time is 0 and the reset is still ahead, the work share is 1.
+- **Rest-time use.** Use on a rest day counts as usual. Each tick recomputes the work share, the pace, the needs and the deficits, so the engine recalculates when you work on a rest day.
+
+## Loss guard (balanced)
+
+The loss guard puts first the usable account whose quota expires before the engine can spend it in work time. It works at any usage level.
+
+1. The fleet pace is the capacity-weighted used share divided by the capacity-weighted work share, over the measured accounts that count.
+2. The fleet work rate is `max(pace, RATE_FLOOR) * capacity of the fleet / work hours of one full week`, in capacity units per work hour. `RATE_FLOOR` is 0.5. A full week has 120 work hours for `mon-fri` and 168 for `all`.
+3. The need of an account is its capacity times the weekly quota it still has to spend to reach its weekly line, divided by the fleet work rate. The need is in work hours.
+4. An account is a guard account when its remaining work time is at most `GUARD_MARGIN` times its need. `GUARD_MARGIN` is 1.25.
+5. An account whose remaining work time is 0 is a guard account when it has any need. So use on a rest day goes first to the quota that expires before the next work day.
+
+Guard accounts rank first, the earliest next weekly reset first. The other accounts follow by deficit. A guard candidate moves the active account when the active account is not a guard account. A guard active account stays, unless a guard candidate has an earlier next reset. Then the engine moves to that candidate. The cooldowns apply as for any other balanced switch.
+
 ## Cooldown and hysteresis
 
 A cooldown (default 5 min) and a hysteresis margin stop it flip-flopping near the threshold: a proactive switch only lands on an account that's below the threshold *and* better than the current one by the margin — a candidate that clears the margin is always taken, but two accounts hovering at the line never ping-pong. When every account is already over its switch lines, it moves to the one with the most quota left before a limit (the lowest usage on its fullest window, whatever line that window carries) under `best`, `weekly-first` and `consume-first` alike, once that account has twice the current one's remaining quota or 3 points more than it, whichever is less. When every account is exhausted it keeps checking on a bounded slow cadence, waking sooner for an imminent reset. `priority-consume-first` does neither: it holds rather than land on an account over its lines (see [Account priority tiers](#account-priority-tiers)).
@@ -71,4 +96,4 @@ For cron/systemd timers, `--once` reports the outcome in its exit code (`0` swit
 
 ## Defaults
 
-Defaults like the threshold and cooldown are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](../README.md#configuration)).
+Defaults like the threshold, the cooldown and the work days are configurable with `cswap config set autoswitch.threshold 80` — flags override them (see [Configuration](../README.md#configuration)).
