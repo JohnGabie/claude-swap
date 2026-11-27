@@ -115,6 +115,47 @@ def test_watch_starts_at_end_of_files(projects):
     assert windows(watch.poll()) == ["5h"]
 
 
+def test_subagent_transcripts_are_watched(projects):
+    agent_log = projects / "-proj" / "session-1" / "subagents" / "agent-x.jsonl"
+    agent_log.parent.mkdir(parents=True)
+    agent_log.write_text(hit_line(), encoding="utf-8")
+    watch = started(projects)
+    assert watch.poll() == []
+    append(agent_log, hit_line())
+    assert windows(watch.poll()) == ["5h"]
+
+
+def test_vanished_file_is_forgotten(projects):
+    log = projects / "-proj" / "s.jsonl"
+    log.write_text("{}\n", encoding="utf-8")
+    watch = started(projects)
+    log.unlink()
+    assert watch.poll() == []
+    assert log not in watch._offsets
+    filler = usage_line(NOW - 60, "claude-opus-5-5", output_tokens=1)
+    log.write_text(hit_line() + filler, encoding="utf-8")
+    assert windows(watch.poll()) == ["5h"]
+
+
+def test_future_lines_are_ignored(projects):
+    clock = Clock()
+    log = projects / "-proj" / "s.jsonl"
+    log.write_text("", encoding="utf-8")
+    watch = started(projects, clock)
+    assert limit_watch.FUTURE_SLACK_S == 60
+    append(log, hit_line(ts=iso(NOW + 120)))
+    append(log, usage_line(NOW + 120, "claude-opus-5-5", mid="m_far", rid="r_far", output_tokens=1000))
+    assert watch.poll() == []
+    assert watch.tokens_since(0) == 0
+    append(log, hit_line(ts=iso(NOW + 30)))
+    append(log, usage_line(NOW + 30, "claude-opus-5-5", mid="m_near", rid="r_near", output_tokens=100))
+    append(log, usage_line(NOW + 60, "claude-opus-5-5", mid="m_edge", rid="r_edge", output_tokens=10))
+    hits = watch.poll()
+    assert windows(hits) == ["5h"]
+    assert hits[0].ts == pytest.approx(NOW + 30, abs=1e-3)
+    assert watch.tokens_since(0) == pytest.approx(550.0)
+
+
 def test_limit_hit_logs_no_text_or_path(projects, caplog):
     caplog.set_level(logging.DEBUG)
     log = projects / "-proj" / "s.jsonl"
@@ -149,8 +190,9 @@ def test_rate_limit_without_api_error_counts(projects):
     log.write_text("", encoding="utf-8")
     watch = started(projects)
     append(log, hit_line(api_error=None))
+    append(log, hit_line("Usage LIMIT reached", api_error=None))
     hits = watch.poll()
-    assert windows(hits) == ["5h"]
+    assert windows(hits) == ["5h", None]
     assert hits[0].ts == pytest.approx(S1_TS, abs=1e-6)
 
 
@@ -172,6 +214,8 @@ def test_other_api_errors_ignored(projects):
         hit_line("Too many requests", api_error=None),
         hit_line(is_error=False),
         hit_line(is_error=None),
+        hit_line(is_error="true"),
+        hit_line(is_error=1),
         hit_line(kind="user"),
         hit_line(ts="not a time"),
         hit_line(ts=None),
@@ -183,6 +227,11 @@ def test_other_api_errors_ignored(projects):
                     "timestamp": S1_TS_TEXT, "message": {"content": "limit"}}) + "\n",
         json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
                     "timestamp": S1_TS_TEXT, "message": {"content": [{"text": 5}]}}) + "\n",
+        # Only the first content item is searched.
+        json.dumps({"type": "assistant", "isApiErrorMessage": True, "error": "rate_limit",
+                    "timestamp": S1_TS_TEXT,
+                    "message": {"content": [{"type": "text", "text": "Request failed"},
+                                            {"type": "text", "text": "You've hit your 5-hour limit"}]}}) + "\n",
     ]
     append(log, "".join(ignored))
     assert watch.poll() == []
@@ -221,7 +270,7 @@ def test_tokens_since_weights(projects):
     t1, t2 = NOW - 600, NOW - 300
     append(log, usage_line(t1, "claude-opus-5-5", input_tokens=10, output_tokens=100))
     append(log, usage_line(t2, "claude-sonnet-5", output_tokens=100, cache_read_input_tokens=1000))
-    append(log, usage_line(t2, "claude-opus-5-5", kind="user", output_tokens=9999))
+    append(log, usage_line(t2, "claude-opus-5-5", kind="user", mid="m_user", rid="r_user", output_tokens=9999))
     append(log, hit_line(ts=iso(t2)))
     assert watch.poll() == [LimitHit(ts=pytest.approx(t2, abs=1e-3), window="5h")]
     # opus-5-5: 1.0 * (10 + 5*100) = 510; sonnet: 0.6 * (5*100 + 0.01*1000) = 306.

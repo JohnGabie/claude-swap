@@ -1,7 +1,10 @@
 """Limit hits and weighted tokens from new Claude Code transcript lines (LH1, LH3, LH4).
 
-Reads the whole lines that Claude Code appends to ``<projects>/**/*.jsonl``,
-by byte offset, like ``usage_history``. The offsets live in memory only. The
+Reads the whole lines that Claude Code appends to ``<projects>/**/*.jsonl``
+at any depth (subagent transcripts are in ``<project>/<session>/subagents/``),
+by byte offset, like ``usage_history``. A line stamped more than
+``FUTURE_SLACK_S`` after ``clock()`` is ignored, and a line older than
+``KEEP_S`` adds no tokens. The offsets live in memory only. The
 first ``poll`` starts at the end of each existing file, so old hits never
 replay; a file that appears later starts at 0; a shrunk file restarts at 0.
 
@@ -28,6 +31,9 @@ from claude_swap import token_model, usage_history, usage_log
 _logger = logging.getLogger("claude-swap")
 
 KEEP_S = 6 * 3600
+# A line stamped further than this after clock() is ignored: a clock step or a
+# crafted line must not hold tokens in memory or count as a hit.
+FUTURE_SLACK_S = 60
 API_ERROR_LIMIT = "usage_limit_reached"
 ERROR_RATE_LIMIT = "rate_limit"
 LIMIT_WORD = "limit"
@@ -140,10 +146,11 @@ class LimitWatch:
             return
         ts = usage_log.parse_ts(row.get("timestamp"))
         message = row.get("message")
-        if ts is None or not isinstance(message, dict):
+        now = self._clock()
+        if ts is None or ts > now + FUTURE_SLACK_S or not isinstance(message, dict):
             return
         usage = message.get("usage")
-        if row.get("type") == "assistant" and isinstance(usage, dict):
+        if row.get("type") == "assistant" and isinstance(usage, dict) and ts >= now - KEEP_S:
             key = usage_history._message_key(message, row, row.get("timestamp"))
             if key not in self._seen:
                 self._seen[key] = ts
