@@ -51,7 +51,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import ClassVar
 
-from claude_swap import balance, oauth, pace_feed, poll_policy
+from claude_swap import balance, oauth, pace_feed, poll_policy, worktime
 from claude_swap.decision_log import DecisionLog
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
@@ -683,6 +683,16 @@ def _weekly_for(
     if isinstance(weekly_threshold, Mapping):
         return weekly_threshold[num]
     return weekly_threshold
+
+
+def _work_days_of(settings: AutoSwitchSettings) -> frozenset[int] | None:
+    """The work days of ``settings`` for ``balance``; ``None`` (all days)
+    for a text that does not parse. Settings read from the file or the
+    command line are already in the normal form."""
+    try:
+        return worktime.parse_days(settings.work_days)
+    except ValueError:
+        return None
 
 
 def _balance_accounts(
@@ -3676,12 +3686,17 @@ class AutoSwitchEngine:
         # its configured weekly line. With no account key at all (neither
         # `threshold` nor `weeklyThreshold`) these are `settings.threshold`
         # and `settings.weekly_threshold`, so the result is unchanged.
+        # The work days (WD2) apply to `decide` and to every `rank` below,
+        # in the machine's local zone (tz None: read at each call, so a
+        # change of offset moves the day borders).
         lines_kw = {
             "threshold": settings.threshold,
             "weekly_threshold": settings.weekly_threshold,
             "lines": {
                 int(num): (lines[num], weekly[num]) for num in weekly
             },
+            "work_days": _work_days_of(settings),
+            "tz": None,
         }
 
         def run(accs: list[balance.Account]) -> balance.Decision:

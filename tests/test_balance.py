@@ -63,7 +63,9 @@ def test_decided_constants():
     assert balance.PLAN_CAPACITY == {"pro": 1.0, "max": 5.0, "ultra": 10.0}
     assert balance.DEFAULT_CAPACITY == 1.0
     assert (balance.F_BOOST, balance.F_MIN, balance.F_FLOOR) == (1.1, 0.1, 0.01)
-    assert (balance.GUARD_F, balance.GUARD_HOURS) == (0.9, 12.0)
+    # Changed for the work-days guard (WD4): GUARD_F and GUARD_HOURS are gone.
+    assert (balance.RATE_FLOOR, balance.GUARD_MARGIN, balance.GUARD_CAP_WORK_H) == (
+        0.5, 1.25, 24.0)
     assert balance.DEFICIT_MARGIN_PTS == 4.0
 
 
@@ -279,48 +281,51 @@ def test_reset_exactly_at_now_has_zero_elapsed():
 
 
 def _passed_guard_fleet(hours_ago=160, third_p7=80.0):
-    # hours_ago=160: e = 160/168; f = 1.1 * 1.65 / 1.857 = 0.977 (guard on).
-    # third_p7=20: f = 1.1 * 1.05 / 1.857 = 0.622 (guard off).
+    # hours_ago=160: e = 160/168; f = 1.1 * 1.65 / 1.857 = 0.977. The passed
+    # reading starts a new week at 0%: its need is 0.9 / R_w = 31.5 h.
     return [_passed(1, hours_ago, p7=40.0), acct(2, p7=85, r7=100),
             acct(3, p7=third_p7, r7=84)]
 
 
+def _guard_score(fleet, account):
+    # One account scored with the fleet's line height and work rate.
+    return score_account(account, NOW, f=balance.line_height(fleet, NOW),
+                         work_rate=balance.work_rate(fleet, NOW))
+
+
 def test_loss_guard_uses_the_next_real_reset_of_a_passed_reading():
+    # Changed for the work-days guard (WD4): the guard reads the need and the
+    # remaining work time, at any f.
     fleet = _passed_guard_fleet()
-    f = balance.line_height(fleet, NOW)
-    assert f >= 0.9
     # The old reset passed 160 hours ago: the next one is 8 hours away.
-    s = score_account(fleet[0], NOW, f=f)
+    s = _guard_score(fleet, fleet[0])
     assert s.usable and s.headroom_7d == 100.0
     assert s.guard and s.reason == "loss guard"
     assert s.reset_7d == pytest.approx(NOW + 8 * H)
     assert rank(fleet, NOW)[0] == 1
     assert run(fleet, 1) == Stay()
     # A reading older than one week: 160 h + 168 h ago, the same next reset.
-    older = score_account(_passed(1, 160 + 168, p7=40.0), NOW, f=f)
+    older = _guard_score(fleet, _passed(1, 160 + 168, p7=40.0))
     assert older.guard and older.reset_7d == pytest.approx(NOW + 8 * H)
-    # Two guard accounts: the earlier next reset goes first.
-    # (f = 1.1 * 2.5 / 2.797 = 0.983, and 0.975 with the reset in 6 hours.)
-    two = [*fleet, acct(4, p7=85, r7=10)]
-    assert balance.line_height(two, NOW) >= 0.9
+    # Two guard accounts (account 4 at 40% needs about 23 h): the earlier
+    # next reset goes first.
+    two = [*fleet, acct(4, p7=40, r7=10)]
+    assert _guard_score(two, two[3]).guard
     assert rank(two, NOW)[:2] == [1, 4]
-    sooner = [*fleet, acct(4, p7=85, r7=6)]
-    assert balance.line_height(sooner, NOW) >= 0.9
+    sooner = [*fleet, acct(4, p7=40, r7=6)]
     assert rank(sooner, NOW)[:2] == [4, 1]
 
 
 def test_loss_guard_of_a_passed_reading_keeps_its_limits():
-    # 13 hours before the next reset: outside GUARD_HOURS.
-    far = _passed_guard_fleet(hours_ago=155)
-    f = balance.line_height(far, NOW)
-    assert f >= 0.9
-    assert not score_account(far[0], NOW, f=f).guard
-    # A low f: no guard.
-    low = _passed_guard_fleet(third_p7=20.0)
-    f = balance.line_height(low, NOW)
-    assert f < 0.9
-    s = score_account(low[0], NOW, f=f)
+    # Changed for the work-days guard (WD4): the limit is the cap of
+    # GUARD_CAP_WORK_H remaining work hours, not GUARD_HOURS and f.
+    # 24 hours before the next reset: not below the cap.
+    far = _passed_guard_fleet(hours_ago=144)
+    s = _guard_score(far, far[0])
     assert s.usable and not s.guard and s.reason == "deficit"
+    # 23 hours before it: a guard account.
+    near = _passed_guard_fleet(hours_ago=145)
+    assert _guard_score(near, near[0]).guard
 
 
 def test_account_with_no_weekly_reset_time():
@@ -357,24 +362,25 @@ def test_ties_go_to_the_less_used_account_then_to_the_lower_id():
     assert rank(list(reversed(twins)), NOW) == [3, 7]
 
 
-# --- the loss guard (B1) ----------------------------------------------------
-# With f >= GUARD_F, a usable account whose weekly reset is within
-# GUARD_HOURS goes first, the earliest reset first.
+# --- the loss guard ---------------------------------------------------------
+# Changed for the work-days guard (WD4): at any f, a usable account whose
+# remaining work time is at most GUARD_MARGIN times its need and below
+# GUARD_CAP_WORK_H goes first, the earliest reset first.
 
 
-def _guard_fleet(third_p7=80.0, guard_r7=6):
-    # third_p7=80: f = 1.1 * 1.65 / 1.869 = 0.971 (guard on); deficits 8.6
-    # for account 1, 39.3 for account 2, -31.4 for account 3.
-    # third_p7=60: f = 1.1 * 1.45 / 1.869 = 0.853 (guard off); deficits -2.7,
-    # 34.5 and -17.3.
-    return [acct(1, p7=85, r7=guard_r7), acct(2, p7=0, r7=100),
-            acct(3, p7=third_p7, r7=84)]
+def _guard_fleet(first_p7=60.0, guard_r7=6):
+    # first_p7=60: account 1 needs 0.3 / R_w = 19 h, so it is a guard account
+    # 6 hours before its reset; deficits about 34 for account 1, 39 for
+    # account 2 and -31 for account 3. first_p7=85: it needs 3.2 h, so 6
+    # hours are more than 1.25 times its need (no guard).
+    return [acct(1, p7=first_p7, r7=guard_r7), acct(2, p7=0, r7=100),
+            acct(3, p7=80, r7=84)]
 
 
 def test_loss_guard_on_puts_the_expiring_account_first():
     fleet = _guard_fleet()
     f = balance.line_height(fleet, NOW)
-    assert f >= 0.9
+    assert _guard_score(fleet, fleet[0]).guard
     assert balance.deficit(fleet[0], NOW, f) < balance.deficit(fleet[1], NOW, f)
     assert rank(fleet, NOW) == [1, 2, 3]
     # A non-guard active account moves to the guard account: its deficit is
@@ -386,30 +392,32 @@ def test_loss_guard_on_puts_the_expiring_account_first():
     assert run(fleet, 1) == Stay()
 
 
-def test_loss_guard_off_below_guard_f():
-    fleet = _guard_fleet(third_p7=60.0)
-    assert 0.8 < balance.line_height(fleet, NOW) < 0.9
+def test_loss_guard_off_when_the_need_is_small():
+    # Changed for the work-days guard (WD4, was "off below GUARD_F").
+    fleet = _guard_fleet(first_p7=85.0)
+    assert not _guard_score(fleet, fleet[0]).guard
     assert rank(fleet, NOW) == [2, 1, 3]
     assert run(fleet, 2) == Stay()
     # No guard: the account near its reset leaves for the larger deficit.
     assert run(fleet, 1) == SwitchTo(2, "proactive")
 
 
-def test_loss_guard_window_is_twelve_hours():
-    assert rank(_guard_fleet(guard_r7=12), NOW) == [1, 2, 3]
-    assert balance.line_height(_guard_fleet(guard_r7=12.5), NOW) >= 0.9
-    assert rank(_guard_fleet(guard_r7=12.5), NOW) == [2, 1, 3]
+def test_loss_guard_cap_is_24_work_hours():
+    # Changed for the work-days guard (WD4, was a 12-hour window).
+    assert rank(_guard_fleet(guard_r7=23.5), NOW) == [1, 2, 3]
+    assert rank(_guard_fleet(guard_r7=24), NOW) == [2, 1, 3]
 
 
 def test_loss_guard_orders_by_the_earliest_reset():
     # Account 4 resets first and has the smaller deficit of the two guards.
-    fleet = [*_guard_fleet(), acct(4, p7=88, r7=3)]
+    fleet = [*_guard_fleet(), acct(4, p7=70, r7=3)]
     f = balance.line_height(fleet, NOW)
-    assert f >= 0.9
+    assert _guard_score(fleet, fleet[3]).guard
     assert balance.deficit(fleet[3], NOW, f) < balance.deficit(fleet[0], NOW, f)
     assert rank(fleet, NOW) == [4, 1, 2, 3]
-    # One guard account does not leave for another guard account.
-    assert run(fleet, 1) == Stay()
+    # Changed for the work-days guard (WD4): a guard account leaves for a
+    # guard account with an earlier next reset, never for a later one.
+    assert run(fleet, 1) == SwitchTo(4, "proactive")
     assert run(fleet, 4) == Stay()
 
 
@@ -490,7 +498,9 @@ def test_blocked_account_is_excluded():
 
 def test_ranking_four_pro_one_max():
     # Changed in B1 (was [1, 4, 2, 3, 10], Pro first). f = 1.1 * 1.0 / 3.0476
-    # = 0.361, so the guard is off.
+    # = 0.361. Changed for the work-days guard (WD4, was [10, 3, 2, 1, 4]):
+    # account 1 has 12 h to its reset and needs about 18.7 h, so it is a
+    # guard account at any f and goes first.
     accounts = [
         acct(10, "max", p7=5, r7=120),  # 0.361 * 28.6 - 5 = 5.3
         acct(1, p7=40, r7=12),  # 0.361 * 92.9 - 40 = -6.5
@@ -498,7 +508,7 @@ def test_ranking_four_pro_one_max():
         acct(3, p7=0, r7=None),  # 0
         acct(4, p7=25, r7=90),  # 0.361 * 46.4 - 25 = -8.2
     ]
-    assert rank(accounts, NOW) == [10, 3, 2, 1, 4]
+    assert rank(accounts, NOW) == [1, 10, 3, 2, 4]
 
 
 def test_ranking_four_pro_one_max_near_reset():
@@ -1198,17 +1208,21 @@ def test_proactive_switch_needs_the_deficit_margin_or_the_loss_guard():
             if not (isinstance(got, SwitchTo) and got.reason == "proactive"):
                 continue
             f = balance.line_height(accounts, NOW)
+            rate = balance.work_rate(accounts, NOW)
             target, active = by_id[got.account_id], by_id[active_id]
             gap = balance.deficit(target, NOW, f) - balance.deficit(active, NOW, f)
+            # Changed for the work-days guard (WD4): a guard target moves a
+            # non-guard active account, or a guard active account with a
+            # later next reset.
+            t = score_account(target, NOW, **lines, candidate_margin=margin,
+                              f=f, work_rate=rate)
+            a = score_account(active, NOW, **lines, f=f, min_headroom=False,
+                              work_rate=rate)
 
-            def guarded(a, f=f):
-                reset = a.seven_day.resets_at
-                return f >= 0.9 and reset is not None and 0 < reset - NOW <= 12 * H
-
-            if gap > balance.DEFICIT_MARGIN_PTS:
+            if gap > balance.DEFICIT_MARGIN_PTS and not a.guard:
                 by_margin += 1
             else:
-                assert guarded(target) and not guarded(active), (
+                assert t.guard and (not a.guard or t.reset_7d < a.reset_7d), (
                     margin, case, accounts, got)
                 by_guard += 1
     # The grid reaches usable active accounts inside a margin, and both

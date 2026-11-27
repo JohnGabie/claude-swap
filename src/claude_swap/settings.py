@@ -22,9 +22,11 @@ import logging
 import math
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from claude_swap import worktime
 from claude_swap.exceptions import ConfigError
 from claude_swap.fsutil import atomic_write_text, publish_target
 
@@ -83,6 +85,15 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Balanced strategy: the days the user works, in the normal form of
+    # ``worktime.format_days`` ("all", "mon-fri", "mon,wed,fri"). Only work
+    # time counts toward an account's week.
+    work_days: str = worktime.ALL_DAYS
+
+
+def normalize_work_days(text: str) -> str:
+    """The normal form of a work-days text; ``ValueError`` for a bad one."""
+    return worktime.format_days(worktime.parse_days(text))
 
 
 @dataclass(frozen=True)
@@ -164,6 +175,9 @@ class SettingSpec:
     hi: float | None = None
     choices: tuple[str, ...] = ()
     help: str = ""
+    # A "string" key with a fixed syntax: returns the text to store, or
+    # raises ValueError. Load reads a bad stored text as the default.
+    normalize: Callable[[str], str] | None = None
 
     @property
     def dotted(self) -> str:
@@ -227,6 +241,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "workDays", "work_days", "string",
+            help=(
+                "Balanced strategy: the days you work (all, mon-fri, mon,wed,fri); "
+                "only their time counts toward each week"
+            ),
+            normalize=normalize_work_days,
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -376,7 +398,17 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
-            kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
+            value = value if isinstance(value, str) and value else spec.default
+            if spec.normalize is not None:
+                try:
+                    value = spec.normalize(value)
+                except ValueError as e:
+                    _logger.warning(
+                        "settings.json: %s %r is not valid (%s); using %r",
+                        spec.dotted, value, e, spec.default,
+                    )
+                    value = spec.default
+            kwargs[spec.field] = value
         else:  # choice
             if value not in spec.choices:
                 _logger.warning(
@@ -619,6 +651,11 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"{spec.dotted} expects a non-empty value; use "
                 f"'cswap config unset {spec.dotted}' to clear it"
             )
+        if spec.normalize is not None:
+            try:
+                return spec.normalize(value)
+            except ValueError as e:
+                raise ConfigError(f"{spec.dotted}: {e}") from None
         return value
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
@@ -753,6 +790,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("work_days", "work_days"),
     ):
         value = getattr(args, attr, None)
         if value is not None:
