@@ -36,7 +36,7 @@ def clock_text(dt: datetime) -> str:
 
 
 def local_time(iso: str | None) -> str | None:
-    """'2026-10-12T09:00:00Z' -> '14:30' (local), or 'Oct 13 14:30' if not today."""
+    """'2026-10-12T21:00:00Z' -> '2:30 PM' (local), or 'Oct 13 2:30 PM' if not today."""
     if not iso:
         return None
     try:

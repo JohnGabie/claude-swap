@@ -142,3 +142,10 @@ def test_no_24h_clock_left():
         assert "%H:%M" not in text, name
         assert "getHours()).padStart" not in text, name
         assert "pad(d.getHours())" not in text, name
+    # getHours() may appear only on the lines that define clock and clockHour
+    for name in ("pill.py", "fleet_page.py"):
+        lines = (root / name).read_text(encoding="utf-8").splitlines()
+        stray = [ln for ln in lines if "getHours()" in ln and not ln.startswith(("const clock=", "const clockHour="))]
+        assert stray == [], (name, stray)
+    fleet = (root / "fleet_page.py").read_text(encoding="utf-8")
+    assert "textContent=`${WD[d.getDay()]} ${clockHour(d)}`" in fleet
