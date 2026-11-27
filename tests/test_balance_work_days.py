@@ -84,6 +84,10 @@ def test_friday_ranks_expiring_accounts_first():
     assert [s.id for s in ranked[:3]] == [3, 4, 5]
     assert all(s.guard and s.reason == "loss guard" for s in ranked[:3])
     assert not any(s.guard for s in ranked[3:])
+    # The others by deficit, on the work share and its line height
+    # (f = 0.6545): #2 has 0.6545 * 54.26 - 26 = 9.52.
+    assert [s.id for s in ranked[3:]] == [2, 1, 6]
+    assert ranked[3].score == pytest.approx(9.52, abs=0.01)
     assert balance.rank(accounts, FRI, threshold=99.0, work_days=MON_FRI,
                         tz=TZ)[:3] == [3, 4, 5]
     # The work share of #3: 115.1 of its 120 work hours have passed.
@@ -138,6 +142,18 @@ def test_guard_needs_and_margin():
     slow = [Account(i, "pro", Window(0.0, FRI + H), Window(p7, FRI + 84 * H))
             for i, p7 in ((1, 10.0), (2, 20.0))]
     assert balance.work_rate(slow, FRI) == pytest.approx(0.5 * 2 / 168)
+    # Remaining work time: with mon-fri, a reset on Sunday morning has only
+    # the 4.9 h to Friday midnight left, so the need decides at that time.
+    a = Account(1, "pro", Window(0.0, FRI + H), Window(95.0, at(2026, 11, 29, 5, 59)))
+    # need = 0.04 / 0.01 = 4 h; 1.25 * 4 = 5 >= 4.9 h.
+    assert balance.score_account(a, FRI, threshold=99.0, work_rate=0.01,
+                                 work_days=MON_FRI, tz=TZ).guard
+    # Wall clock: 34.9 h left, no guard.
+    assert not balance.score_account(a, FRI, threshold=99.0, work_rate=0.01).guard
+    # No weekly window or no reset time: no remaining work time.
+    assert balance.remaining_work_hours(Account(1, "pro", None, None), FRI) is None
+    no_reset = Account(1, "pro", Window(0.0, FRI + H), Window(10.0, None))
+    assert balance.remaining_work_hours(no_reset, FRI) is None
 
 
 def test_guard_cap():
@@ -173,18 +189,6 @@ def test_guard_ties_go_by_deficit():
     assert ranked[0].score > ranked[1].score
     assert balance.rank(list(reversed(pair)), FRI, threshold=99.0,
                         work_days=MON_FRI, tz=TZ)[:2] == [7, 3]
-    # Remaining work time: with mon-fri, a reset on Sunday morning has only
-    # the 4.9 h to Friday midnight left, so the need decides at that time.
-    a = Account(1, "pro", Window(0.0, FRI + H), Window(95.0, at(2026, 11, 29, 5, 59)))
-    # need = 0.04 / 0.01 = 4 h; 1.25 * 4 = 5 >= 4.9 h.
-    assert balance.score_account(a, FRI, threshold=99.0, work_rate=0.01,
-                                 work_days=MON_FRI, tz=TZ).guard
-    # Wall clock: 34.9 h left, no guard.
-    assert not balance.score_account(a, FRI, threshold=99.0, work_rate=0.01).guard
-    # No weekly window or no reset time: no remaining work time.
-    assert balance.remaining_work_hours(Account(1, "pro", None, None), FRI) is None
-    no_reset = Account(1, "pro", Window(0.0, FRI + H), Window(10.0, None))
-    assert balance.remaining_work_hours(no_reset, FRI) is None
 
 
 def test_fleet_work_rate():
@@ -195,6 +199,9 @@ def test_fleet_work_rate():
 
     fast = [acc(1, 20.0, 84), acc(2, 40.0, 84)]
     assert balance.work_rate(fast, FRI) == pytest.approx(0.6 * 2 / 168)
+    # The capacity counts: a Max adds 5 units (rho = 2.6 / 3.5).
+    with_max = [*fast, acc(3, 40.0, 84, plan="max")]
+    assert balance.work_rate(with_max, FRI) == pytest.approx(2.6 / 3.5 * 7 / 168)
     # rho = 0.3 is below the floor: R_w uses 0.5.
     slow = [acc(1, 10.0, 84), acc(2, 20.0, 84)]
     assert balance.work_rate(slow, FRI) == pytest.approx(0.5 * 2 / 168)
@@ -241,6 +248,25 @@ def test_guard_active_moves_to_a_guard_with_an_earlier_reset():
     assert _decide(pair, 7) == Stay()
     # A non-guard active account moves to the first guard account.
     assert _decide(accounts, 2) == SwitchTo(3, "proactive")
+
+
+def test_decide_reads_the_work_rate_and_the_work_line():
+    r3, r4 = at(2026, 11, 28, 10, 0), at(2026, 11, 29, 5, 59)
+    # #3 is over its line. #4 at 79% needs less than 4.9 / 1.25 h at the
+    # work rate (120 work hours a week), so it is no guard account; #5 is.
+    accounts = fleet(FRI, {3: (99.5, r3), 4: (79.0, r4)})
+    by_id = {s.id: s for s in scores(accounts, FRI)}
+    assert not by_id[4].guard and by_id[5].guard
+    assert _decide(accounts, 4) == SwitchTo(5, "proactive")
+    # At the wall-clock rate (168 hours a week) #4 would be a guard account.
+    assert balance.score_account(accounts[3], FRI, threshold=99.0,
+                                 work_rate=balance.work_rate(accounts, FRI),
+                                 work_days=MON_FRI, tz=TZ).guard
+    # No guard account: the deficits on the work line (f = 0.566) are 2.1,
+    # 4.7 and 2.0, inside DEFICIT_MARGIN_PTS. The wall-clock f (0.792)
+    # would give #1 a lead of 6.4 points over #6.
+    calm = [a for a in fleet(FRI) if a.id in (1, 2, 6)]
+    assert _decide(calm, 6) == Stay()
 
 
 def test_engine_numbers_pass_through_decide_and_rank():
