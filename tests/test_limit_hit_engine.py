@@ -239,6 +239,7 @@ def test_engine_switches_on_limit_hit(temp_home):
     kinds = h.kinds()
     assert kinds.index("limit-hit") < kinds.index("switch")
     assert h.active_number() == 5
+    assert h.state()["leftTrigger"] == "limit-hit"
     # The decision log: limit-hit before the switch, with no email.
     rows = [json.loads(line) for line in decision_log.tail(h.switcher.backup_dir)]
     events = [r["event"] for r in rows]
@@ -623,6 +624,27 @@ def test_hit_on_an_unread_active_account_switches_at_once(temp_home, reading):
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
     assert _switches(h) == [("limit-hit", 1, 2)]
     assert not any(e.kind == "no-switch" and e.reason == "active-usage-unknown" for e in h.events)
+
+
+def test_hit_on_an_active_account_unread_in_the_priority_refetch(temp_home):
+    # Priority rotation refetches before every switch. The fresh reading of
+    # the hit account is unknown: it stays at its limit, and the departure
+    # records headroom 0, not an unknown one.
+    h = _harness(temp_home, strategy="priority-consume-first")
+    now = h.clock.now
+    week = _iso_at(now + 48 * HOUR_S)
+    first = _entries({"1": _usage7(50, 10, week), "2": _usage7(0, 10, week)}, now)
+    fresh = {"1": UsageEntry(), "2": first["2"]}
+    h.watch.hits = [LimitHit(ts=now, window="5h")]
+
+    def entries(fetch=None, scheduled=False):
+        return fresh if fetch == {"1", "2"} and not h.watch.hits and h.engine._pending_hit is None else first
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=entries):
+        assert h.engine._poll_limit_watch() is True
+        assert h.engine.tick() is TickOutcome.SWITCHED
+    assert _switches(h) == [("limit-hit", 1, 2)]
+    assert h.state()["leftHeadroom"] == 0.0
 
 
 def test_estimate_starts_at_zero_after_the_window_reset(temp_home, pro_plans):
