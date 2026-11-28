@@ -4044,7 +4044,8 @@ class AutoSwitchEngine:
         """``usage`` with each window that a limit hit marked at 100% until
         its mark ends. Ended marks are dropped. The ``active`` account with
         no decision value (unknown, or F4 distrust) reads as its marked
-        windows at 100%: the hit is the one exact reading of it (LH3). Any
+        windows at 100%, each resetting when its mark ends: the hit is the
+        one exact reading of it (LH3). Any
         other row that is not a reading is left as it is; nothing is
         mutated. With no mark the clock is not read."""
         if not self._limit_marks:
@@ -4059,8 +4060,19 @@ class AutoSwitchEngine:
         for num, windows in self._limit_marks.items():
             value = out.get(num)
             if value is None and num == active:
-                value = {}
-            elif not isinstance(value, dict):
+                # No reading to keep: each marked window resets when its mark
+                # ends, so an all-blocked wait knows when the account frees.
+                out[num] = {
+                    _LIMIT_USAGE_KEYS[window]: {
+                        "pct": 100.0,
+                        "resets_at": datetime.fromtimestamp(until, tz=timezone.utc)
+                        .isoformat()
+                        .replace("+00:00", "Z"),
+                    }
+                    for window, until in windows.items()
+                }
+                continue
+            if not isinstance(value, dict):
                 continue
             value = dict(value)
             for window in windows:

@@ -573,6 +573,93 @@ def test_weekly_mark_sets_only_the_seven_day_window(temp_home):
     assert out["2"] == _usage7(5, 5)
 
 
+# ---- every branch of _with_limit_marks ---------------------------------------------
+
+RESET_ISO = "2099-01-01T00:00:00Z"
+
+
+def _marked(temp_home, marks: dict, usage: dict, active: str | None = "1"):
+    h = _harness(temp_home)
+    for num, windows in marks.items():
+        h.engine._limit_marks[num] = {w: h.clock.now + until for w, until in windows.items()}
+    before = json.dumps(usage, sort_keys=True)
+    out = h.engine._with_limit_marks(usage, active)
+    assert json.dumps(usage, sort_keys=True) == before, "the input is never mutated"
+    return h, out
+
+
+def test_marks_readable_row_keeps_its_other_fields(temp_home):
+    # Active and readable, 5h mark: only the pct of five_hour changes.
+    _, out = _marked(temp_home, {"1": {"5h": HOUR_S}}, {"1": _usage(30, RESET_ISO), "2": _usage(5)})
+    assert out["1"]["five_hour"] == {"pct": 100.0, "resets_at": RESET_ISO}
+    assert out["1"]["seven_day"] == {"pct": 0.0}
+    assert out["2"] == _usage(5)
+
+
+def test_marks_readable_non_active_row(temp_home):
+    _, out = _marked(temp_home, {"2": {"5h": HOUR_S}}, {"1": _usage(30), "2": _usage(5)})
+    assert out["2"]["five_hour"]["pct"] == 100.0
+    assert out["1"] == _usage(30)
+
+
+def test_marks_unknown_active_row_reads_full_until_the_mark_end(temp_home):
+    # Active with no decision value (unknown or F4 distrust): a synthetic row,
+    # each marked window at 100% resetting when its mark ends.
+    h, out = _marked(temp_home, {"1": {"5h": HOUR_S, "7d": 2 * HOUR_S}}, {"1": None, "2": _usage(5)})
+    now = h.clock.now
+    assert out["1"] == {
+        "five_hour": {"pct": 100.0, "resets_at": _iso_at(now + HOUR_S)},
+        "seven_day": {"pct": 100.0, "resets_at": _iso_at(now + 2 * HOUR_S)},
+    }
+
+
+def test_marks_leave_an_unknown_non_active_row_unknown(temp_home):
+    _, out = _marked(temp_home, {"2": {"5h": HOUR_S}}, {"1": _usage(30), "2": None})
+    assert out["2"] is None
+
+
+def test_marks_leave_a_sentinel_active_row_as_it_is(temp_home):
+    from claude_swap.json_output import USAGE_TOKEN_EXPIRED
+
+    _, out = _marked(temp_home, {"1": {"5h": HOUR_S}}, {"1": USAGE_TOKEN_EXPIRED, "2": _usage(5)})
+    assert out["1"] == USAGE_TOKEN_EXPIRED
+
+
+def test_ended_marks_are_dropped(temp_home):
+    h, out = _marked(temp_home, {"1": {"5h": -1.0, "7d": HOUR_S}, "2": {"5h": -1.0}},
+                     {"1": _usage7(30, 40), "2": _usage7(5, 5)})
+    assert out["1"] == {"five_hour": {"pct": 30}, "seven_day": {"pct": 100.0}}
+    assert out["2"] == _usage7(5, 5)
+    assert set(h.engine._limit_marks) == {"1"} and set(h.engine._limit_marks["1"]) == {"7d"}
+
+
+def test_unknown_non_active_marked_account_stays_no_comparison(temp_home):
+    # Active 1 over its line, account 2 marked with no reading: nothing to
+    # compare, not an all-exhausted fleet.
+    h = _harness(temp_home)
+    h.engine._limit_marks["2"] = {"5h": h.clock.now + HOUR_S}
+    assert h.tick_with_usage({"1": _usage(99.5), "2": None}) is TickOutcome.BLOCKED
+    reasons = [e.reason for e in h.events if e.kind == "no-switch"]
+    assert reasons == ["no-comparison"]
+    assert not any(e.kind == "all-exhausted" for e in h.events)
+
+
+def test_unread_hit_account_waits_for_its_mark_end_when_all_are_blocked(temp_home):
+    h = _harness(temp_home)
+    now = h.clock.now
+    h.watch.hits = [LimitHit(ts=now, window="5h")]
+    with patch.object(h.switcher, "usage_entries_by_account",
+                      return_value=_entries({"1": _usage(50)}, now)):
+        assert h.engine._poll_limit_watch() is True
+    until = now + 5 * HOUR_S  # no reset known: the 5-hour fallback
+    other = _usage(100, _iso_at(until + 2 * HOUR_S))
+    assert h.tick_with_usage({"1": None, "2": other}) is TickOutcome.BLOCKED
+    exhausted = next(e for e in h.events if e.kind == "all-exhausted")
+    assert exhausted.earliest_reset_at == _iso_at(until)
+    assert exhausted.frees_account == 1
+    assert h.engine._sleep_until_ts == until + poll_policy.RESET_SLACK_S
+
+
 def test_corrupt_calibration_store_does_not_stop_the_tick(temp_home, pro_plans, caplog):
     # A store row that is not a dict makes budget_calibrate.rates raise
     # AttributeError: the tick goes on with no estimate.
