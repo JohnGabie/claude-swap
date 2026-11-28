@@ -17,7 +17,7 @@ Set with `--work-days mon-fri`, or `cswap config set autoswitch.workDays mon-fri
 
 The `balanced` strategy counts only work time: the seconds that fall on a work day of the local calendar (the time zone of the machine). Time on the other days is rest time.
 
-- **Forms.** `all`, a range (`mon-fri`), a list (`mon,wed,fri`), or a mix (`mon-wed,fri`). The day words are `mon tue wed thu fri sat sun`. Case is ignored. A range does not wrap the week, so `fri-mon` is refused.
+- **Forms.** `all`, a range (`mon-fri`), a list (`mon,wed,fri`), or a mix (`mon-wed,fri`). The day words are `mon tue wed thu fri sat sun`. Case is ignored. A range does not wrap the week, so `fri-mon` is refused. The text `sun-sat` is accepted only as the whole text, and it means all days. Inside a list it is refused like any other wrapping range.
 - **Normal form.** The setting stores and shows `all` for 7 days. Otherwise it lists the days in the order Monday to Sunday. A run of 3 or more consecutive days is written `a-b`; other days are single words, joined by `,`. Examples: `mon-fri`, `mon-sat`, `mon,wed,fri`, `mon-wed,fri`.
 - **Default.** `all`. With `all`, the engine keeps the wall-clock figures of earlier versions.
 - **Bad values.** `cswap config set` refuses a bad value with exit code 1. A bad stored value reads as `all`. A value with no day reads as `all`.
@@ -31,7 +31,7 @@ The loss guard puts first the usable account whose quota expires before the engi
 1. The fleet pace is the capacity-weighted used share divided by the capacity-weighted work share, over the measured accounts that count.
 2. The fleet work rate is `max(pace, RATE_FLOOR) * capacity of the fleet / work hours of one full week`, in capacity units per work hour. `RATE_FLOOR` is 0.5. A full week has 120 work hours for `mon-fri` and 168 for `all`.
 3. The need of an account is its capacity times the weekly quota it still has to spend to reach its weekly line, divided by the fleet work rate. The need is in work hours.
-4. An account is a guard account when its remaining work time is at most `GUARD_MARGIN` times its need. `GUARD_MARGIN` is 1.25.
+4. An account is a guard account when its remaining work time is at most `GUARD_MARGIN` times its need and strictly below `GUARD_CAP_WORK_H`. `GUARD_MARGIN` is 1.25. `GUARD_CAP_WORK_H` is 24 work hours. The guard acts only in the last work day before a reset, so the strategy keeps spreading use during the rest of the week.
 5. An account whose remaining work time is 0 is a guard account when it has any need. So use on a rest day goes first to the quota that expires before the next work day.
 
 Guard accounts rank first, the earliest next weekly reset first. The other accounts follow by deficit. A guard candidate moves the active account when the active account is not a guard account. A guard active account stays, unless a guard candidate has an earlier next reset. Then the engine moves to that candidate. The cooldowns apply as for any other balanced switch.

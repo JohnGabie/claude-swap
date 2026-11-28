@@ -69,10 +69,12 @@ The types of the fields do not change. Only their meaning becomes "of the work t
 When the limit-hit watcher counts a hit (see [auto-switch.md](auto-switch.md#limit-hit-watcher)), the decision log and the event stream get one event before the switch event:
 
 ```json
-{"event": "limit-hit", "ts": 1795818082.437, "account": 4, "window": "5h"}
+{"schemaVersion": 1, "event": "limit-hit", "ts": "2026-11-27T22:21:22Z", "account": 4, "window": "5h"}
 ```
 
 `account` is the number of the active account. `window` is `"5h"` or `"7d"`. The event holds no transcript text and no path.
+
+A hit on an active account whose reading is unknown or distrusted makes that account at its limit, and the engine switches at once.
 
 ### Triggers `limit-hit` and `estimate`
 
