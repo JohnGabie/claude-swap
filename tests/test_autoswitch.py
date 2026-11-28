@@ -74,6 +74,16 @@ def _entry_for(value: dict | str | None, now: float) -> UsageEntry:
     return UsageEntry()
 
 
+class _NoLimitWatch:
+    """A limit-hit watcher that sees no hit and no token."""
+
+    def poll(self) -> list:
+        return []
+
+    def tokens_since(self, ts: float) -> float:
+        return 0.0
+
+
 class EngineHarness:
     """Seeded switcher + engine + captured events, on the Linux file backend."""
 
@@ -110,6 +120,8 @@ class EngineHarness:
         self.engine = self._make_engine()
 
     def _make_engine(self, **kwargs) -> AutoSwitchEngine:
+        # No engine test reads the real transcripts: the watcher sees nothing.
+        kwargs.setdefault("limit_watch", _NoLimitWatch())
         return AutoSwitchEngine(
             self.switcher,
             self.settings,
