@@ -613,6 +613,11 @@ def test_marks_unknown_active_row_reads_full_until_the_mark_end(temp_home):
     }
 
 
+def test_marks_add_a_window_the_reading_lacks(temp_home):
+    _, out = _marked(temp_home, {"2": {"7d": HOUR_S}}, {"1": _usage(30), "2": {"five_hour": {"pct": 5}}})
+    assert out["2"] == {"five_hour": {"pct": 5}, "seven_day": {"pct": 100.0}}
+
+
 def test_marks_leave_an_unknown_non_active_row_unknown(temp_home):
     _, out = _marked(temp_home, {"2": {"5h": HOUR_S}}, {"1": _usage(30), "2": None})
     assert out["2"] is None
